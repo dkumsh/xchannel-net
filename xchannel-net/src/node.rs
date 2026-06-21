@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -287,6 +287,14 @@ impl Node {
                 },
             },
             ClientRequest::Subscribe { name, wait_ms } => {
+                // Idempotent: reuse a live subscription for this channel.
+                if let Some(existing) = self.subscriptions.lock().unwrap().get(&name)
+                    && existing.is_active()
+                {
+                    return ClientReply::Subscribed {
+                        replica_path: existing.replica_path().to_string_lossy().into_owned(),
+                    };
+                }
                 let wait = (wait_ms != 0).then(|| Duration::from_millis(wait_ms));
                 match self.subscribe(&name, wait) {
                     Ok(sub) => {
@@ -313,40 +321,128 @@ impl Node {
 
     // ---------------- subscribing ----------------
 
-    /// Subscribe to a channel by name: resolve it via the registry + membership, connect
-    /// to its owner's stream address, and build a local replica under `data_dir` in a
-    /// background thread. Returns a [`Subscription`] tracking sync progress and the replica
-    /// path (a local reader client opens that path).
+    /// Subscribe to a channel by name and maintain a local replica under `data_dir` in a
+    /// background thread. Returns a [`Subscription`] tracking sync progress + the replica
+    /// path (a local reader client opens that path, in its own process).
     ///
-    /// `resolve_timeout`: `None` blocks until the channel is known and its owner reachable;
-    /// `Some(d)` errors after `d`. v1 always starts a *fresh* replica (`from = 0`).
+    /// The background loop is **self-healing**: it resolves the owner, **resumes** from the
+    /// replica's current head (so a reconnect or restart never re-pulls history it already
+    /// has), streams until the connection drops, then **reconnects** — until [`stop`](
+    /// Subscription::stop). `resolve_timeout` bounds only the *initial* resolution (so the
+    /// RPC fails fast if the channel is unknown): `None` blocks, `Some(d)` errors after `d`.
     pub fn subscribe(
         &self,
         name: &str,
         resolve_timeout: Option<Duration>,
     ) -> io::Result<Subscription> {
-        let (_identity, owner_addr) = self.resolve(name, resolve_timeout)?;
+        // Fail fast if the channel can't be resolved within the timeout.
+        self.resolve(name, resolve_timeout)?;
         let replica_path = self.channel_path(name)?;
         if let Some(parent) = replica_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = TcpTransport::connect(owner_addr)?;
-        let mut client = stream::subscribe(conn, name, RecordIndex(0), &replica_path)?;
-        let synced = Arc::new(AtomicU64::new(client.expected_index().0));
-        let synced_thread = Arc::clone(&synced);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let synced = Arc::new(AtomicU64::new(0));
+        let shutdown: Arc<Mutex<Option<TcpTransport>>> = Arc::new(Mutex::new(None));
+
+        let node = self.clone();
+        let (name_t, path_t, stopped_t, synced_t, shutdown_t) = (
+            name.to_string(),
+            replica_path.clone(),
+            Arc::clone(&stopped),
+            Arc::clone(&synced),
+            Arc::clone(&shutdown),
+        );
         let handle = std::thread::spawn(move || {
-            // Apply records until the connection drops, publishing progress.
-            while client.recv_one().is_ok() {
-                synced_thread.store(client.expected_index().0, Ordering::Relaxed);
-            }
+            node.run_subscription(name_t, path_t, stopped_t, synced_t, shutdown_t)
         });
 
         Ok(Subscription {
             replica_path,
             synced,
-            _handle: handle,
+            stopped,
+            shutdown,
+            handle: Some(handle),
         })
+    }
+
+    /// The self-healing subscription loop: resolve → resume from replica head → stream →
+    /// reconnect, until stopped. Failures back off and retry; `stop` interrupts a blocked
+    /// read by shutting down the live socket.
+    fn run_subscription(
+        &self,
+        name: String,
+        replica_path: PathBuf,
+        stopped: Arc<AtomicBool>,
+        synced: Arc<AtomicU64>,
+        shutdown: Arc<Mutex<Option<TcpTransport>>>,
+    ) {
+        const BACKOFF: Duration = Duration::from_millis(100);
+        while !stopped.load(Ordering::Relaxed) {
+            // Re-resolve each attempt (owner address may have changed); short timeout so we
+            // keep re-checking `stopped`.
+            let Ok((id, addr)) = self.resolve(&name, Some(Duration::from_millis(200))) else {
+                std::thread::sleep(BACKOFF);
+                continue;
+            };
+            // Resume from the replica's current head (0 if it doesn't exist yet).
+            let from = self
+                .replica_head(&replica_path, id.region_size)
+                .unwrap_or(RecordIndex(0));
+            synced.store(from.0, Ordering::Relaxed);
+
+            let Ok(conn) = TcpTransport::connect(addr) else {
+                std::thread::sleep(BACKOFF);
+                continue;
+            };
+            let shutdown_handle = conn.try_clone().ok();
+            let Ok(mut client) = stream::subscribe(conn, &name, from, &replica_path) else {
+                std::thread::sleep(BACKOFF);
+                continue;
+            };
+            *shutdown.lock().unwrap() = shutdown_handle;
+
+            // Apply records until the connection drops or we're stopped.
+            loop {
+                if stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                match client.recv_one() {
+                    Ok(()) => synced.store(client.expected_index().0, Ordering::Relaxed),
+                    Err(_) => break, // disconnected → reconnect (resuming from the new head)
+                }
+            }
+            *shutdown.lock().unwrap() = None;
+            if stopped.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(BACKOFF);
+        }
+    }
+
+    /// Absolute head index of an existing replica (so a subscription resumes from there),
+    /// or 0 if the replica doesn't exist yet. Reopens the channel briefly to read its head;
+    /// `region_size` must match the on-disk geometry (taken from the registry identity).
+    fn replica_head(&self, replica_path: &Path, region_size: u32) -> io::Result<RecordIndex> {
+        if !replica_path.exists() {
+            return Ok(RecordIndex(0));
+        }
+        let writer = WriterBuilder::new(replica_path)
+            .region_size(region_size as usize)
+            .build()?;
+        Ok(RecordIndex(writer.next_record_index()))
+    }
+
+    /// Stop and forget a subscription this node maintains for a client. Returns whether one
+    /// was found.
+    pub fn unsubscribe(&self, name: &str) -> bool {
+        if let Some(sub) = self.subscriptions.lock().unwrap().remove(name) {
+            sub.stop();
+            true
+        } else {
+            false
+        }
     }
 
     /// Block (until `timeout`) until `name` is in the registry and its owner's address is
@@ -384,11 +480,16 @@ impl Node {
     }
 }
 
-/// Handle to an in-progress subscription replicating a remote channel locally.
+/// Handle to a self-healing subscription replicating a remote channel locally. Dropping it
+/// stops the background loop.
 pub struct Subscription {
     replica_path: PathBuf,
     synced: Arc<AtomicU64>,
-    _handle: JoinHandle<()>,
+    stopped: Arc<AtomicBool>,
+    /// The currently-live connection (if any), so [`stop`](Self::stop) can interrupt a
+    /// blocked read by shutting it down.
+    shutdown: Arc<Mutex<Option<TcpTransport>>>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl Subscription {
@@ -397,10 +498,33 @@ impl Subscription {
         &self.replica_path
     }
 
-    /// Absolute index up to which the replica has been synced (records applied = this
-    /// minus the start index). Grows as the stream is consumed.
+    /// Absolute index the replica has been synced to (the head). Grows as records arrive.
     pub fn synced_index(&self) -> u64 {
         self.synced.load(Ordering::Relaxed)
+    }
+
+    /// Whether the background loop is still running (not stopped).
+    pub fn is_active(&self) -> bool {
+        !self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Stop the background loop: set the flag and shut down the live socket so a blocked
+    /// read returns. Idempotent.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        if let Some(conn) = self.shutdown.lock().unwrap().as_ref() {
+            let _ = conn.shutdown();
+        }
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.stop();
+        // Best-effort join so the replica writer is released before we return.
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -505,6 +629,32 @@ mod tests {
         // The replica syncs all records purely through the two managers.
         poll_until(|| (sub.synced_index() == n).then_some(()));
         assert_eq!(sub.synced_index(), n);
+    }
+
+    #[test]
+    fn subscription_stops_cleanly() {
+        let (a, _a_stream, a_control) = start(11, "stop-a");
+        let (b, _b_stream, _b_control) = start(12, "stop-b");
+        let n = 10u64;
+        {
+            let mut w = a.host_channel("c", 1 << 20, 0, |x| x).unwrap();
+            for i in 0..n {
+                let p = format!("r{i}").into_bytes();
+                let buf = w.try_reserve(p.len()).unwrap();
+                buf.copy_from_slice(&p);
+                w.commit(0, p.len() as u32, i).unwrap();
+            }
+        }
+        b.connect_control_peer(a_control).unwrap();
+
+        let sub = b.subscribe("c", Some(Duration::from_secs(5))).unwrap();
+        poll_until(|| (sub.synced_index() == n).then_some(()));
+        assert!(sub.is_active());
+
+        sub.stop();
+        assert!(!sub.is_active());
+        assert_eq!(sub.synced_index(), n, "sync frozen after stop");
+        // Dropping `sub` joins the background thread; must not hang.
     }
 
     #[test]

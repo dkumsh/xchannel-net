@@ -57,6 +57,13 @@ impl TcpTransport {
             stream: self.stream.try_clone()?,
         })
     }
+
+    /// Shut down the connection in both directions. A blocking `recv_frame` on this socket
+    /// (e.g. on another clone) returns promptly with an error — used to interrupt a reader
+    /// thread on stop/unsubscribe.
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
+    }
 }
 
 impl Transport for TcpTransport {
