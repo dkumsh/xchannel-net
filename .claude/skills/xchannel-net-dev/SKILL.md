@@ -83,7 +83,9 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   ├── transport.rs          Transport + Listener traits; TcpTransport/TcpListener
 │   │                         (std-only, u32-LE length-delimited, NODELAY, MAX_FRAME_LEN)
 │   ├── dissemination.rs      Dissemination trait — the swappable broadcast/gossip seam
-│   └── replication.rs        ReplicationSource / ReplicationSink (engine, stubbed)
+│   └── replication.rs        ReplicationSource (tail→frames) / ReplicationSink
+│   │                         (frames→replica) — implemented over xchannel 4.0.0; absolute
+│   │                         RecordIndex via base_record_index + next_record_index()
 ├── xchannel-net/             the node-manager daemon (lib + bin)
 │   ├── registry.rs           Registry: CRDT merge over ChannelIdentity (+ tests)
 │   └── broadcast.rs          BroadcastDissemination<T: Transport> (v1 impl, stubbed)
@@ -137,20 +139,21 @@ _As of 2026-06-21:_
 - On `main`: scaffold + doc reconciliation + dep repoint. Dep is now
   **`xchannel = { version = "4.0.0" }`** (published on crates.io; resolves from registry).
 - Scaffold builds clean; `registry` collision tests pass (2).
-- **Wire codec + TCP transport implemented** (`core::codec`, `core::transport::Tcp*`;
-  hand-rolled LE, zero deps; 9 core tests incl. codec-over-TCP). Dissemination + engine
-  bodies are still `unimplemented!` stubs.
+- Implemented in `core`: **codec** (`core::codec`), **TCP transport** (`core::transport::Tcp*`),
+  and the **replication engines** (`core::replication`, real xchannel-backed, end-to-end
+  origin→replica round-trip test). 12 core tests, clippy clean.
+- Still `unimplemented!`: `BroadcastDissemination` bodies; node-manager event loop; client bodies.
 - **xchannel 4.0.0 is published** (format_version 2, intrinsic absolute `RecordIndex`).
-- Next real code step: **`BroadcastDissemination` bodies + heartbeats** (Next steps §3),
-  then the replication engines (§4).
+- Next: **`BroadcastDissemination` bodies + heartbeats** (Next steps §3), then the
+  node-manager event loop wiring registry ⇄ dissemination ⇄ replication (§5).
 
 ## Next steps (rough order; depends-on noted)
 
 1. ~~**Wire serialization**~~ — **done** (`core::codec`, hand-rolled LE, zero deps).
 2. ~~**TCP `Transport` + `Listener`**~~ — **done** (`core::transport::Tcp*`, std-only).
 3. **`BroadcastDissemination`** bodies (announce / pump / live_members) + heartbeats.
-4. **`ReplicationSource` / `ReplicationSink`** bodies over real xchannel readers/writers.
-5. Node-manager event loop wiring registry ⇄ dissemination ⇄ replication; client API.
+4. ~~**`ReplicationSource` / `ReplicationSink`**~~ — **done** (`core::replication`).
+5. Node-manager event loop wiring registry ⇄ dissemination ⇄ replication; client bodies.
 
 ## Open questions (see DESIGN.md §8)
 
