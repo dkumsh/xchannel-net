@@ -1,0 +1,12 @@
+[package]
+name = "xchannel-net-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Thin client library for talking to a local xchannel-net node manager."
+
+[dependencies]
+xchannel-net-core.workspace = true
+xchannel.workspace = true

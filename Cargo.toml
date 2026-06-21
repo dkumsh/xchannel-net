@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = [
+    "xchannel-net-core",
+    "xchannel-net",
+    "xchannel-net-client",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/dkumsh/xchannel-net"
+authors = ["Dmitriy Kumshayev <dq@mail.com>"]
+
+[workspace.dependencies]
+# The log/IPC substrate this project replicates over the network.
+xchannel = { version = "4.0.0" }
+
+# Internal crates referencing each other.
+xchannel-net-core = { path = "xchannel-net-core" }

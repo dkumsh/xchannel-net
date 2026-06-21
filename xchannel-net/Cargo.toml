@@ -1,0 +1,20 @@
+[package]
+name = "xchannel-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Node manager daemon for xchannel-net: registry, gossip discovery, and TCP replication."
+
+[lib]
+name = "xchannel_net"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xchannel-net"
+path = "src/main.rs"
+
+[dependencies]
+xchannel-net-core.workspace = true
+xchannel.workspace = true

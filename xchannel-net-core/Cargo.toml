@@ -1,0 +1,11 @@
+[package]
+name = "xchannel-net-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Wire types, channel identity, and transport-agnostic replication engine for xchannel-net."
+
+[dependencies]
+xchannel.workspace = true
