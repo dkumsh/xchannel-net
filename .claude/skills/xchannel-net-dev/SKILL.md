@@ -123,9 +123,9 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
 - Future SWIM (only if node count outgrows ~100): **`foca` 1.0.0** is the fit
   (runtime/transport-agnostic, `no_std+alloc`, no forced tokio). `chitchat` 0.11.0 is
   prior art but hard-depends on tokio. `libp2p`/gossipsub rejected (wrong scale/shape).
-- `xchannel` is the substrate (path dep `../xchannel` during co-dev; pin a release once
-  the v2 change ships). Key facts (Live/LateJoin, reserve/commit, file rolling, retention
-  via `keep_files`, byte-offset resume) are mapped in DESIGN.md §1.
+- `xchannel` is the substrate — the published crates.io release `xchannel = "4.0.0"` (the
+  v2 format change has shipped). Key facts (Live/LateJoin, reserve/commit, file rolling,
+  retention via `keep_files`, byte-offset resume) are mapped in DESIGN.md §1.
 - **Verified: reopen-for-append** (`Writer::open_or_create` → `open_file`): a restarted
   writer reopens the latest segment without truncation, resumes at the persisted
   `write_position`, with bounded crash recovery (INV5). Load-bearing for §5; no special

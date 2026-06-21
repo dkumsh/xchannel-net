@@ -51,6 +51,24 @@ fn main() -> std::io::Result<()> {
         client_listener.local_addr()?,
     );
 
+    // Security: all planes are unauthenticated plaintext (see SECURITY.md). Warn loudly
+    // when any plane is bound off-loopback, where any reachable host can register names,
+    // pull any channel's history, and inject registry/membership gossip.
+    for (plane, addr) in [
+        ("stream", stream_addr),
+        ("control", control_addr),
+        ("client", client_addr),
+    ] {
+        if !addr.ip().is_loopback() {
+            eprintln!(
+                "xchanneld[{node_id}]: WARNING: {plane} plane bound to non-loopback {addr} \
+                 — all planes are UNAUTHENTICATED plaintext; any reachable host can \
+                 register, subscribe, and gossip. Bind only to trusted networks. See \
+                 SECURITY.md."
+            );
+        }
+    }
+
     node.connect_seeds();
     for (node, run) in [
         (node.clone(), Plane::Control(control_listener)),
