@@ -354,13 +354,26 @@ Each `Record` carries its own `index` so the sink asserts contiguity before `com
 
 ## 7. Client API sketch (`xchannel-net-client`)
 
-- `create_channel(name) -> Writer` — create + register a master this node owns.
-- `register_existing(name, path)` — make an existing local channel network-visible.
+- `create_channel(name, configure: FnOnce(WriterBuilder) -> WriterBuilder) -> Writer` —
+  create + register an origin this node owns. **Manager owns placement, caller owns shape:**
+  the manager seeds `WriterBuilder::new(<path under data_dir>)` and hands it to `configure`,
+  so all builder options are available with no client-side duplication or drift, and
+  placement can't be overridden (`WriterBuilder` has no path setter). The manager registers
+  by reading `region_size`/`mtu` from the resulting header. `base_record_index` is
+  manager-owned (0 for a new origin) and must not be set in `configure`.
+- `register_existing(name, path)` — full-control path: caller built the `Writer` itself
+  with plain `WriterBuilder`; the manager reads geometry from the header and registers.
+  Caveat: keep `path` under `data_dir` or restart-rediscovery (§5.2) can't find it.
 - `subscribe(name, SubscribeMode, WaitPolicy) -> Reader` — discover, ensure the local
   replica is synced, return a local reader.
   - `SubscribeMode = Live | LateJoin` — where the returned reader starts.
   - `WaitPolicy = Block | Poll { interval } | FailFast` — behavior when the channel is
     not yet known to the network.
+
+Placement-vs-shape split: the manager dictates *where* (under `data_dir`, for serving +
+restart rediscovery), the caller dictates *how* (geometry/retention). Handing over the
+real `WriterBuilder` keeps full option control in the caller without the client mirroring
+xchannel's option set.
 
 ---
 

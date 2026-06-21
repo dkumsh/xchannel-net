@@ -41,15 +41,47 @@ impl Client {
         unimplemented!("open control transport to the local manager")
     }
 
-    /// Create a channel owned by this node and register it network-wide. Returns the
-    /// local `xchannel::Writer` for the master.
-    pub fn create_channel(&self, _name: &str) -> io::Result<xchannel::Writer> {
-        unimplemented!("ask manager to create+register master; return local Writer")
+    /// Create a channel owned by this node and register it network-wide, returning the
+    /// local `xchannel::Writer` for the origin.
+    ///
+    /// The manager owns *placement* (the file lives under the node's `data_dir` so it can
+    /// be served and rediscovered on restart — DESIGN §5.2). The caller owns *shape*: the
+    /// manager seeds `WriterBuilder::new(<resolved path>)` and hands it to `configure`, so
+    /// every builder option is available with no client-side duplication. `WriterBuilder`
+    /// has no path setter, so `configure` cannot override placement.
+    ///
+    /// Do **not** set `base_record_index` in `configure` — it is manager-owned and stays 0
+    /// (genesis) for a new origin; it exists for replicas (see [`ReplicationSink`] usage).
+    ///
+    /// The manager registers the channel by reading `region_size`/`mtu` from the resulting
+    /// channel header, so replicas can be built compatibly.
+    ///
+    /// ```ignore
+    /// let w = client.create_channel("md.aapl", |b| {
+    ///     b.region_size(1 << 20).file_roll_size(1 << 30).keep_files(8)
+    /// })?;
+    /// ```
+    ///
+    /// [`ReplicationSink`]: xchannel_net_core::replication::ReplicationSink
+    pub fn create_channel(
+        &self,
+        _name: &str,
+        _configure: impl FnOnce(xchannel::WriterBuilder) -> xchannel::WriterBuilder,
+    ) -> io::Result<xchannel::Writer> {
+        unimplemented!(
+            "resolve path under data_dir; new(path) -> configure -> build; register; return Writer"
+        )
     }
 
-    /// Register an already-created local channel as network-visible.
+    /// Register an already-created local channel as network-visible. Full-control path for
+    /// a caller who built the `Writer` itself with plain `xchannel::WriterBuilder`; the
+    /// manager reads the channel header for geometry and registers it.
+    ///
+    /// Caveat: unless `path` is under the node's `data_dir`, the manager cannot rediscover
+    /// the channel on restart (DESIGN §5.2) — keep it under `data_dir`, or re-register
+    /// after a restart.
     pub fn register_existing(&self, _name: &str, _path: &std::path::Path) -> io::Result<()> {
-        unimplemented!("send ControlMsg::Register; handle RegisterRejected")
+        unimplemented!("send ControlMsg::Register (geometry from header); handle RegisterRejected")
     }
 
     /// Subscribe to a channel by name and obtain a local `xchannel::Reader` over the

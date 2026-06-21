@@ -87,7 +87,10 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 ├── xchannel-net/             the node-manager daemon (lib + bin)
 │   ├── registry.rs           Registry: CRDT merge over ChannelIdentity (+ tests)
 │   └── broadcast.rs          BroadcastDissemination<T: Transport> (v1 impl, stubbed)
-└── xchannel-net-client/      thin client lib (create/register/subscribe)
+└── xchannel-net-client/      thin client lib. create_channel takes a
+                              FnOnce(WriterBuilder)->WriterBuilder closure: manager owns
+                              placement (path under data_dir), caller owns shape (all
+                              builder opts, no drift). See DESIGN §7.
 ```
 
 **Convergence vs dissemination are separate concerns.** The registry merge is a fixed
