@@ -89,7 +89,7 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   └── stream.rs             Stream-plane protocol over a Transport (generic): origin
 │   │                         accept_subscription→StreamServer; subscriber subscribe→
 │   │                         StreamClient. Drives the engines; tested over loopback TCP.
-├── xchannel-net/             the node-manager daemon (lib + bin)
+├── xchannel-net/             the node-manager daemon — lib + bin `xchanneld`
 │   ├── registry.rs           Registry: CRDT merge over ChannelIdentity (+ tests)
 │   └── broadcast.rs          BroadcastDissemination<T: Transport> (v1 impl, stubbed)
 └── xchannel-net-client/      thin client lib. create_channel takes a

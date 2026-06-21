@@ -1,5 +1,5 @@
-//! Node manager entry point (scaffold).
+//! `xchanneld` — the xchannel-net node-manager daemon entry point (scaffold).
 
 fn main() {
-    eprintln!("xchannel-net node manager — scaffold; see DESIGN.md for the architecture.");
+    eprintln!("xchanneld — node-manager daemon (scaffold); see DESIGN.md for the architecture.");
 }

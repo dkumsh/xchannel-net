@@ -131,7 +131,7 @@ data is bulk and throughput-sensitive. They must never share a pipe.
 | Crate | Role |
 |---|---|
 | `xchannel-net-core` | Transport-agnostic: `identity`, `wire` frames, `transport` trait, `replication` engines. No opinion on TCP vs RDMA vs local IPC. |
-| `xchannel-net` | The node-manager daemon: `registry` (CRDT merge), discovery/creation service, concrete TCP transport. |
+| `xchannel-net` | The node-manager daemon (binary **`xchanneld`**): `registry` (CRDT merge), discovery/creation service, concrete TCP wiring. |
 | `xchannel-net-client` | Thin library clients link against to talk to their **local** manager. |
 
 A client never talks to a remote node directly — only to its local manager, then

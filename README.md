@@ -19,5 +19,5 @@ engine bodies are stubbed (`unimplemented!`) pending the next implementation rou
 | Crate | Role |
 |---|---|
 | `xchannel-net-core` | Transport-agnostic identity, wire frames, transport trait, replication engines. |
-| `xchannel-net` | Node-manager daemon: CRDT registry, decentralized discovery, TCP replication. |
+| `xchannel-net` | Node-manager daemon (binary `xchanneld`): CRDT registry, decentralized discovery, TCP replication. |
 | `xchannel-net-client` | Thin client library for talking to the local node manager. |

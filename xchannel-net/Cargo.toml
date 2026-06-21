@@ -5,14 +5,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Node manager daemon for xchannel-net: registry, gossip discovery, and TCP replication."
+description = "xchanneld — the xchannel-net node-manager daemon: registry, discovery, and TCP replication."
 
 [lib]
 name = "xchannel_net"
 path = "src/lib.rs"
 
 [[bin]]
-name = "xchannel-net"
+name = "xchanneld"
 path = "src/main.rs"
 
 [dependencies]
