@@ -6,10 +6,12 @@ several managers may share a host). Managers provide a **discovery service** and
 **creation service**; the data plane replicates a channel's records from its single
 owner to read-only replicas on subscribing nodes.
 
-> **Lineage.** The *management layer* — Nodes, a channel-name/discovery service,
-> rendezvous; xchannel is a persistent, ordered, replayable single-writer log. So the
-> data plane is **log replication / pub-sub**, closer in spirit to Aeron + Aeron Archive
-> replication than to a remote rendezvous.
+> **Prior art (influences, not a model we follow).** The *management layer* — Nodes, a
+> name-based discovery/creation service, register-and-find-by-name — echoes ideas from
+> several distributed messaging and naming systems, but our registry is a decentralized
+> gossiped CRDT, not a central name server. The *data semantics* are a persistent,
+> ordered, replayable single-writer log, so the data plane is **log replication / pub-sub**
+> — closest in spirit to Aeron + Aeron Archive replication.
 
 ---
 

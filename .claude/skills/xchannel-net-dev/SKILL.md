@@ -15,9 +15,10 @@ orientation layer; when they disagree, DESIGN.md wins — and update both.
 
 ## Mental model (read this first)
 
-  Networking lineage is only the *management layer* (Nodes, name-based discovery,
-  register/find). Data semantics come from xchannel (persistent ordered replayable log).
-  Nearest prior art: Aeron + Aeron Archive replication.
+- This is **single-writer log replication / pub-sub**, NOT remote rendezvous. The networked
+  part is only the *management layer* (Nodes, name-based discovery, register/find); data
+  semantics come from xchannel (persistent ordered replayable log). Nearest prior art:
+  Aeron + Aeron Archive replication.
 - **xchannel is single-writer.** ⇒ each logical channel has exactly one authoritative
   `Writer` on one owner node; every other node holds a **read-only replica**. There is
   **no consensus on the data path** — it is single-source fan-out. Preserve this invariant

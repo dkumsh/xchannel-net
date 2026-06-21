@@ -6,13 +6,18 @@ creation service**; a channel's records are replicated from its single owner nod
 read-only replicas on subscribing nodes, where local clients read them with plain
 xchannel.
 
-Networking. The data model is **single-writer log replication** — see
-[`DESIGN.md`](DESIGN.md) for the full architecture and the decisions behind it.
+The management model is a **decentralized mesh of node managers**: flat global channel
+names, register-and-discover through a gossiped last-writer-wins registry, and
+heartbeat-based membership to locate a channel's owner. The data model is **single-writer
+log replication**. See [`DESIGN.md`](DESIGN.md) for the full architecture, the decisions
+behind it, and the prior art that informed it.
 
 ## Status
 
-Early scaffold. The architecture and protocol shapes are pinned in `DESIGN.md`; the
-engine bodies are stubbed (`unimplemented!`) pending the next implementation round.
+Working v1: an external client process talks to its local `xchanneld` daemon to create or
+subscribe to channels; the daemon discovers channels across the mesh, locates owners, and
+replicates single-writer logs byte-faithfully between nodes. See `DESIGN.md` for the
+architecture and the remaining refinements.
 
 ## Workspace
 
