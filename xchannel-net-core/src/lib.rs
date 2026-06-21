@@ -11,6 +11,7 @@
 pub mod codec;
 pub mod dissemination;
 pub mod identity;
+pub mod membership;
 pub mod transport;
 pub mod wire;
 

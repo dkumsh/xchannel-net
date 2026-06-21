@@ -48,6 +48,15 @@ impl TcpTransport {
         stream.set_nodelay(true)?;
         Ok(Self { stream })
     }
+
+    /// Duplicate the handle to the same connection. Both refer to one socket — used to run
+    /// a blocking reader on one half while the other half sends (e.g. the control plane's
+    /// per-peer reader thread vs. broadcast sends). Reads and writes are independent.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            stream: self.stream.try_clone()?,
+        })
+    }
 }
 
 impl Transport for TcpTransport {

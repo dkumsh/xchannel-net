@@ -68,6 +68,11 @@ impl<'a> W<'a> {
     fn str(&mut self, s: &str) {
         self.bytes(s.as_bytes());
     }
+    /// Socket address as its text form (handles v4/v6 uniformly).
+    #[inline]
+    fn addr(&mut self, a: std::net::SocketAddr) {
+        self.str(&a.to_string());
+    }
 }
 
 // ---------- low-level reader (borrows the input frame) ----------
@@ -122,6 +127,12 @@ impl<'a> R<'a> {
         std::str::from_utf8(b)
             .map(str::to_owned)
             .map_err(|_| invalid("invalid utf-8 in string field"))
+    }
+    #[inline]
+    fn addr(&mut self) -> io::Result<std::net::SocketAddr> {
+        self.str()?
+            .parse()
+            .map_err(|_| invalid("invalid socket address field"))
     }
     /// Reject a frame with trailing bytes — a sign of version/shape mismatch.
     #[inline]
@@ -206,9 +217,10 @@ pub fn encode_control_into(buf: &mut Vec<u8>, m: &ControlMsg) {
             w.u8(control_tag::REGISTRY_SYNC);
             put_identities(&mut w, ids);
         }
-        ControlMsg::Heartbeat { node } => {
+        ControlMsg::Heartbeat { node, addr } => {
             w.u8(control_tag::HEARTBEAT);
             w.u64(node.0);
+            w.addr(*addr);
         }
         ControlMsg::RegisterRejected { name, winner } => {
             w.u8(control_tag::REGISTER_REJECTED);
@@ -237,6 +249,7 @@ pub fn decode_control(bytes: &[u8]) -> io::Result<ControlMsg> {
         control_tag::REGISTRY_SYNC => ControlMsg::RegistrySync(get_identities(&mut r)?),
         control_tag::HEARTBEAT => ControlMsg::Heartbeat {
             node: NodeId(r.u64()?),
+            addr: r.addr()?,
         },
         control_tag::REGISTER_REJECTED => ControlMsg::RegisterRejected {
             name: r.str()?,
@@ -377,7 +390,10 @@ mod tests {
             },
             ControlMsg::RegistryDelta(vec![ident("a", 1), ident("b", 2)]),
             ControlMsg::RegistrySync(vec![]),
-            ControlMsg::Heartbeat { node: NodeId(42) },
+            ControlMsg::Heartbeat {
+                node: NodeId(42),
+                addr: "127.0.0.1:7000".parse().unwrap(),
+            },
             ControlMsg::RegisterRejected {
                 name: "dup".into(),
                 winner: NodeId(9),
@@ -461,7 +477,10 @@ mod tests {
 
     #[test]
     fn trailing_bytes_error() {
-        let mut bytes = encode_control(&ControlMsg::Heartbeat { node: NodeId(1) });
+        let mut bytes = encode_control(&ControlMsg::Heartbeat {
+            node: NodeId(1),
+            addr: "127.0.0.1:1".parse().unwrap(),
+        });
         bytes.push(0xAB);
         assert!(decode_control(&bytes).is_err());
     }

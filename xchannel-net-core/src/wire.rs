@@ -6,6 +6,7 @@
 
 use crate::identity::{ChannelIdentity, ChannelName};
 use crate::{NodeId, RecordIndex, StreamId};
+use std::net::SocketAddr;
 
 /// One self-describing log record as it travels on the data plane.
 ///
@@ -38,7 +39,10 @@ pub enum ControlMsg {
     /// peer catches up on anything it missed while disconnected.
     RegistrySync(Vec<ChannelIdentity>),
     /// Node membership heartbeat (membership liveness, distinct from writer liveness).
-    Heartbeat { node: NodeId },
+    /// Carries the sender's stream-plane address so peers can resolve `owner: NodeId`
+    /// (from a [`ChannelIdentity`]) to where they must connect to subscribe — the
+    /// separate-membership-map approach (DESIGN §9: identity stays address-free).
+    Heartbeat { node: NodeId, addr: SocketAddr },
     /// Registration was rejected because another registration won the name.
     RegisterRejected { name: ChannelName, winner: NodeId },
 }

@@ -80,8 +80,10 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   │                         encode/decode_stream (+ *_into for buffer reuse). Transport
 │   │                         owns frame length-delimiting; 1-byte tag + u32-prefixed
 │   │                         bytes/strings; Record is flat fixed header + payload.
-│   ├── transport.rs          Transport + Listener traits; TcpTransport/TcpListener
-│   │                         (std-only, u32-LE length-delimited, NODELAY, MAX_FRAME_LEN)
+│   ├── transport.rs          Transport + Listener traits; TcpTransport (+ try_clone) /
+│   │                         TcpListener (std-only, u32-LE length-delimited, MAX_FRAME_LEN)
+│   ├── membership.rs         Membership: NodeId→addr + heartbeat liveness (separate map;
+│   │                         ChannelIdentity stays address-free, DESIGN §9)
 │   ├── dissemination.rs      Dissemination trait — the swappable broadcast/gossip seam
 │   ├── replication.rs        ReplicationSource (tail→frames) / ReplicationSink
 │   │                         (frames→replica) — implemented over xchannel 4.0.0; absolute
@@ -94,7 +96,9 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   │                         (accept loop, per-conn StreamServer thread, resolver over
 │   │                         hosted map). main.rs wires it into the `xchanneld` binary.
 │   ├── registry.rs           Registry: CRDT merge over ChannelIdentity (+ tests)
-│   └── broadcast.rs          BroadcastDissemination<T: Transport> (v1 impl, stubbed)
+│   └── broadcast.rs          BroadcastDissemination (concrete/TCP): per-peer reader
+│   │                         threads → inbox + Membership; announce/emit_heartbeat/pump/
+│   │                         addr_of/live_members. Implements core::dissemination trait.
 └── xchannel-net-client/      thin client lib. create_channel takes a
                               FnOnce(WriterBuilder)->WriterBuilder closure: manager owns
                               placement (path under data_dir), caller owns shape (all
@@ -151,13 +155,15 @@ _As of 2026-06-21:_
 - **`xchanneld` serving half is live**: `Node::host_channel` + `Node::serve_stream`
   (threaded accept/dispatch) replicate a hosted channel to a subscriber over TCP; the
   `xchanneld` binary runs it (env-configured). Tested.
-- Still `unimplemented!`/missing: `BroadcastDissemination` bodies; the **subscriber-side**
-  daemon routing (resolve owner address via registry → pull replica → expose to clients);
-  the **control plane** (peer gossip + client RPC); `xchannel-net-client` bodies.
+- **Dissemination done**: `BroadcastDissemination` (TCP) propagates registry deltas/syncs
+  and learns peer addresses via heartbeats into `Membership`; verified over loopback TCP.
+- Still missing: the daemon's **control listener** wiring (accept peer links → add_peer;
+  periodic heartbeat; merge `pump()` output into the shared `Registry`); the
+  **subscriber-side `Node`** routing (registry → `addr_of(owner)` → `stream::subscribe` →
+  replica → expose to clients); **client RPC** (`xchannel-net-client` bodies).
 - **xchannel 4.0.0 is published** (format_version 2, intrinsic absolute `RecordIndex`).
-- Next: **control plane / membership** — needs node→address resolution (owner stream addr
-  isn't in `ChannelIdentity` yet). `BroadcastDissemination` (§3) + a membership map feed
-  this; then subscriber-side `Node` routing.
+- Next: wire the **control plane into `Node`** (peer links + heartbeat loop + registry
+  merge), then **subscriber-side subscribe** using `addr_of` to locate owners.
 
 ## Next steps (rough order; depends-on noted)
 
@@ -168,9 +174,12 @@ _As of 2026-06-21:_
 5. Node-manager loop: **serving half done** (`Node::serve_stream`, `xchanneld` bin).
    Remaining: subscriber-side routing (registry → owner addr → pull replica), control
    plane (peer gossip + client RPC), `xchannel-net-client` bodies.
-6. **Membership / address resolution** — `ChannelIdentity` carries `owner: NodeId` but no
-   address; need NodeId→stream-addr (seed config + heartbeats/dissemination) before a
-   subscriber daemon can locate an owner. Gates subscriber-side §5.
+6. ~~**Membership / address resolution**~~ — **done** (`core::membership`, fed by
+   `BroadcastDissemination` heartbeats; `addr_of(owner)` resolves where to connect).
+7. **Wire control plane into `Node`**: control listener (accept → `add_peer`), heartbeat
+   loop, drain `pump()` into the shared `Registry`. Then **subscriber-side `Node`**:
+   resolve owner via registry+`addr_of` → `stream::subscribe` → run `StreamClient` thread
+   → expose replica path. Then **client RPC** for external clients.
 
 ## Open questions (see DESIGN.md §8)
 
