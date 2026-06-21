@@ -83,9 +83,12 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   ├── transport.rs          Transport + Listener traits; TcpTransport/TcpListener
 │   │                         (std-only, u32-LE length-delimited, NODELAY, MAX_FRAME_LEN)
 │   ├── dissemination.rs      Dissemination trait — the swappable broadcast/gossip seam
-│   └── replication.rs        ReplicationSource (tail→frames) / ReplicationSink
+│   ├── replication.rs        ReplicationSource (tail→frames) / ReplicationSink
 │   │                         (frames→replica) — implemented over xchannel 4.0.0; absolute
 │   │                         RecordIndex via base_record_index + next_record_index()
+│   └── stream.rs             Stream-plane protocol over a Transport (generic): origin
+│   │                         accept_subscription→StreamServer; subscriber subscribe→
+│   │                         StreamClient. Drives the engines; tested over loopback TCP.
 ├── xchannel-net/             the node-manager daemon (lib + bin)
 │   ├── registry.rs           Registry: CRDT merge over ChannelIdentity (+ tests)
 │   └── broadcast.rs          BroadcastDissemination<T: Transport> (v1 impl, stubbed)
@@ -139,13 +142,15 @@ _As of 2026-06-21:_
 - On `main`: scaffold + doc reconciliation + dep repoint. Dep is now
   **`xchannel = { version = "4.0.0" }`** (published on crates.io; resolves from registry).
 - Scaffold builds clean; `registry` collision tests pass (2).
-- Implemented in `core`: **codec** (`core::codec`), **TCP transport** (`core::transport::Tcp*`),
-  and the **replication engines** (`core::replication`, real xchannel-backed, end-to-end
-  origin→replica round-trip test). 12 core tests, clippy clean.
-- Still `unimplemented!`: `BroadcastDissemination` bodies; node-manager event loop; client bodies.
+- Implemented in `core`: **codec**, **TCP transport**, **replication engines**, and the
+  **stream-plane protocol** (`core::stream`) — a channel replicates origin→replica over
+  loopback TCP end-to-end. 14 core tests, clippy clean.
+- Still `unimplemented!`: `BroadcastDissemination` bodies; the manager's accept/dispatch
+  loop + registry/control-plane wiring; client bodies.
 - **xchannel 4.0.0 is published** (format_version 2, intrinsic absolute `RecordIndex`).
-- Next: **`BroadcastDissemination` bodies + heartbeats** (Next steps §3), then the
-  node-manager event loop wiring registry ⇄ dissemination ⇄ replication (§5).
+- Next (manager loop, §5): the **control plane + accept/dispatch loop** — bind listeners,
+  route Subscribe to `stream::accept_subscription`, wire the registry, expose client API.
+  `BroadcastDissemination` (§3) interleaves.
 
 ## Next steps (rough order; depends-on noted)
 

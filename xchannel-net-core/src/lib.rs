@@ -15,6 +15,7 @@ pub mod transport;
 pub mod wire;
 
 pub mod replication;
+pub mod stream;
 
 /// Stable identifier for a node manager within the mesh.
 ///
