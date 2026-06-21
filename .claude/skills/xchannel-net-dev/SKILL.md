@@ -151,37 +151,36 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
 
 ## Current status (update this section as work lands)
 
-_As of 2026-06-21:_
-- On `main`: scaffold + doc reconciliation + dep repoint. Dep is now
-  **`xchannel = { version = "4.0.0" }`** (published on crates.io; resolves from registry).
-- Scaffold builds clean; `registry` collision tests pass (2).
-- `core` complete: **codec**, **TCP transport**, **replication engines**, **stream-plane
-  protocol**, **membership**. Dep is published `xchannel = "4.0.0"`.
-- **Feature-complete v1 path**: external client process → `Client` RPC → local `xchanneld`
-  → gossip discovery + membership → cross-node replication. A two-node test and a
-  client↔daemon RPC integration test pass on top of per-layer unit tests. ~26 tests,
-  clippy clean, release builds. The `xchanneld` binary serves stream + control + **client**
-  planes + maintenance + seeds (env-config); `Client::connect_or_spawn` auto-starts it.
-- Refinements remaining: **auto-spawn cross-process test** (not automated yet; spawns a
-  real binary, `connect_or_spawn` uses `$XCHANNELD_BIN`/PATH, no `setsid`); **subscription
-  lifecycle** (stop/unsubscribe — threads run until conn drops); **resume** (subscribe is
-  fresh `from=0`); precise live-`head`; registry **tombstones** (§8 deregister).
-- Next: pick from refinements — subscription lifecycle / resume are most user-visible; a
-  cross-process spawn test would harden `connect_or_spawn`.
+_As of 2026-06-22:_
+- Dep is published **`xchannel = "4.0.0"`**. `.justfile` present in every commit; every
+  commit passes `just check` (cargo check + fmt --check + clippy --all-targets).
+- **v1 complete and hardened.** External client process → `Client` RPC → local `xchanneld`
+  → gossip discovery + membership → cross-node replication. Hardening done:
+  - **Self-healing subscriptions**: `Node::run_subscription` resumes from the replica head,
+    reconnects on drop (backoff), and is stoppable (`Subscription::stop`/`unsubscribe`,
+    socket shutdown to interrupt blocked reads). Idempotent `subscribe` RPC.
+  - **Control-plane reconnection**: maintenance re-dials dropped seeds (tracked outbound
+    peers, deduped, bounded `connect_timeout`).
+  - **Replicas live under `data_dir/.replicas/<name>`**, distinct from origins
+    (`data_dir/<name>`) — no collision when a node subscribes to a channel it also hosts.
+  - **Cross-process test** spawns the real `xchanneld` and replicates via `Client` across
+    processes (reads the replica — only possible cross-process). `Client::subscribe`
+    retries the replica open (async creation race).
+- ~28 tests across unit + two-node + client-RPC + cross-process; clippy clean; release builds.
 
-## Next steps
+## Next steps (post-v1 polish, optional)
 
-The full v1 pipeline is **done** (codec, transport, replication engines, stream protocol,
-membership, dissemination, `Node` control plane + subscribe, `xchannel-net-client`,
-`xchanneld` binary). Remaining work is refinements, roughly by user-visibility:
-
-1. **Subscription lifecycle** — `stop`/unsubscribe (shutdown the socket; today the replica
-   thread runs until the conn drops); track + clean up `Node.subscriptions`.
-2. **Resume** — `subscribe` is fresh `from=0`; reopen an existing replica from its head.
-3. **Auto-spawn hardening** — `setsid`/daemonize in `connect_or_spawn`; a cross-process
-   integration test (spawn the real binary, read the replica from the test process).
-4. **Precise live-`head`** in `SubscribeAck` (sync milestone); registry **tombstones** for
-   deregister (§8); backpressure/`Gap` policy.
+1. **Auto-spawn hardening** — `connect_or_spawn` works (`$XCHANNELD_BIN`/PATH) but doesn't
+   `setsid`/daemonize; its exact wrapper isn't automated-tested (the cross-process test
+   spawns the daemon directly).
+2. **Deregistration / tombstones** (§8) — `Deregister` is on the wire but unhandled; an old
+   `Register` can resurrect a removed name.
+3. **Precise live-`head`** in `SubscribeAck` (currently `head = start` placeholder); a
+   "synced" milestone signal.
+4. **Membership pruning** — `Membership::forget_stale` exists but nothing calls it; the
+   maintenance loop could prune dead peers.
+5. **Observability / graceful shutdown** — daemon loops swallow errors (`let _ =`); no
+   logging or clean shutdown.
 
 ## Open questions (see DESIGN.md §8)
 
