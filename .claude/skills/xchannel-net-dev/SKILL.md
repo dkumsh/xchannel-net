@@ -80,7 +80,8 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   │                         encode/decode_stream (+ *_into for buffer reuse). Transport
 │   │                         owns frame length-delimiting; 1-byte tag + u32-prefixed
 │   │                         bytes/strings; Record is flat fixed header + payload.
-│   ├── transport.rs          Transport + Listener traits (TCP today, IPC/RDMA later)
+│   ├── transport.rs          Transport + Listener traits; TcpTransport/TcpListener
+│   │                         (std-only, u32-LE length-delimited, NODELAY, MAX_FRAME_LEN)
 │   ├── dissemination.rs      Dissemination trait — the swappable broadcast/gossip seam
 │   └── replication.rs        ReplicationSource / ReplicationSink (engine, stubbed)
 ├── xchannel-net/             the node-manager daemon (lib + bin)
@@ -131,16 +132,17 @@ _As of 2026-06-21:_
 - On `main`: scaffold + doc reconciliation + dep repoint. Dep is now
   **`xchannel = { version = "4.0.0" }`** (published on crates.io; resolves from registry).
 - Scaffold builds clean; `registry` collision tests pass (2).
-- **Wire codec is implemented** (`core::codec`, hand-rolled LE, zero deps; 7 tests).
-  Engine/transport/dissemination bodies are still `unimplemented!` stubs.
+- **Wire codec + TCP transport implemented** (`core::codec`, `core::transport::Tcp*`;
+  hand-rolled LE, zero deps; 9 core tests incl. codec-over-TCP). Dissemination + engine
+  bodies are still `unimplemented!` stubs.
 - **xchannel 4.0.0 is published** (format_version 2, intrinsic absolute `RecordIndex`).
-- Next real code step: **TCP `Transport`/`Listener`** (Next steps §2) → dissemination + engines.
+- Next real code step: **`BroadcastDissemination` bodies + heartbeats** (Next steps §3),
+  then the replication engines (§4).
 
 ## Next steps (rough order; depends-on noted)
 
 1. ~~**Wire serialization**~~ — **done** (`core::codec`, hand-rolled LE, zero deps).
-2. **TCP `Transport` + `Listener`** impl over `core::transport`. *Blocks broadcast +
-   replication over the net.* (Frame = one length-delimited blob; codec maps blob ↔ msg.)
+2. ~~**TCP `Transport` + `Listener`**~~ — **done** (`core::transport::Tcp*`, std-only).
 3. **`BroadcastDissemination`** bodies (announce / pump / live_members) + heartbeats.
 4. **`ReplicationSource` / `ReplicationSink`** bodies over real xchannel readers/writers.
 5. Node-manager event loop wiring registry ⇄ dissemination ⇄ replication; client API.
