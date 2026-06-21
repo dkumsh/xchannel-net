@@ -206,18 +206,37 @@ impl Node {
         }
     }
 
-    /// Connect to a peer's control address and adopt it as a dissemination peer.
+    /// Connect to a peer's control address and adopt it as an outbound dissemination peer
+    /// (deduped: a no-op if already connected). The connect happens outside the
+    /// dissemination lock so a slow dial doesn't stall heartbeats/announces.
     pub fn connect_control_peer(&self, addr: SocketAddr) -> io::Result<()> {
+        if self.dissemination.lock().unwrap().is_connected(addr) {
+            return Ok(());
+        }
         let conn = TcpTransport::connect(addr)?;
         let snapshot = self.registry_snapshot();
-        self.dissemination.lock().unwrap().add_peer(conn, &snapshot)
+        self.dissemination
+            .lock()
+            .unwrap()
+            .add_outbound_peer(conn, addr, &snapshot)
     }
 
-    /// Connect to all configured seed peers (best-effort; unreachable seeds are skipped).
+    /// (Re)connect to any configured seed peer not currently linked. Called at startup and
+    /// each maintenance tick, so a dropped seed link is re-established. Uses a bounded dial
+    /// timeout so a down seed doesn't stall the loop.
     pub fn connect_seeds(&self) {
-        let seeds = self.config.seeds.clone();
-        for addr in seeds {
-            let _ = self.connect_control_peer(addr);
+        for addr in self.config.seeds.clone() {
+            if self.dissemination.lock().unwrap().is_connected(addr) {
+                continue;
+            }
+            if let Ok(conn) = TcpTransport::connect_timeout(&addr, Duration::from_secs(1)) {
+                let snapshot = self.registry_snapshot();
+                let _ = self
+                    .dissemination
+                    .lock()
+                    .unwrap()
+                    .add_outbound_peer(conn, addr, &snapshot);
+            }
         }
     }
 
@@ -225,10 +244,11 @@ impl Node {
         self.registry.lock().unwrap().iter().cloned().collect()
     }
 
-    /// Periodic maintenance: emit a heartbeat and merge any gossiped identities into the
-    /// registry. Runs forever; the caller drives it on its own thread.
+    /// Periodic maintenance: reconnect dropped seeds, emit a heartbeat, and merge gossiped
+    /// identities into the registry. Runs forever; the caller drives it on its own thread.
     pub fn run_maintenance(&self, interval: Duration) -> io::Result<()> {
         loop {
+            self.connect_seeds();
             let pumped = {
                 let mut d = self.dissemination.lock().unwrap();
                 let _ = d.emit_heartbeat();

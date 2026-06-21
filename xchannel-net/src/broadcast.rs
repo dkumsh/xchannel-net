@@ -11,7 +11,7 @@
 //! inbound queue (registry deltas/syncs) and the shared [`Membership`] (heartbeats); the
 //! send side stays here for `announce` / heartbeat emission. `pump` drains the queue.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,9 @@ use xchannel_net_core::wire::ControlMsg;
 
 type Inbox = Arc<Mutex<VecDeque<ChannelIdentity>>>;
 type SharedMembership = Arc<Mutex<Membership>>;
+/// Dial addresses of outbound peer links currently believed connected (for dedup +
+/// reconnection). An outbound peer's reader removes its address here on disconnect.
+type Connected = Arc<Mutex<HashSet<SocketAddr>>>;
 
 /// Eager-broadcast dissemination over a set of peer TCP connections.
 pub struct BroadcastDissemination {
@@ -39,6 +42,7 @@ pub struct BroadcastDissemination {
     /// Filled by per-peer reader threads; drained by [`pump`](Self::pump).
     inbox: Inbox,
     membership: SharedMembership,
+    connected: Connected,
 }
 
 impl BroadcastDissemination {
@@ -50,15 +54,47 @@ impl BroadcastDissemination {
             peers: Vec::new(),
             inbox: Arc::new(Mutex::new(VecDeque::new())),
             membership: Arc::new(Mutex::new(Membership::new())),
+            connected: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    /// Adopt a peer connection: spawn its reader thread and send a `RegistrySync` of
-    /// `initial_sync` (join-time anti-entropy) plus a first `Heartbeat` so the peer learns
-    /// our address immediately. The send half is retained for future broadcasts.
+    /// Adopt an **inbound** peer connection (the peer dialed us; we don't know its dial
+    /// address, so it isn't tracked for reconnection — it reconnects to us).
     pub fn add_peer(
         &mut self,
         transport: TcpTransport,
+        initial_sync: &[ChannelIdentity],
+    ) -> io::Result<()> {
+        self.adopt(transport, None, initial_sync)
+    }
+
+    /// Adopt an **outbound** peer connection dialed to `addr`, tracking it so it's deduped
+    /// and reconnected (its reader clears the tracking on disconnect).
+    pub fn add_outbound_peer(
+        &mut self,
+        transport: TcpTransport,
+        addr: SocketAddr,
+        initial_sync: &[ChannelIdentity],
+    ) -> io::Result<()> {
+        self.connected.lock().unwrap().insert(addr);
+        let r = self.adopt(transport, Some(addr), initial_sync);
+        if r.is_err() {
+            self.connected.lock().unwrap().remove(&addr);
+        }
+        r
+    }
+
+    /// Whether an outbound link to `addr` is currently believed connected.
+    pub fn is_connected(&self, addr: SocketAddr) -> bool {
+        self.connected.lock().unwrap().contains(&addr)
+    }
+
+    /// Spawn a reader thread, send join-time `RegistrySync` + a first `Heartbeat`, and
+    /// retain the send half. `addr` is `Some` for outbound links (tracked for reconnection).
+    fn adopt(
+        &mut self,
+        transport: TcpTransport,
+        addr: Option<SocketAddr>,
         initial_sync: &[ChannelIdentity],
     ) -> io::Result<()> {
         let reader = transport.try_clone()?;
@@ -66,6 +102,8 @@ impl BroadcastDissemination {
             reader,
             Arc::clone(&self.inbox),
             Arc::clone(&self.membership),
+            Arc::clone(&self.connected),
+            addr,
         );
 
         let mut send = transport;
@@ -132,7 +170,13 @@ impl Dissemination for BroadcastDissemination {
 /// `RegistryDelta`/`RegistrySync` identities go to the inbox for the node to merge;
 /// `Heartbeat`s refresh membership. Client→manager frames (`Register`, …) are not expected
 /// on a peer link and are ignored.
-fn spawn_reader(mut reader: TcpTransport, inbox: Inbox, membership: SharedMembership) {
+fn spawn_reader(
+    mut reader: TcpTransport,
+    inbox: Inbox,
+    membership: SharedMembership,
+    connected: Connected,
+    addr: Option<SocketAddr>,
+) {
     std::thread::spawn(move || {
         while let Ok(bytes) = reader.recv_frame() {
             let Ok(msg) = decode_control(&bytes) else {
@@ -147,6 +191,10 @@ fn spawn_reader(mut reader: TcpTransport, inbox: Inbox, membership: SharedMember
                 }
                 _ => {} // not expected on a peer link
             }
+        }
+        // Connection dropped: clear outbound tracking so the node reconnects this seed.
+        if let Some(addr) = addr {
+            connected.lock().unwrap().remove(&addr);
         }
     });
 }

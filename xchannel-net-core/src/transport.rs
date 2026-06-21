@@ -43,6 +43,15 @@ impl TcpTransport {
         Self::from_stream(TcpStream::connect(addr)?)
     }
 
+    /// Connect with a bounded timeout — used for periodic peer reconnection so a down peer
+    /// doesn't stall the caller for the OS default connect timeout.
+    pub fn connect_timeout(
+        addr: &std::net::SocketAddr,
+        timeout: std::time::Duration,
+    ) -> io::Result<Self> {
+        Self::from_stream(TcpStream::connect_timeout(addr, timeout)?)
+    }
+
     /// Wrap an already-connected stream (e.g. one returned by [`TcpListener::accept`]).
     pub fn from_stream(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
