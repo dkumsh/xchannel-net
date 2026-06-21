@@ -92,9 +92,11 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   │                         accept_subscription→StreamServer; subscriber subscribe→
 │   │                         StreamClient. Drives the engines; tested over loopback TCP.
 ├── xchannel-net/             the node-manager daemon — lib + bin `xchanneld`
-│   ├── node.rs               Node: host_channel (origin under data_dir) + serve_stream
-│   │                         (accept loop, per-conn StreamServer thread, resolver over
-│   │                         hosted map). main.rs wires it into the `xchanneld` binary.
+│   ├── node.rs               Node: host_channel (register+announce), serve_stream,
+│   │                         control plane (serve_control/connect_control_peer/
+│   │                         run_maintenance over BroadcastDissemination+Registry), and
+│   │                         subscribe (resolve via registry+membership → replica thread →
+│   │                         Subscription). main.rs runs it all as `xchanneld`.
 │   ├── registry.rs           Registry: CRDT merge over ChannelIdentity (+ tests)
 │   └── broadcast.rs          BroadcastDissemination (concrete/TCP): per-peer reader
 │   │                         threads → inbox + Membership; announce/emit_heartbeat/pump/
@@ -149,21 +151,18 @@ _As of 2026-06-21:_
 - On `main`: scaffold + doc reconciliation + dep repoint. Dep is now
   **`xchannel = { version = "4.0.0" }`** (published on crates.io; resolves from registry).
 - Scaffold builds clean; `registry` collision tests pass (2).
-- Implemented in `core`: **codec**, **TCP transport**, **replication engines**, and the
-  **stream-plane protocol** (`core::stream`) — a channel replicates origin→replica over
-  loopback TCP end-to-end. 14 core tests, clippy clean.
-- **`xchanneld` serving half is live**: `Node::host_channel` + `Node::serve_stream`
-  (threaded accept/dispatch) replicate a hosted channel to a subscriber over TCP; the
-  `xchanneld` binary runs it (env-configured). Tested.
-- **Dissemination done**: `BroadcastDissemination` (TCP) propagates registry deltas/syncs
-  and learns peer addresses via heartbeats into `Membership`; verified over loopback TCP.
-- Still missing: the daemon's **control listener** wiring (accept peer links → add_peer;
-  periodic heartbeat; merge `pump()` output into the shared `Registry`); the
-  **subscriber-side `Node`** routing (registry → `addr_of(owner)` → `stream::subscribe` →
-  replica → expose to clients); **client RPC** (`xchannel-net-client` bodies).
-- **xchannel 4.0.0 is published** (format_version 2, intrinsic absolute `RecordIndex`).
-- Next: wire the **control plane into `Node`** (peer links + heartbeat loop + registry
-  merge), then **subscriber-side subscribe** using `addr_of` to locate owners.
+- `core` complete: **codec**, **TCP transport**, **replication engines**, **stream-plane
+  protocol**, **membership**. Dep is published `xchannel = "4.0.0"`.
+- **`xchanneld` is end-to-end**: `Node` does hosting, stream serving, the control plane
+  (gossip via `BroadcastDissemination` + `Registry`), and `subscribe`. A two-node test
+  has B discover A's channel via gossip + heartbeat and build a synced replica through the
+  managers. ~20 tests across the workspace, clippy clean, release builds.
+- Still missing / refinements: **client RPC** (`xchannel-net-client` bodies — external
+  processes host/subscribe via the local daemon); **subscription lifecycle** (stop/
+  unsubscribe; threads run until the conn drops); **resume** (subscribe is fresh `from=0`);
+  precise live-`head` in `SubscribeAck`; registry **tombstones** (§8 deregister).
+- Next: **`xchannel-net-client`** — the external client↔daemon control protocol (host/
+  register → get a path to write; subscribe → get the replica path to read).
 
 ## Next steps (rough order; depends-on noted)
 
@@ -176,10 +175,10 @@ _As of 2026-06-21:_
    plane (peer gossip + client RPC), `xchannel-net-client` bodies.
 6. ~~**Membership / address resolution**~~ — **done** (`core::membership`, fed by
    `BroadcastDissemination` heartbeats; `addr_of(owner)` resolves where to connect).
-7. **Wire control plane into `Node`**: control listener (accept → `add_peer`), heartbeat
-   loop, drain `pump()` into the shared `Registry`. Then **subscriber-side `Node`**:
-   resolve owner via registry+`addr_of` → `stream::subscribe` → run `StreamClient` thread
-   → expose replica path. Then **client RPC** for external clients.
+7. ~~**Control plane + subscriber-side `Node`**~~ — **done** (`serve_control`,
+   `run_maintenance`, `Node::subscribe`; two-node integration test passes).
+8. **`xchannel-net-client`**: external client↔daemon control protocol. Then subscription
+   lifecycle (stop/unsubscribe), resume (`from = replica head`), precise `head`.
 
 ## Open questions (see DESIGN.md §8)
 

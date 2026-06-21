@@ -96,6 +96,12 @@ impl BroadcastDissemination {
         self.membership.lock().unwrap().addr_of(node)
     }
 
+    /// Set the stream address advertised in heartbeats — used after binding the stream
+    /// listener to an ephemeral port (`:0`), so peers learn the real address.
+    pub fn set_self_addr(&mut self, addr: SocketAddr) {
+        self.self_addr = addr;
+    }
+
     /// Best-effort broadcast to all peers; drops peers whose send fails (disconnected).
     fn broadcast(&mut self, frame: &[u8]) {
         self.peers.retain_mut(|p| p.send_frame(frame).is_ok());

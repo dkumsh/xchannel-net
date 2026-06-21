@@ -35,11 +35,27 @@ fn main() -> std::io::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
 
     let node = Node::new(config);
-    let listener = node.stream_listener()?;
+    let stream_listener = node.bind_stream()?;
+    let control_listener = node.bind_control()?;
     eprintln!(
-        "xchanneld[{}]: serving stream plane on {}",
+        "xchanneld[{}]: stream {} | control {}",
         node_id,
-        listener.local_addr()?
+        stream_listener.local_addr()?,
+        control_listener.local_addr()?
     );
-    node.serve_stream(listener)
+
+    node.connect_seeds();
+    {
+        let node = node.clone();
+        std::thread::spawn(move || {
+            let _ = node.run_maintenance(std::time::Duration::from_millis(500));
+        });
+    }
+    {
+        let node = node.clone();
+        std::thread::spawn(move || {
+            let _ = node.serve_control(control_listener);
+        });
+    }
+    node.serve_stream(stream_listener)
 }
