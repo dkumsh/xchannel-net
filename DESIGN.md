@@ -15,6 +15,73 @@ owner to read-only replicas on subscribing nodes.
 
 ---
 
+## 0. Implementation status (v1, as of 2026-06)
+
+> **This is a design document — much of it describes the target design, not all of which
+> is built.** This section is the authoritative map of what the code on disk actually
+> does. Where a later section describes behavior that is designed but not yet implemented,
+> it is tagged **(not yet — see §0)**. This is experimental, pre-1.0 software
+> (`version = 0.0.0`); the wire protocol and on-disk layout may change without notice.
+
+**Implemented and tested** (unit + cross-process integration tests, `cargo test` green):
+
+- Single-writer log replication over TCP; replicas are **record-identical to the origin in
+  steady-state operation** (§4), driven end-to-end by a spawned `xchanneld` in
+  `tests/cross_process.rs`.
+- Hand-rolled little-endian wire codec + length-delimited TCP transport, with bounded
+  frame lengths and truncation/edge-case tests (`codec.rs`, `transport.rs`).
+- CRDT registry merge `resolve_collision` — commutative, associative, idempotent (§2.1).
+- Decentralized discovery: eager `RegistryDelta` broadcast + `RegistrySync` anti-entropy on
+  (re)connect; membership heartbeats; owner-address resolution.
+- Client↔daemon RPC (`create` / `subscribe`) and `connect_or_spawn` single-daemon bring-up.
+- Self-healing subscriptions: resume from the replica head, reconnect on drop,
+  stop/unsubscribe (§5.1, `node.rs::run_subscription`).
+- Resume handshake (`Subscribe.from` / `SubscribeAck.start`) and `Gap` on retention underrun.
+
+**Partial / known limitations:**
+
+- **`SubscribeAck.head` is a placeholder** equal to `start`, not the true high-water index
+  (§6.1). Harmless today because nothing consumes it; it would mislead any future HA
+  failover (§9) built on the "synchronized once applied up to `head`" contract.
+- **Membership liveness is tracked but not used in resolution.** `live_members` and the
+  heartbeat timeout exist, but the resolve path uses `addr_of` regardless of liveness, so
+  "known, owner unreachable" (§5.4) is not surfaced and stale peers are not pruned from
+  lookups.
+- **Partition reconvergence is not guaranteed.** Delta broadcast is best-effort (a peer that
+  errors is dropped, no retry); reconvergence relies on `RegistrySync` at (re)connect. With
+  no `seeds` configured (the binary's default is `seeds: vec![]`) and inbound-only links not
+  re-dialed, a healed partition may not reconverge automatically — two nodes can keep
+  divergent registries (and, with §"Name collisions" unimplemented, both believe they own a
+  name).
+- **Crash/restart resume is unverified here.** It relies on xchannel's `next_record_index()`
+  equalling the durably-committed user-record count after a crash (read and reasoned about
+  in §5.3) — but there is **no kill/restart test in this repo** exercising it.
+
+**Not yet implemented** (designed below, absent from the code):
+
+- **Restart = reconstruct (§5.2)** — there is no data-dir scan / re-register on startup. A
+  restarted daemon does **not** automatically re-register hosted channels or re-attach
+  replicas; recovery currently depends on clients reconnecting and re-declaring.
+- **Registry tombstones / `Deregister` (§5.4)** — `Deregister` is a wire/codec shape only;
+  the merge has no deleted-flag, so a name once registered cannot be removed and a stale
+  `Register` cannot be tombstoned.
+- **`RegisterRejected` collision notification** — wire/codec shape only; `register_origin`
+  does not detect a lost collision or notify the client, so a losing registrant silently
+  believes it owns the name (see §"Name collisions").
+- **Stream multiplexing (§6)** — `StreamId` is hardcoded to `0`; one connection carries one
+  subscription. The multiplexing described in §6 is not built.
+- **Authentication / authorization / encryption (§8)** — none. All three planes are
+  unauthenticated plaintext; any peer that can connect can register names, subscribe to and
+  pull any channel's history, inject registry deltas, and heartbeat as any node. **Run only
+  on trusted networks; defaults bind `127.0.0.1`.**
+
+**Clock caveat.** The collision tiebreak `(min registered_at_nanos, then min NodeId)` uses
+each owner's **wall clock** (`SystemTime::now`). "First-registrant-wins" therefore holds
+only to the precision of clock synchronization across nodes; under skew the slowest clock
+wins. There is no logical/Lamport clock yet.
+
+---
+
 ## 1. The substrate we build on (xchannel facts that shape everything)
 
 xchannel gives us, per channel:
@@ -48,7 +115,7 @@ Three consequences drive the whole design:
 |---|---|---|
 | **Owner death** | Channel **freezes** — no failover, no election. | Identical to plain xchannel when a writer stops. *Writer liveness* is an application concern. |
 | **Discovery** | **Decentralized CRDT registry**; v1 dissemination = eager broadcast + join-time anti-entropy. | No SPOF, no central name server to bootstrap. Full epidemic gossip is *not* needed at the expected scale (≤100 nodes, LAN) — see §2.1. |
-| **Namespace** | **Flat global names**, first-registrant-wins. | Identity = the name. Collisions resolved deterministically (below). |
+| **Namespace** | **Flat global names**, first-registrant-wins. | Identity = the name. Collisions resolved deterministically (below). *Tiebreak uses wall-clock timestamps — see §0 clock caveat; loser-notification not yet implemented.* |
 | **Initial pull** | **Always full (retained) history.** | Any subscribing node materializes the whole channel, so any local reader (Live or LateJoin) is instantly serviceable. No lazy/backfill logic. |
 
 ### Two liveness concepts, kept separate
@@ -102,8 +169,11 @@ computes identically, with no coordination round:
 winner = (min registered_at_nanos, then min NodeId)
 ```
 
-The loser's manager reports `RegisterRejected { winner }` to its client. (See
-`identity::ChannelIdentity::resolve_collision`.)
+The loser's manager *should* report `RegisterRejected { winner }` to its client. (See
+`identity::ChannelIdentity::resolve_collision`.) **Note (not yet — see §0):** the merge and
+tiebreak are implemented and tested, but `register_origin` does not yet detect a lost
+collision or emit `RegisterRejected`, so a losing registrant currently believes it owns the
+name. The tiebreak also depends on wall-clock timestamps — see the clock caveat in §0.
 
 ---
 
@@ -199,6 +269,10 @@ A writer client writes to its local xchannel via mmap **directly**; the manager 
   a persistent log a reader client reads via mmap even while its manager is down.
 
 ### 5.2 Restart = reconstruct, never restore from node-owned metadata
+
+> **(Not yet — see §0.)** This section describes the intended recovery model. The code does
+> not yet scan the data dir or re-register on startup; today a restarted daemon recovers
+> only as clients reconnect and re-declare. The rest of this section is the design target.
 
 A node persists **no separate registry/subscription database.** On restart it rebuilds
 from three authoritative sources:
@@ -320,9 +394,10 @@ lookups from its local converged registry.)
 the client opens (§7).
 
 **Stream plane** (`StreamMsg`, high volume): `Subscribe`, `SubscribeAck`, `Record`, `Gap`.
-A source→subscriber connection is **multiplexed** — one link carries any number of
-subscriptions, each keyed by a compact `StreamId` the source assigns, so the (string)
-channel name is *not* repeated on every record.
+A source→subscriber connection is designed to be **multiplexed** — one link carrying any
+number of subscriptions, each keyed by a compact `StreamId` the source assigns, so the
+(string) channel name is *not* repeated on every record. **(Not yet — see §0:** `StreamId`
+is currently hardcoded to `0` and one connection carries one subscription.**)**
 
 ### 6.1 Subscribe / SubscribeAck — the resume handshake
 
@@ -347,7 +422,8 @@ Gap          { name, earliest, head }                        source → subscrib
   receive genesis.
 - **`head`** = source's high-water index at accept time. The subscriber is *synchronized*
   once it has applied up to `head`; historical replay and live tail are the **same**
-  stream, so there is no explicit catch-up message.
+  stream, so there is no explicit catch-up message. **(Not yet — see §0:** `head` is
+  currently a placeholder equal to `start`, not the true high-water index.**)**
 - **`region_size` / `mtu`** = the source's authoritative geometry, so the sink builds a
   replica `Writer` guaranteed to fit every record (the registry copy may be stale).
 - **`Gap`** replaces the Ack when `from > 0` and `earliest > from`: the subscriber fell

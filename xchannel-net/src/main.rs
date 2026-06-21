@@ -1,8 +1,9 @@
 //! `xchanneld` — the xchannel-net node-manager daemon entry point.
 //!
-//! Minimal wiring: configure from environment, then run the stream-plane accept/dispatch
-//! loop. The control plane (registry gossip, client RPC, subscriber-side routing) is not
-//! wired here yet — see DESIGN.md.
+//! Configures from environment, then binds and serves all three planes: the stream
+//! (data) plane, the control plane (registry gossip + membership heartbeats), and the
+//! client RPC plane, alongside a periodic maintenance loop. See DESIGN.md for the
+//! architecture and README.md for current implementation status.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

@@ -14,10 +14,21 @@ behind it, and the prior art that informed it.
 
 ## Status
 
-Working v1: an external client process talks to its local `xchanneld` daemon to create or
-subscribe to channels; the daemon discovers channels across the mesh, locates owners, and
-replicates single-writer logs byte-faithfully between nodes. See `DESIGN.md` for the
-architecture and the remaining refinements.
+**Experimental, pre-1.0** (`version = 0.0.0`); the wire protocol and on-disk layout may
+change without notice.
+
+Working v1 data plane: an external client process talks to its local `xchanneld` daemon to
+create or subscribe to channels; the daemon discovers channels across the mesh, locates
+owners, and replicates single-writer logs between nodes, producing **record-identical**
+replicas in steady-state operation. This path is covered by unit and cross-process
+integration tests.
+
+Several behaviors described in `DESIGN.md` are **designed but not yet implemented** — most
+notably restart-time reconstruction (no data-dir re-registration on startup), registry
+tombstones / deregistration, collision rejection notices, stream multiplexing, and **any
+authentication or encryption** (all planes are unauthenticated plaintext — run only on
+trusted networks; defaults bind `127.0.0.1`). See **§0 "Implementation status"** in
+`DESIGN.md` for the authoritative implemented / partial / not-yet map.
 
 ## Workspace
 
