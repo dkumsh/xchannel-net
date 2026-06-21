@@ -90,6 +90,9 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   │                         accept_subscription→StreamServer; subscriber subscribe→
 │   │                         StreamClient. Drives the engines; tested over loopback TCP.
 ├── xchannel-net/             the node-manager daemon — lib + bin `xchanneld`
+│   ├── node.rs               Node: host_channel (origin under data_dir) + serve_stream
+│   │                         (accept loop, per-conn StreamServer thread, resolver over
+│   │                         hosted map). main.rs wires it into the `xchanneld` binary.
 │   ├── registry.rs           Registry: CRDT merge over ChannelIdentity (+ tests)
 │   └── broadcast.rs          BroadcastDissemination<T: Transport> (v1 impl, stubbed)
 └── xchannel-net-client/      thin client lib. create_channel takes a
@@ -145,12 +148,16 @@ _As of 2026-06-21:_
 - Implemented in `core`: **codec**, **TCP transport**, **replication engines**, and the
   **stream-plane protocol** (`core::stream`) — a channel replicates origin→replica over
   loopback TCP end-to-end. 14 core tests, clippy clean.
-- Still `unimplemented!`: `BroadcastDissemination` bodies; the manager's accept/dispatch
-  loop + registry/control-plane wiring; client bodies.
+- **`xchanneld` serving half is live**: `Node::host_channel` + `Node::serve_stream`
+  (threaded accept/dispatch) replicate a hosted channel to a subscriber over TCP; the
+  `xchanneld` binary runs it (env-configured). Tested.
+- Still `unimplemented!`/missing: `BroadcastDissemination` bodies; the **subscriber-side**
+  daemon routing (resolve owner address via registry → pull replica → expose to clients);
+  the **control plane** (peer gossip + client RPC); `xchannel-net-client` bodies.
 - **xchannel 4.0.0 is published** (format_version 2, intrinsic absolute `RecordIndex`).
-- Next (manager loop, §5): the **control plane + accept/dispatch loop** — bind listeners,
-  route Subscribe to `stream::accept_subscription`, wire the registry, expose client API.
-  `BroadcastDissemination` (§3) interleaves.
+- Next: **control plane / membership** — needs node→address resolution (owner stream addr
+  isn't in `ChannelIdentity` yet). `BroadcastDissemination` (§3) + a membership map feed
+  this; then subscriber-side `Node` routing.
 
 ## Next steps (rough order; depends-on noted)
 
@@ -158,7 +165,12 @@ _As of 2026-06-21:_
 2. ~~**TCP `Transport` + `Listener`**~~ — **done** (`core::transport::Tcp*`, std-only).
 3. **`BroadcastDissemination`** bodies (announce / pump / live_members) + heartbeats.
 4. ~~**`ReplicationSource` / `ReplicationSink`**~~ — **done** (`core::replication`).
-5. Node-manager event loop wiring registry ⇄ dissemination ⇄ replication; client bodies.
+5. Node-manager loop: **serving half done** (`Node::serve_stream`, `xchanneld` bin).
+   Remaining: subscriber-side routing (registry → owner addr → pull replica), control
+   plane (peer gossip + client RPC), `xchannel-net-client` bodies.
+6. **Membership / address resolution** — `ChannelIdentity` carries `owner: NodeId` but no
+   address; need NodeId→stream-addr (seed config + heartbeats/dissemination) before a
+   subscriber daemon can locate an owner. Gates subscriber-side §5.
 
 ## Open questions (see DESIGN.md §8)
 

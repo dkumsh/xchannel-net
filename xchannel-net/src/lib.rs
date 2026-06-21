@@ -13,6 +13,7 @@
 //! node holds the only `Writer`; every other node holds read-only replicas.
 
 pub mod broadcast;
+pub mod node;
 pub mod registry;
 
 /// Node manager configuration.
