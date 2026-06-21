@@ -122,6 +122,9 @@ impl Client {
     }
 
     /// Subscribe and return a `Reader` over the replica, opened in `mode`.
+    ///
+    /// The daemon builds the replica asynchronously, so the file may not exist the instant
+    /// the RPC returns; this retries the open briefly until it appears.
     pub fn subscribe(
         &mut self,
         name: &str,
@@ -129,7 +132,16 @@ impl Client {
         wait: Option<Duration>,
     ) -> io::Result<Reader> {
         let path = self.subscribe_path(name, wait)?;
-        ReaderBuilder::new(path).mode(mode.into()).build()
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match ReaderBuilder::new(&path).mode(mode.into()).build() {
+                Ok(reader) => return Ok(reader),
+                Err(e) if e.kind() == ErrorKind::NotFound && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
