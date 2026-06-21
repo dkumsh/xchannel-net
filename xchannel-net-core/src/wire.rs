@@ -113,3 +113,57 @@ pub enum StreamMsg {
         head: RecordIndex,
     },
 }
+
+/// Channel geometry/retention a client requests when creating a channel. Unlike the
+/// in-process `WriterBuilder` closure, this is serializable so it can cross the
+/// client↔daemon link; the daemon applies it (and owns placement + genesis base).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChannelOptions {
+    pub region_size: u32,
+    /// Max payload bytes; 0 = unlimited.
+    pub mtu: u32,
+    /// Bytes per segment before rolling; 0 = no rolling.
+    pub file_roll_size: u64,
+    /// Rolled files to retain; 0 = unlimited.
+    pub keep_files: u32,
+}
+
+impl Default for ChannelOptions {
+    fn default() -> Self {
+        Self {
+            region_size: 1 << 20, // 1 MiB
+            mtu: 0,
+            file_roll_size: 0,
+            keep_files: 0,
+        }
+    }
+}
+
+/// Client → local daemon request (the client↔manager control protocol). A client never
+/// talks to remote nodes; it asks its local daemon, which handles registration,
+/// discovery, and replication, and replies with a local path the client opens itself.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ClientRequest {
+    /// Create + register an origin channel this node owns. The daemon precreates the file
+    /// under its `data_dir` and replies [`Created`](ClientReply::Created) with the path;
+    /// the client opens the single `Writer`.
+    Create {
+        name: ChannelName,
+        options: ChannelOptions,
+    },
+    /// Subscribe to a channel. The daemon ensures a local replica is being synced and
+    /// replies [`Subscribed`](ClientReply::Subscribed) with the replica path; the client
+    /// opens a `Reader`. `wait_ms` is the resolve timeout (0 = block until available).
+    Subscribe { name: ChannelName, wait_ms: u64 },
+}
+
+/// Local daemon → client reply.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ClientReply {
+    /// Channel created; open a `Writer` at this local path (with the requested options).
+    Created { path: String },
+    /// Replica is being synced; open a `Reader` at this local path.
+    Subscribed { replica_path: String },
+    /// The request failed (name taken by another owner, resolve timeout, IO error, …).
+    Error { message: String },
+}

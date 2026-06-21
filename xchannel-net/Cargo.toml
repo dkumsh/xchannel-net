@@ -18,3 +18,6 @@ path = "src/main.rs"
 [dependencies]
 xchannel-net-core.workspace = true
 xchannel.workspace = true
+
+[dev-dependencies]
+xchannel-net-client = { path = "../xchannel-net-client" }

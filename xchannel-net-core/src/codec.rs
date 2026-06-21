@@ -18,7 +18,7 @@
 //! the hot read side.
 
 use crate::identity::ChannelIdentity;
-use crate::wire::{ControlMsg, RecordFrame, StreamMsg};
+use crate::wire::{ChannelOptions, ClientReply, ClientRequest, ControlMsg, RecordFrame, StreamMsg};
 use crate::{NodeId, RecordIndex, StreamId};
 use std::io;
 
@@ -366,6 +366,104 @@ pub fn decode_stream(bytes: &[u8]) -> io::Result<StreamMsg> {
     Ok(m)
 }
 
+// ---------- client RPC (client ↔ local daemon) ----------
+
+mod client_req_tag {
+    pub const CREATE: u8 = 0;
+    pub const SUBSCRIBE: u8 = 1;
+}
+
+mod client_reply_tag {
+    pub const CREATED: u8 = 0;
+    pub const SUBSCRIBED: u8 = 1;
+    pub const ERROR: u8 = 2;
+}
+
+fn put_options(w: &mut W, o: &ChannelOptions) {
+    w.u32(o.region_size);
+    w.u32(o.mtu);
+    w.u64(o.file_roll_size);
+    w.u32(o.keep_files);
+}
+
+fn get_options(r: &mut R) -> io::Result<ChannelOptions> {
+    Ok(ChannelOptions {
+        region_size: r.u32()?,
+        mtu: r.u32()?,
+        file_roll_size: r.u64()?,
+        keep_files: r.u32()?,
+    })
+}
+
+pub fn encode_client_request(m: &ClientRequest) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut w = W::new(&mut buf);
+    match m {
+        ClientRequest::Create { name, options } => {
+            w.u8(client_req_tag::CREATE);
+            w.str(name);
+            put_options(&mut w, options);
+        }
+        ClientRequest::Subscribe { name, wait_ms } => {
+            w.u8(client_req_tag::SUBSCRIBE);
+            w.str(name);
+            w.u64(*wait_ms);
+        }
+    }
+    buf
+}
+
+pub fn decode_client_request(bytes: &[u8]) -> io::Result<ClientRequest> {
+    let mut r = R::new(bytes);
+    let m = match r.u8()? {
+        client_req_tag::CREATE => ClientRequest::Create {
+            name: r.str()?,
+            options: get_options(&mut r)?,
+        },
+        client_req_tag::SUBSCRIBE => ClientRequest::Subscribe {
+            name: r.str()?,
+            wait_ms: r.u64()?,
+        },
+        _ => return Err(invalid("unknown ClientRequest tag")),
+    };
+    r.finish()?;
+    Ok(m)
+}
+
+pub fn encode_client_reply(m: &ClientReply) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut w = W::new(&mut buf);
+    match m {
+        ClientReply::Created { path } => {
+            w.u8(client_reply_tag::CREATED);
+            w.str(path);
+        }
+        ClientReply::Subscribed { replica_path } => {
+            w.u8(client_reply_tag::SUBSCRIBED);
+            w.str(replica_path);
+        }
+        ClientReply::Error { message } => {
+            w.u8(client_reply_tag::ERROR);
+            w.str(message);
+        }
+    }
+    buf
+}
+
+pub fn decode_client_reply(bytes: &[u8]) -> io::Result<ClientReply> {
+    let mut r = R::new(bytes);
+    let m = match r.u8()? {
+        client_reply_tag::CREATED => ClientReply::Created { path: r.str()? },
+        client_reply_tag::SUBSCRIBED => ClientReply::Subscribed {
+            replica_path: r.str()?,
+        },
+        client_reply_tag::ERROR => ClientReply::Error { message: r.str()? },
+        _ => return Err(invalid("unknown ClientReply tag")),
+    };
+    r.finish()?;
+    Ok(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +552,46 @@ mod tests {
         for m in stream_cases() {
             let bytes = encode_stream(&m);
             assert_eq!(decode_stream(&bytes).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn client_rpc_round_trips() {
+        let requests = [
+            ClientRequest::Create {
+                name: "md.aapl".into(),
+                options: ChannelOptions {
+                    region_size: 1 << 20,
+                    mtu: 4096,
+                    file_roll_size: 1 << 30,
+                    keep_files: 8,
+                },
+            },
+            ClientRequest::Subscribe {
+                name: "md.aapl".into(),
+                wait_ms: 0,
+            },
+        ];
+        for m in &requests {
+            assert_eq!(
+                &decode_client_request(&encode_client_request(m)).unwrap(),
+                m
+            );
+        }
+
+        let replies = [
+            ClientReply::Created {
+                path: "/data/md.aapl".into(),
+            },
+            ClientReply::Subscribed {
+                replica_path: "/data/md.aapl".into(),
+            },
+            ClientReply::Error {
+                message: "name taken".into(),
+            },
+        ];
+        for m in &replies {
+            assert_eq!(&decode_client_reply(&encode_client_reply(m)).unwrap(), m);
         }
     }
 

@@ -101,10 +101,13 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   └── broadcast.rs          BroadcastDissemination (concrete/TCP): per-peer reader
 │   │                         threads → inbox + Membership; announce/emit_heartbeat/pump/
 │   │                         addr_of/live_members. Implements core::dissemination trait.
-└── xchannel-net-client/      thin client lib. create_channel takes a
-                              FnOnce(WriterBuilder)->WriterBuilder closure: manager owns
-                              placement (path under data_dir), caller owns shape (all
-                              builder opts, no drift). See DESIGN §7.
+└── xchannel-net-client/      external client↔daemon RPC. Client::connect(addr) /
+                              connect_or_spawn() (auto-starts xchanneld at the default
+                              endpoint; single-instance via bind contention). create_channel
+                              (→ Writer) / subscribe (→ Reader) / subscribe_path. Cross-
+                              process ⇒ serializable ChannelOptions, NOT a closure (a
+                              closure can't cross the wire; the in-process Node::host_channel
+                              keeps its closure). Daemon owns placement, returns a path.
 ```
 
 **Convergence vs dissemination are separate concerns.** The registry merge is a fixed
@@ -153,32 +156,31 @@ _As of 2026-06-21:_
 - Scaffold builds clean; `registry` collision tests pass (2).
 - `core` complete: **codec**, **TCP transport**, **replication engines**, **stream-plane
   protocol**, **membership**. Dep is published `xchannel = "4.0.0"`.
-- **`xchanneld` is end-to-end**: `Node` does hosting, stream serving, the control plane
-  (gossip via `BroadcastDissemination` + `Registry`), and `subscribe`. A two-node test
-  has B discover A's channel via gossip + heartbeat and build a synced replica through the
-  managers. ~20 tests across the workspace, clippy clean, release builds.
-- Still missing / refinements: **client RPC** (`xchannel-net-client` bodies — external
-  processes host/subscribe via the local daemon); **subscription lifecycle** (stop/
-  unsubscribe; threads run until the conn drops); **resume** (subscribe is fresh `from=0`);
-  precise live-`head` in `SubscribeAck`; registry **tombstones** (§8 deregister).
-- Next: **`xchannel-net-client`** — the external client↔daemon control protocol (host/
-  register → get a path to write; subscribe → get the replica path to read).
+- **Feature-complete v1 path**: external client process → `Client` RPC → local `xchanneld`
+  → gossip discovery + membership → cross-node replication. A two-node test and a
+  client↔daemon RPC integration test pass on top of per-layer unit tests. ~26 tests,
+  clippy clean, release builds. The `xchanneld` binary serves stream + control + **client**
+  planes + maintenance + seeds (env-config); `Client::connect_or_spawn` auto-starts it.
+- Refinements remaining: **auto-spawn cross-process test** (not automated yet; spawns a
+  real binary, `connect_or_spawn` uses `$XCHANNELD_BIN`/PATH, no `setsid`); **subscription
+  lifecycle** (stop/unsubscribe — threads run until conn drops); **resume** (subscribe is
+  fresh `from=0`); precise live-`head`; registry **tombstones** (§8 deregister).
+- Next: pick from refinements — subscription lifecycle / resume are most user-visible; a
+  cross-process spawn test would harden `connect_or_spawn`.
 
-## Next steps (rough order; depends-on noted)
+## Next steps
 
-1. ~~**Wire serialization**~~ — **done** (`core::codec`, hand-rolled LE, zero deps).
-2. ~~**TCP `Transport` + `Listener`**~~ — **done** (`core::transport::Tcp*`, std-only).
-3. **`BroadcastDissemination`** bodies (announce / pump / live_members) + heartbeats.
-4. ~~**`ReplicationSource` / `ReplicationSink`**~~ — **done** (`core::replication`).
-5. Node-manager loop: **serving half done** (`Node::serve_stream`, `xchanneld` bin).
-   Remaining: subscriber-side routing (registry → owner addr → pull replica), control
-   plane (peer gossip + client RPC), `xchannel-net-client` bodies.
-6. ~~**Membership / address resolution**~~ — **done** (`core::membership`, fed by
-   `BroadcastDissemination` heartbeats; `addr_of(owner)` resolves where to connect).
-7. ~~**Control plane + subscriber-side `Node`**~~ — **done** (`serve_control`,
-   `run_maintenance`, `Node::subscribe`; two-node integration test passes).
-8. **`xchannel-net-client`**: external client↔daemon control protocol. Then subscription
-   lifecycle (stop/unsubscribe), resume (`from = replica head`), precise `head`.
+The full v1 pipeline is **done** (codec, transport, replication engines, stream protocol,
+membership, dissemination, `Node` control plane + subscribe, `xchannel-net-client`,
+`xchanneld` binary). Remaining work is refinements, roughly by user-visibility:
+
+1. **Subscription lifecycle** — `stop`/unsubscribe (shutdown the socket; today the replica
+   thread runs until the conn drops); track + clean up `Node.subscriptions`.
+2. **Resume** — `subscribe` is fresh `from=0`; reopen an existing replica from its head.
+3. **Auto-spawn hardening** — `setsid`/daemonize in `connect_or_spawn`; a cross-process
+   integration test (spawn the real binary, read the replica from the test process).
+4. **Precise live-`head`** in `SubscribeAck` (sync milestone); registry **tombstones** for
+   deregister (§8); backpressure/`Gap` policy.
 
 ## Open questions (see DESIGN.md §8)
 

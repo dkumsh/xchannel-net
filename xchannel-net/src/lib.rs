@@ -19,12 +19,14 @@ pub mod registry;
 /// Node manager configuration.
 pub struct NodeConfig {
     pub node_id: xchannel_net_core::NodeId,
-    /// Directory under which local master channels and replicas live.
+    /// Directory under which local origin channels and replicas live.
     pub data_dir: std::path::PathBuf,
-    /// Control-plane listen address.
+    /// Control-plane listen address (peer gossip).
     pub control_addr: std::net::SocketAddr,
-    /// Stream-plane listen address.
+    /// Stream-plane listen address (serving subscriptions).
     pub stream_addr: std::net::SocketAddr,
+    /// Client-plane listen address (local client↔daemon RPC).
+    pub client_addr: std::net::SocketAddr,
     /// Seed peers to exchange registry state with on startup.
     pub seeds: Vec<std::net::SocketAddr>,
 }

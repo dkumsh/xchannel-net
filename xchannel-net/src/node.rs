@@ -27,10 +27,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use xchannel::{Writer, WriterBuilder};
 use xchannel_net_core::RecordIndex;
+use xchannel_net_core::codec::{decode_client_request, encode_client_reply};
 use xchannel_net_core::dissemination::Dissemination;
 use xchannel_net_core::identity::ChannelIdentity;
 use xchannel_net_core::stream::{self, ChannelSource, accept_subscription};
-use xchannel_net_core::transport::{Listener, TcpListener, TcpTransport};
+use xchannel_net_core::transport::{Listener, TcpListener, TcpTransport, Transport};
+use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest};
 
 /// A node not heard from within this is dropped from the live set.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -50,6 +52,11 @@ pub struct Node {
     /// Network-wide channel directory (CRDT), converged via dissemination.
     registry: Arc<Mutex<Registry>>,
     dissemination: Arc<Mutex<BroadcastDissemination>>,
+    /// Actual bound stream address (set by `bind_stream`), used to resolve self-owned
+    /// channels (a node never receives its own heartbeat into membership).
+    bound_stream_addr: Arc<Mutex<Option<SocketAddr>>>,
+    /// Live replica subscriptions this node maintains for clients, keyed by channel name.
+    subscriptions: Arc<Mutex<HashMap<String, Subscription>>>,
 }
 
 impl Node {
@@ -60,6 +67,8 @@ impl Node {
             hosted: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(Mutex::new(Registry::new())),
             dissemination: Arc::new(Mutex::new(dissemination)),
+            bound_stream_addr: Arc::new(Mutex::new(None)),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(config),
         }
     }
@@ -86,7 +95,40 @@ impl Node {
             .mtu(mtu as u64)
             .base_record_index(0)
             .build()?;
+        self.register_origin(name, path, region_size, mtu)?;
+        Ok(writer)
+    }
 
+    /// Create + register an origin on behalf of a client (cross-process): precreate the
+    /// channel under `data_dir` with `options` (no live writer kept — the client opens the
+    /// single `Writer` itself), register + announce it, and return the path.
+    pub fn create_for_client(&self, name: &str, options: ChannelOptions) -> io::Result<PathBuf> {
+        let path = self.channel_path(name)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut builder = WriterBuilder::new(&path)
+            .region_size(options.region_size as usize)
+            .mtu(options.mtu as u64)
+            .file_roll_size(options.file_roll_size)
+            .base_record_index(0);
+        if options.keep_files > 0 {
+            builder = builder.keep_files(options.keep_files as u64);
+        }
+        builder.precreate()?; // file + header exist; no writer retained
+        self.register_origin(name, path.clone(), options.region_size, options.mtu)?;
+        Ok(path)
+    }
+
+    /// Register a locally-hosted origin in the registry, announce it to peers, and record
+    /// it in the hosted map (so `serve_stream` can resolve it).
+    fn register_origin(
+        &self,
+        name: &str,
+        path: PathBuf,
+        region_size: u32,
+        mtu: u32,
+    ) -> io::Result<()> {
         let identity = ChannelIdentity {
             name: name.to_string(),
             owner: self.config.node_id,
@@ -108,7 +150,7 @@ impl Node {
                 mtu,
             },
         );
-        Ok(writer)
+        Ok(())
     }
 
     fn channel_path(&self, name: &str) -> io::Result<PathBuf> {
@@ -126,10 +168,9 @@ impl Node {
     /// Bind the stream-plane listener and advertise its real address in heartbeats.
     pub fn bind_stream(&self) -> io::Result<TcpListener> {
         let listener = TcpListener::bind(self.config.stream_addr)?;
-        self.dissemination
-            .lock()
-            .unwrap()
-            .set_self_addr(listener.local_addr()?);
+        let addr = listener.local_addr()?;
+        self.dissemination.lock().unwrap().set_self_addr(addr);
+        *self.bound_stream_addr.lock().unwrap() = Some(addr);
         Ok(listener)
     }
 
@@ -203,6 +244,73 @@ impl Node {
         }
     }
 
+    // ---------------- client plane (local client RPC) ----------------
+
+    /// Bind the client-plane listener (local client↔daemon RPC).
+    pub fn bind_client(&self) -> io::Result<TcpListener> {
+        TcpListener::bind(self.config.client_addr)
+    }
+
+    /// Accept local client connections forever, handling each on its own thread.
+    pub fn serve_client(&self, mut listener: TcpListener) -> io::Result<()> {
+        loop {
+            let conn = listener.accept()?;
+            let node = self.clone();
+            std::thread::spawn(move || node.handle_client(conn));
+        }
+    }
+
+    /// Serve a client connection: one request → one reply, until it disconnects.
+    fn handle_client(&self, mut conn: TcpTransport) {
+        while let Ok(bytes) = conn.recv_frame() {
+            let reply = match decode_client_request(&bytes) {
+                Ok(req) => self.handle_request(req),
+                Err(e) => ClientReply::Error {
+                    message: e.to_string(),
+                },
+            };
+            if conn.send_frame(&encode_client_reply(&reply)).is_err() {
+                break;
+            }
+        }
+    }
+
+    fn handle_request(&self, req: ClientRequest) -> ClientReply {
+        match req {
+            ClientRequest::Create { name, options } => match self.create_for_client(&name, options)
+            {
+                Ok(path) => ClientReply::Created {
+                    path: path.to_string_lossy().into_owned(),
+                },
+                Err(e) => ClientReply::Error {
+                    message: e.to_string(),
+                },
+            },
+            ClientRequest::Subscribe { name, wait_ms } => {
+                let wait = (wait_ms != 0).then(|| Duration::from_millis(wait_ms));
+                match self.subscribe(&name, wait) {
+                    Ok(sub) => {
+                        let replica_path = sub.replica_path().to_string_lossy().into_owned();
+                        self.subscriptions.lock().unwrap().insert(name, sub);
+                        ClientReply::Subscribed { replica_path }
+                    }
+                    Err(e) => ClientReply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Sync progress of a subscription this node maintains (for clients), if any.
+    pub fn subscription_synced(&self, name: &str) -> Option<u64> {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|s| s.synced_index())
+    }
+
     // ---------------- subscribing ----------------
 
     /// Subscribe to a channel by name: resolve it via the registry + membership, connect
@@ -251,10 +359,17 @@ impl Node {
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             let identity = self.registry.lock().unwrap().get(name).cloned();
-            if let Some(identity) = identity
-                && let Some(addr) = self.dissemination.lock().unwrap().addr_of(identity.owner)
-            {
-                return Ok((identity, addr));
+            if let Some(identity) = identity {
+                // Self-owned channels resolve to our own (bound) stream address — a node
+                // never records its own heartbeat into membership.
+                let addr = if identity.owner == self.config.node_id {
+                    *self.bound_stream_addr.lock().unwrap()
+                } else {
+                    self.dissemination.lock().unwrap().addr_of(identity.owner)
+                };
+                if let Some(addr) = addr {
+                    return Ok((identity, addr));
+                }
             }
             if let Some(dl) = deadline
                 && Instant::now() >= dl
@@ -310,6 +425,7 @@ mod tests {
             data_dir,
             control_addr: "127.0.0.1:0".parse().unwrap(),
             stream_addr: "127.0.0.1:0".parse().unwrap(),
+            client_addr: "127.0.0.1:0".parse().unwrap(),
             seeds: vec![],
         }
     }

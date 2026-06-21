@@ -24,12 +24,16 @@ fn main() -> std::io::Result<()> {
     let control_addr: SocketAddr = env_or("XCHANNELD_CONTROL_ADDR", "127.0.0.1:7001")
         .parse()
         .expect("XCHANNELD_CONTROL_ADDR must be host:port");
+    let client_addr: SocketAddr = env_or("XCHANNELD_CLIENT_ADDR", "127.0.0.1:7002")
+        .parse()
+        .expect("XCHANNELD_CLIENT_ADDR must be host:port");
 
     let config = NodeConfig {
         node_id: NodeId(node_id),
         data_dir: PathBuf::from(env_or("XCHANNELD_DATA_DIR", "/tmp/xchanneld")),
         control_addr,
         stream_addr,
+        client_addr,
         seeds: vec![],
     };
     std::fs::create_dir_all(&config.data_dir)?;
@@ -37,25 +41,35 @@ fn main() -> std::io::Result<()> {
     let node = Node::new(config);
     let stream_listener = node.bind_stream()?;
     let control_listener = node.bind_control()?;
+    let client_listener = node.bind_client()?;
     eprintln!(
-        "xchanneld[{}]: stream {} | control {}",
+        "xchanneld[{}]: stream {} | control {} | client {}",
         node_id,
         stream_listener.local_addr()?,
-        control_listener.local_addr()?
+        control_listener.local_addr()?,
+        client_listener.local_addr()?,
     );
 
     node.connect_seeds();
+    for (node, run) in [
+        (node.clone(), Plane::Control(control_listener)),
+        (node.clone(), Plane::Client(client_listener)),
+    ] {
+        std::thread::spawn(move || match run {
+            Plane::Control(l) => node.serve_control(l),
+            Plane::Client(l) => node.serve_client(l),
+        });
+    }
     {
         let node = node.clone();
         std::thread::spawn(move || {
             let _ = node.run_maintenance(std::time::Duration::from_millis(500));
         });
     }
-    {
-        let node = node.clone();
-        std::thread::spawn(move || {
-            let _ = node.serve_control(control_listener);
-        });
-    }
     node.serve_stream(stream_listener)
+}
+
+enum Plane {
+    Control(xchannel_net_core::transport::TcpListener),
+    Client(xchannel_net_core::transport::TcpListener),
 }

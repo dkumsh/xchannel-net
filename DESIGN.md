@@ -303,14 +303,19 @@ then resumes forwarding from its remembered `RecordIndex`. No special support ne
 
 ## 6. Protocols (shapes; encoding TBD)
 
-See `xchannel-net-core::wire`. Two planes on separate connections.
+See `xchannel-net-core::wire`. Three planes on separate connections/listeners.
 
-**Control plane** (`ControlMsg`, low volume): `Register`, `Deregister`, `RegistryDelta`,
-`RegistrySync`, `Heartbeat`, `RegisterRejected`. `RegistryDelta` is the eager broadcast on
-register/deregister; `RegistrySync` is the join-time anti-entropy exchange (full registry
-on (re)connect). Both feed the same CRDT merge. (Discovery needs no RPC — a node answers
-lookups from its local converged registry; "channel unknown" is handled by the client
-`WaitPolicy`, §7.)
+**Control plane** (`ControlMsg`, peer↔peer, low volume): `Register`, `Deregister`,
+`RegistryDelta`, `RegistrySync`, `Heartbeat`, `RegisterRejected`. `RegistryDelta` is the
+eager broadcast on register/deregister; `RegistrySync` is the join-time anti-entropy
+exchange (full registry on (re)connect). Both feed the same CRDT merge. `Heartbeat` carries
+the sender's stream address → membership (§9). (Discovery needs no RPC — a node answers
+lookups from its local converged registry.)
+
+**Client plane** (`ClientRequest`/`ClientReply`, local client↔daemon, request/reply):
+`Create { name, options }` → `Created { path }`; `Subscribe { name, wait_ms }` →
+`Subscribed { replica_path }` | `Error`. The daemon owns placement and returns a local path
+the client opens (§7).
 
 **Stream plane** (`StreamMsg`, high volume): `Subscribe`, `SubscribeAck`, `Record`, `Gap`.
 A source→subscriber connection is **multiplexed** — one link carries any number of
@@ -352,28 +357,36 @@ Each `Record` carries its own `index` so the sink asserts contiguity before `com
 
 ---
 
-## 7. Client API sketch (`xchannel-net-client`)
+## 7. Client API (`xchannel-net-client`)
 
-- `create_channel(name, configure: FnOnce(WriterBuilder) -> WriterBuilder) -> Writer` —
-  create + register an origin this node owns. **Manager owns placement, caller owns shape:**
-  the manager seeds `WriterBuilder::new(<path under data_dir>)` and hands it to `configure`,
-  so all builder options are available with no client-side duplication or drift, and
-  placement can't be overridden (`WriterBuilder` has no path setter). The manager registers
-  by reading `region_size`/`mtu` from the resulting header. `base_record_index` is
-  manager-owned (0 for a new origin) and must not be set in `configure`.
-- `register_existing(name, path)` — full-control path: caller built the `Writer` itself
-  with plain `WriterBuilder`; the manager reads geometry from the header and registers.
-  Caveat: keep `path` under `data_dir` or restart-rediscovery (§5.2) can't find it.
-- `subscribe(name, SubscribeMode, WaitPolicy) -> Reader` — discover, ensure the local
-  replica is synced, return a local reader.
-  - `SubscribeMode = Live | LateJoin` — where the returned reader starts.
-  - `WaitPolicy = Block | Poll { interval } | FailFast` — behavior when the channel is
-    not yet known to the network.
+Clients are **separate processes** that reach their local `xchanneld` over the client
+plane. Because a closure can't cross a process boundary, the cross-process API uses a
+**serializable `ChannelOptions`** (`region_size`, `mtu`, `file_roll_size`, `keep_files`) —
+*not* the `WriterBuilder` closure. (The in-process `Node::host_channel` keeps a closure;
+the two layers are distinct.) The daemon owns placement and replies with a **local path**;
+the client opens its own `Writer`/`Reader` (no-custody).
 
-Placement-vs-shape split: the manager dictates *where* (under `data_dir`, for serving +
-restart rediscovery), the caller dictates *how* (geometry/retention). Handing over the
-real `WriterBuilder` keeps full option control in the caller without the client mirroring
-xchannel's option set.
+- `Client::connect(addr)` — explicit daemon endpoint (managed / multi-daemon).
+- `Client::connect_or_spawn()` — the well-known default endpoint, auto-starting `xchanneld`
+  if none is running (single-instance falls out of bind contention; §ops below).
+- `create_channel(name, &ChannelOptions) -> Writer` — daemon precreates under `data_dir`,
+  registers + announces, returns the path; the client opens the single `Writer`.
+- `subscribe(name, SubscribeMode, wait) -> Reader` / `subscribe_path(name, wait) -> PathBuf`
+  — daemon resolves the channel (registry) + owner address (membership), builds a synced
+  replica, returns the replica path; the client opens a `Reader` (`Live`/`LateJoin`).
+  `wait`: `None` blocks until available, `Some(d)` errors after `d`.
+
+Placement-vs-shape split: the daemon dictates *where* (under `data_dir`, for serving +
+restart rediscovery), the client dictates *how* (geometry/retention via `ChannelOptions`).
+
+**Daemon lifecycle / multiple daemons.** Run several daemons explicitly with distinct
+`stream`/`control`/`client` addresses + `data_dir`, and point clients at one via
+`connect(addr)`. Or rely on the implicit single daemon: `connect_or_spawn()` connects to
+the default client endpoint and, if refused, spawns `xchanneld`; concurrent first-clients
+race to `bind()`, the losers exit, everyone converges on the winner — no lockfile needed.
+
+Wire: the client plane carries `ClientRequest`/`ClientReply` (§6 `wire`) — a small
+request/reply RPC distinct from the peer-gossip `ControlMsg` and the data-plane `StreamMsg`.
 
 ---
 
