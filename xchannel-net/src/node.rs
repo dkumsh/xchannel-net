@@ -153,6 +153,7 @@ impl Node {
         Ok(())
     }
 
+    /// Path of an **origin** channel this node hosts: `data_dir/<name>`.
     fn channel_path(&self, name: &str) -> io::Result<PathBuf> {
         if name.is_empty() || name.contains('/') || name.contains('\\') {
             return Err(io::Error::new(
@@ -161,6 +162,14 @@ impl Node {
             ));
         }
         Ok(self.config.data_dir.join(name))
+    }
+
+    /// Path of a **replica** this node maintains: `data_dir/.replicas/<name>`. Kept in a
+    /// separate subtree so a replica never collides with a same-named origin (notably for a
+    /// node subscribing to a channel it also hosts).
+    fn replica_path(&self, name: &str) -> io::Result<PathBuf> {
+        self.channel_path(name)?; // validate the name
+        Ok(self.config.data_dir.join(".replicas").join(name))
     }
 
     // ---------------- stream plane (serve) ----------------
@@ -357,7 +366,7 @@ impl Node {
     ) -> io::Result<Subscription> {
         // Fail fast if the channel can't be resolved within the timeout.
         self.resolve(name, resolve_timeout)?;
-        let replica_path = self.channel_path(name)?;
+        let replica_path = self.replica_path(name)?;
         if let Some(parent) = replica_path.parent() {
             std::fs::create_dir_all(parent)?;
         }

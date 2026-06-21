@@ -41,9 +41,10 @@ fn poll_until<R>(mut f: impl FnMut() -> Option<R>) -> R {
 
 #[test]
 fn client_creates_and_subscribes_via_daemon() {
+    let node_data_dir = temp_dir("daemon");
     let node = Node::new(NodeConfig {
         node_id: NodeId(1),
-        data_dir: temp_dir("daemon"),
+        data_dir: node_data_dir.clone(),
         control_addr: loopback(),
         stream_addr: loopback(),
         client_addr: loopback(),
@@ -89,14 +90,15 @@ fn client_creates_and_subscribes_via_daemon() {
     let replica_path = client
         .subscribe_path("md.aapl", Some(Duration::from_secs(5)))
         .unwrap();
-    assert!(
-        replica_path.exists(),
-        "replica file should have been created"
-    );
 
-    // The daemon syncs all records into the replica.
+    // The daemon builds the replica asynchronously and syncs all records into it. (The
+    // replica lives under data_dir/.replicas, distinct from the same-named origin.)
     poll_until(|| (node.subscription_synced("md.aapl") == Some(n)).then_some(()));
     assert_eq!(node.subscription_synced("md.aapl"), Some(n));
+    assert!(
+        replica_path.exists() && replica_path.starts_with(node_data_dir.join(".replicas")),
+        "replica should exist under data_dir/.replicas"
+    );
 }
 
 #[test]
