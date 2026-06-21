@@ -75,7 +75,11 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   ├── wire.rs               ControlMsg (control plane) / StreamMsg (stream plane) /
 │   │                         RecordFrame. Stream plane is multiplexed by StreamId;
 │   │                         Subscribe/SubscribeAck handshake encodes the resume cursor
-│   │                         (DESIGN.md §6.1). Shapes pinned; encoding TBD.
+│   │                         (DESIGN.md §6.1).
+│   ├── codec.rs              Hand-rolled LE codec (zero deps): encode/decode_control,
+│   │                         encode/decode_stream (+ *_into for buffer reuse). Transport
+│   │                         owns frame length-delimiting; 1-byte tag + u32-prefixed
+│   │                         bytes/strings; Record is flat fixed header + payload.
 │   ├── transport.rs          Transport + Listener traits (TCP today, IPC/RDMA later)
 │   ├── dissemination.rs      Dissemination trait — the swappable broadcast/gossip seam
 │   └── replication.rs        ReplicationSource / ReplicationSink (engine, stubbed)
@@ -127,18 +131,16 @@ _As of 2026-06-21:_
 - On `main`: scaffold + doc reconciliation + dep repoint. Dep is now
   **`xchannel = { version = "4.0.0" }`** (published on crates.io; resolves from registry).
 - Scaffold builds clean; `registry` collision tests pass (2).
-- All engine/transport/dissemination bodies are `unimplemented!` stubs; wire frames are
-  Rust shapes with **no serialization yet**.
+- **Wire codec is implemented** (`core::codec`, hand-rolled LE, zero deps; 7 tests).
+  Engine/transport/dissemination bodies are still `unimplemented!` stubs.
 - **xchannel 4.0.0 is published** (format_version 2, intrinsic absolute `RecordIndex`).
-- Next real code step: **wire serialization** (see Next steps §1) → TCP transport → engines.
+- Next real code step: **TCP `Transport`/`Listener`** (Next steps §2) → dissemination + engines.
 
 ## Next steps (rough order; depends-on noted)
 
-1. **Wire serialization** for `ControlMsg`/`StreamMsg`/`RecordFrame` (length-prefix +
-   codec choice). Shapes are pinned (incl. the §6.1 Subscribe/SubscribeAck resume
-   handshake + `StreamId` multiplexing); only the byte encoding is open.
-   *Blocks transport + everything on the wire.*
-2. **TCP `Transport` + `Listener`** impl. *Blocks broadcast + replication over the net.*
+1. ~~**Wire serialization**~~ — **done** (`core::codec`, hand-rolled LE, zero deps).
+2. **TCP `Transport` + `Listener`** impl over `core::transport`. *Blocks broadcast +
+   replication over the net.* (Frame = one length-delimited blob; codec maps blob ↔ msg.)
 3. **`BroadcastDissemination`** bodies (announce / pump / live_members) + heartbeats.
 4. **`ReplicationSource` / `ReplicationSink`** bodies over real xchannel readers/writers.
 5. Node-manager event loop wiring registry ⇄ dissemination ⇄ replication; client API.

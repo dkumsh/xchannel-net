@@ -8,6 +8,7 @@
 //!
 //! See `DESIGN.md` at the repo root for the architecture this implements.
 
+pub mod codec;
 pub mod dissemination;
 pub mod identity;
 pub mod transport;
