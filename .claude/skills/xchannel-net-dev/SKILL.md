@@ -123,9 +123,11 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
 
 - Rust **edition 2024**, toolchain 1.95. `cargo build --workspace` / `cargo test --workspace`.
 - Commits: **single-line messages only — no body, no prose, no trailers** (incl. no
-  `Co-Authored-By`). Never
-  run `git config`. Commit/push only when asked. (Same single-line rule applies to the
-  `xchannel` repo going forward; its existing multi-line commits are left as-is.)
+  `Co-Authored-By`). **No conventional-commit type prefix** — `feat`/`fix`/`docs` are
+  redundant; use plain `scope: summary` (e.g. `core: …`, `client: …`, `docs: …` only when
+  the scope genuinely is docs).
+  Never run `git config`. Commit/push only when asked. (Same rules apply to the `xchannel`
+  repo going forward; its existing commits are left as-is.)
 - Scaffold stubs use `unimplemented!("<exact intended behavior>")` so the contract is
   pinned without pretending to work.
 
