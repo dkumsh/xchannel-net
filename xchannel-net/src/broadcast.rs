@@ -162,8 +162,7 @@ impl Dissemination for BroadcastDissemination {
 
     fn live_members(&self) -> Vec<NodeId> {
         self.membership
-            .lock()
-            .unwrap()
+            .lock_safe()
             .live_members(self.liveness_timeout)
     }
 }

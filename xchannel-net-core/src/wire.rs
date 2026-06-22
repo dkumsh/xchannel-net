@@ -85,6 +85,9 @@ pub enum StreamMsg {
     /// * `region_size` / `mtu` — the source channel's authoritative geometry, so the sink
     ///   builds a replica `Writer` guaranteed to fit every record (the registry copy may be
     ///   stale; the source is the source of truth).
+    /// * `file_roll_size` / `keep_files` — the source's rolling + retention policy, so the
+    ///   replica inherits the same bounds rather than growing as one unbounded file
+    ///   (`file_roll_size = 0` ⇒ no rolling; `keep_files = 0` ⇒ unlimited retention).
     SubscribeAck {
         name: ChannelName,
         stream_id: StreamId,
@@ -92,6 +95,8 @@ pub enum StreamMsg {
         head: RecordIndex,
         region_size: u32,
         mtu: u32,
+        file_roll_size: u64,
+        keep_files: u32,
     },
 
     /// Source → subscriber: one replicated record on `stream_id`. The frame carries its

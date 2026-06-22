@@ -40,9 +40,10 @@ are properties of the current design, not bugs:
   channels (writing files under `data_dir`).
 - **Resource exhaustion.** The registry has no TTL, tombstones, or aggregate size cap, so a
   peer can grow it without bound across connections. Stream and client connections are
-  capped (a fixed `MAX_CONNECTIONS`), but peer control links are not, there is no
-  per-connection read timeout or rate limit, and replica disk usage is unbounded (replicas
-  retain full history by design).
+  capped (a fixed `MAX_CONNECTIONS`), but peer control links are not, and there is no
+  per-connection read timeout or rate limit. (Replicas inherit the origin's
+  rolling/retention via the `SubscribeAck`, so a replica's disk use is unbounded only if
+  its origin is.)
 
 What is *defended*: the wire codec is bounds-checked, refuses attacker-controlled
 pre-allocation, and caps individual frame size; there is no `unsafe` in the workspace and

@@ -109,17 +109,30 @@ pub struct ReplicationSink {
 }
 
 impl ReplicationSink {
-    /// Create (or reopen) the local replica for a channel. `region_size`/`mtu` come from
-    /// the source's authoritative geometry (the `SubscribeAck`), so every record fits.
-    /// `start` is the first absolute index the source will send; it seeds the replica's
-    /// `base_record_index` so the replica self-describes absolute indices. Reopening an
-    /// existing replica ignores `start` (the on-disk base wins) and resumes from its head.
-    pub fn open(path: &Path, region_size: u32, mtu: u32, start: RecordIndex) -> io::Result<Self> {
-        let writer = WriterBuilder::new(path)
+    /// Create (or reopen) the local replica for a channel. `region_size`/`mtu` and the
+    /// `file_roll_size`/`keep_files` rolling+retention policy all come from the source's
+    /// `SubscribeAck`, so the replica mirrors the origin's geometry *and* its disk bounds
+    /// rather than growing unbounded. `start` is the first absolute index the source will
+    /// send; it seeds the replica's `base_record_index` so the replica self-describes
+    /// absolute indices. Reopening an existing replica ignores `start` (the on-disk base
+    /// wins) and resumes from its head.
+    pub fn open(
+        path: &Path,
+        region_size: u32,
+        mtu: u32,
+        file_roll_size: u64,
+        keep_files: u32,
+        start: RecordIndex,
+    ) -> io::Result<Self> {
+        let mut builder = WriterBuilder::new(path)
             .region_size(region_size as usize)
             .mtu(mtu as u64)
-            .base_record_index(start.0)
-            .build()?;
+            .file_roll_size(file_roll_size)
+            .base_record_index(start.0);
+        if keep_files > 0 {
+            builder = builder.keep_files(keep_files as u64);
+        }
+        let writer = builder.build()?;
         let expected_index = writer.next_record_index();
         Ok(Self {
             writer,
@@ -208,7 +221,7 @@ mod tests {
 
         // Apply into the replica.
         {
-            let mut sink = ReplicationSink::open(&replica, REGION_U32, 0, earliest).unwrap();
+            let mut sink = ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, earliest).unwrap();
             for f in &frames {
                 sink.apply(f).unwrap();
             }
@@ -231,9 +244,55 @@ mod tests {
     }
 
     #[test]
+    fn sink_inherits_rolling_and_retention() {
+        // A replica opened with the origin's file_roll_size + keep_files rolls and prunes
+        // like the origin, instead of growing as one unbounded file. We prove both
+        // propagated by checking that early records were pruned (earliest retained base > 0).
+        let replica = temp_base("retain");
+        let region = REGION as u32; // 1 MiB
+        let file_roll_size = (REGION as u64) * 2; // 2 regions/file → frequent rolls
+        let keep_files = 2u32;
+
+        {
+            let mut sink = ReplicationSink::open(
+                &replica,
+                region,
+                0,
+                file_roll_size,
+                keep_files,
+                RecordIndex(0),
+            )
+            .unwrap();
+            // Enough ~1 KiB records to fill many files and force pruning past keep_files.
+            let payload = vec![0xABu8; 1024];
+            for i in 0..6000u64 {
+                sink.apply(&RecordFrame {
+                    index: RecordIndex(i),
+                    msg_type: 0,
+                    user_meta: i,
+                    payload: payload.clone(),
+                })
+                .unwrap();
+            }
+        }
+
+        // Pruning happened ⇒ the earliest retained file no longer starts at genesis.
+        let r = ReaderBuilder::new(&replica)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        assert!(
+            r.base_record_index() > 0,
+            "replica should have rolled and pruned early records (base = {})",
+            r.base_record_index()
+        );
+    }
+
+    #[test]
     fn sink_rejects_non_contiguous_frame() {
         let replica = temp_base("noncontig");
-        let mut sink = ReplicationSink::open(&replica, REGION_U32, 0, RecordIndex(0)).unwrap();
+        let mut sink =
+            ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, RecordIndex(0)).unwrap();
 
         sink.apply(&RecordFrame {
             index: RecordIndex(0),

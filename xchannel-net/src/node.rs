@@ -153,7 +153,15 @@ impl Node {
             .mtu(mtu as u64)
             .base_record_index(0)
             .build()?;
-        self.register_origin(name, path, region_size, mtu)?;
+        // The `configure` closure is opaque, so any `file_roll_size`/`keep_files` it sets
+        // can't be read back to advertise in the `SubscribeAck`. We therefore announce
+        // `(0, 0)` (no rolling / unlimited) — which matches the WriterBuilder default, so
+        // for an unconfigured channel origin and replicas agree. But if the closure *does*
+        // set rolling/retention, the origin rolls-and-prunes while its replicas grow
+        // unbounded (safe direction: replicas never drop records, only over-retain).
+        // Clients that need replicas to inherit disk bounds should use the client RPC
+        // (`create_for_client` / `ChannelOptions`), which propagates both fields.
+        self.register_origin(name, path, region_size, mtu, 0, 0)?;
         Ok(writer)
     }
 
@@ -174,18 +182,29 @@ impl Node {
             builder = builder.keep_files(options.keep_files as u64);
         }
         builder.precreate()?; // file + header exist; no writer retained
-        self.register_origin(name, path.clone(), options.region_size, options.mtu)?;
+        self.register_origin(
+            name,
+            path.clone(),
+            options.region_size,
+            options.mtu,
+            options.file_roll_size,
+            options.keep_files,
+        )?;
         Ok(path)
     }
 
     /// Register a locally-hosted origin in the registry, announce it to peers, and record
-    /// it in the hosted map (so `serve_stream` can resolve it).
+    /// it in the hosted map (so `serve_stream` can resolve it). `file_roll_size`/`keep_files`
+    /// are the origin's rolling+retention policy, carried in the hosted `ChannelSource` so
+    /// subscribers' replicas inherit the same disk bounds via `SubscribeAck`.
     fn register_origin(
         &self,
         name: &str,
         path: PathBuf,
         region_size: u32,
         mtu: u32,
+        file_roll_size: u64,
+        keep_files: u32,
     ) -> io::Result<()> {
         let identity = ChannelIdentity {
             name: name.to_string(),
@@ -197,8 +216,7 @@ impl Node {
         };
         self.registry.lock_safe().merge(identity.clone());
         self.dissemination
-            .lock()
-            .unwrap()
+            .lock_safe()
             .announce(std::slice::from_ref(&identity))?;
         self.hosted.lock_safe().insert(
             name.to_string(),
@@ -206,6 +224,8 @@ impl Node {
                 path,
                 region_size,
                 mtu,
+                file_roll_size,
+                keep_files,
             },
         );
         Ok(())
@@ -282,8 +302,7 @@ impl Node {
         let conn = TcpTransport::connect(addr)?;
         let snapshot = self.registry_snapshot();
         self.dissemination
-            .lock()
-            .unwrap()
+            .lock_safe()
             .add_outbound_peer(conn, addr, &snapshot)
     }
 
@@ -299,8 +318,7 @@ impl Node {
                 let snapshot = self.registry_snapshot();
                 let _ = self
                     .dissemination
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .add_outbound_peer(conn, addr, &snapshot);
             }
         }
@@ -405,8 +423,7 @@ impl Node {
     /// Sync progress of a subscription this node maintains (for clients), if any.
     pub fn subscription_synced(&self, name: &str) -> Option<u64> {
         self.subscriptions
-            .lock()
-            .unwrap()
+            .lock_safe()
             .get(name)
             .map(|s| s.synced_index())
     }

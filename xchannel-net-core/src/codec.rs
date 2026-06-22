@@ -286,6 +286,8 @@ pub fn encode_stream_into(buf: &mut Vec<u8>, m: &StreamMsg) {
             head,
             region_size,
             mtu,
+            file_roll_size,
+            keep_files,
         } => {
             w.u8(stream_tag::SUBSCRIBE_ACK);
             w.str(name);
@@ -294,6 +296,8 @@ pub fn encode_stream_into(buf: &mut Vec<u8>, m: &StreamMsg) {
             w.u64(head.0);
             w.u32(*region_size);
             w.u32(*mtu);
+            w.u64(*file_roll_size);
+            w.u32(*keep_files);
         }
         StreamMsg::Record { stream_id, frame } => {
             // Hot path: flat fixed header + payload, no per-field framing.
@@ -338,6 +342,8 @@ pub fn decode_stream(bytes: &[u8]) -> io::Result<StreamMsg> {
             head: RecordIndex(r.u64()?),
             region_size: r.u32()?,
             mtu: r.u32()?,
+            file_roll_size: r.u64()?,
+            keep_files: r.u32()?,
         },
         stream_tag::RECORD => {
             let stream_id = StreamId(r.u32()?);
@@ -512,6 +518,8 @@ mod tests {
                 head: RecordIndex(250),
                 region_size: 1 << 20,
                 mtu: 0,
+                file_roll_size: 1 << 30,
+                keep_files: 8,
             },
             StreamMsg::Record {
                 stream_id: StreamId(3),

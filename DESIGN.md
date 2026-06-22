@@ -406,7 +406,7 @@ the source persists none.
 
 ```
 Subscribe    { name, from }                                  subscriber → source
-SubscribeAck { name, stream_id, start, head, region_size, mtu }   source → subscriber
+SubscribeAck { name, stream_id, start, head, region_size, mtu, file_roll_size, keep_files }  source → subscriber
 Record       { stream_id, frame{ index, msg_type, user_meta, payload } }   source → subscriber (xN)
 Gap          { name, earliest, head }                        source → subscriber (in place of Ack)
 ```
@@ -426,6 +426,9 @@ Gap          { name, earliest, head }                        source → subscrib
   currently a placeholder equal to `start`, not the true high-water index.**)**
 - **`region_size` / `mtu`** = the source's authoritative geometry, so the sink builds a
   replica `Writer` guaranteed to fit every record (the registry copy may be stale).
+- **`file_roll_size` / `keep_files`** = the source's rolling + retention policy, so the
+  replica inherits the origin's disk bounds instead of growing as one unbounded file
+  (`0` ⇒ no rolling / unlimited). Carried in the owner's hosted `ChannelSource`.
 - **`Gap`** replaces the Ack when `from > 0` and `earliest > from`: the subscriber fell
   behind retention and its partial replica can't be extended contiguously. `earliest`/`head`
   let it decide whether to discard and re-subscribe from `0`. (Policy: §8.)

@@ -35,6 +35,10 @@ pub struct ChannelSource {
     pub path: PathBuf,
     pub region_size: u32,
     pub mtu: u32,
+    /// Rolling + retention policy to advertise so the replica inherits the origin's disk
+    /// bounds (`0` = no rolling / unlimited retention).
+    pub file_roll_size: u64,
+    pub keep_files: u32,
 }
 
 // ---------------- origin side ----------------
@@ -87,6 +91,8 @@ pub fn accept_subscription<T: Transport>(
         head: start,
         region_size: src.region_size,
         mtu: src.mtu,
+        file_roll_size: src.file_roll_size,
+        keep_files: src.keep_files,
     }))?;
 
     Ok(StreamServer { transport, source })
@@ -154,9 +160,18 @@ pub fn subscribe<T: Transport>(
             start,
             region_size,
             mtu,
+            file_roll_size,
+            keep_files,
             ..
         } => {
-            let sink = ReplicationSink::open(replica_path, region_size, mtu, start)?;
+            let sink = ReplicationSink::open(
+                replica_path,
+                region_size,
+                mtu,
+                file_roll_size,
+                keep_files,
+                start,
+            )?;
             Ok(StreamClient { transport, sink })
         }
         StreamMsg::Gap { earliest, .. } => Err(io::Error::new(
@@ -248,6 +263,8 @@ mod tests {
                     path: origin_path.clone(),
                     region_size: REGION as u32,
                     mtu: 0,
+                    file_roll_size: 0,
+                    keep_files: 0,
                 })
             };
             let mut srv = accept_subscription(conn, resolve).unwrap();
