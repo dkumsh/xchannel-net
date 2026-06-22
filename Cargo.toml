@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.89" # File::try_lock / TryLockError (data_dir .lock guard)
 license = "MIT"
@@ -18,5 +18,6 @@ authors = ["Dmitriy Kumshayev <dq@mail.com>"]
 # The log/IPC substrate this project replicates over the network.
 xchannel = { version = "4.0.0" }
 
-# Internal crates referencing each other.
-xchannel-net-core = { path = "xchannel-net-core" }
+# Internal crates referencing each other. `version` is required for crates.io publishing
+# (the registry rejects a bare path dep); the `path` still wins for local/workspace builds.
+xchannel-net-core = { path = "xchannel-net-core", version = "0.0.1" }

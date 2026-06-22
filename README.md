@@ -14,7 +14,7 @@ behind it, and the prior art that informed it.
 
 ## Status
 
-**Experimental, pre-1.0** (`version = 0.0.0`); the wire protocol and on-disk layout may
+**Experimental, pre-1.0** (`version = 0.0.1`); the wire protocol and on-disk layout may
 change without notice.
 
 **Platform: Unix only.** The client plane is a permission-gated Unix domain socket and the

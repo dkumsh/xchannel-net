@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "xchannel-net"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "xchannel",
  "xchannel-net-client",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "xchannel-net-client"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "xchannel",
  "xchannel-net-core",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "xchannel-net-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "xchannel",
 ]

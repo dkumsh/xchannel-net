@@ -6,7 +6,7 @@
 > channel names, subscribe to and pull the full history of any channel, and inject registry
 > and membership gossip. **Do not expose `xchanneld` ports to untrusted hosts.**
 
-This is experimental, pre-1.0 software (`version = 0.0.0`). The wire protocol and on-disk
+This is experimental, pre-1.0 software (`version = 0.0.1`). The wire protocol and on-disk
 layout may change without notice.
 
 ## Threat model / scope
