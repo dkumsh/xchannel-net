@@ -81,8 +81,9 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   │                         encode/decode_stream (+ *_into for buffer reuse). Transport
 │   │                         owns frame length-delimiting; 1-byte tag + u32-prefixed
 │   │                         bytes/strings; Record is flat fixed header + payload.
-│   ├── transport.rs          Transport + Listener traits; TcpTransport (+ try_clone) /
-│   │                         TcpListener (std-only, u32-LE length-delimited, MAX_FRAME_LEN)
+│   ├── transport.rs          Transport + Listener traits; shared u32-LE framing; TcpTransport
+│   │                         /TcpListener (network planes) + UnixTransport/UnixListener
+│   │                         (local client plane); std-only, MAX_FRAME_LEN cap
 │   ├── membership.rs         Membership: NodeId→addr + heartbeat liveness (separate map;
 │   │                         ChannelIdentity stays address-free, DESIGN §9)
 │   ├── dissemination.rs      Dissemination trait — the swappable broadcast/gossip seam
@@ -102,9 +103,10 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   └── broadcast.rs          BroadcastDissemination (concrete/TCP): per-peer reader
 │   │                         threads → inbox + Membership; announce/emit_heartbeat/pump/
 │   │                         addr_of/live_members. Implements core::dissemination trait.
-└── xchannel-net-client/      external client↔daemon RPC. Client::connect(addr) /
-                              connect_or_spawn() (auto-starts xchanneld at the default
-                              endpoint; single-instance via bind contention). create_channel
+└── xchannel-net-client/      external client↔daemon RPC over a Unix socket.
+                              Client::connect(path) / connect_or_spawn() (auto-starts
+                              xchanneld at DEFAULT_CLIENT_PATH; single-instance via socket
+                              bind contention + stale-socket reclaim). create_channel
                               (→ Writer) / subscribe (→ Reader) / subscribe_path. Cross-
                               process ⇒ serializable ChannelOptions, NOT a closure (a
                               closure can't cross the wire; the in-process Node::host_channel
@@ -171,13 +173,15 @@ _As of 2026-06-22:_
 ## Security
 
 Trust model + threats + reporting are in `SECURITY.md` (TL;DR: unauthenticated plaintext,
-**trusted-network only**; defaults bind loopback, non-loopback bind warns). **Tier-0
-hardening is done**: channel-name allowlist (no traversal/`.replicas` collision), absolute
-daemon-spawn path (no `PATH` injection), lock-poison recovery (`util::MutexExt::lock_safe`),
-`MAX_CONNECTIONS` cap on stream+client planes, `0700` data dir, 64 MiB frame cap.
-**Tier-1 (required before any untrusted exposure) is future**: mTLS/Noise on all planes,
-signed `ChannelIdentity` (don't trust `registered_at_nanos`/`owner`), authz, UDS for the
-client plane.
+**trusted-network only**; stream/control default to loopback, non-loopback bind warns; the
+client plane is a permission-gated local Unix socket). **Tier-0 hardening is done**:
+channel-name allowlist (no traversal/`.replicas` collision), absolute daemon-spawn path (no
+`PATH` injection), lock-poison recovery (`util::MutexExt::lock_safe`), `MAX_CONNECTIONS` cap
+on stream+client planes, `0700` data dir, 64 MiB frame cap, and the client plane on a
+`0600` Unix socket under the data dir (no loopback port; `bind` arbitrates single-instance
+startup + reclaims stale sockets).
+**Tier-1 (required before any untrusted exposure) is future**: mTLS/Noise on the network
+planes, signed `ChannelIdentity` (don't trust `registered_at_nanos`/`owner`), authz.
 
 ## Next steps (post-v1 polish, optional)
 

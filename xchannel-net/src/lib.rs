@@ -26,8 +26,9 @@ pub struct NodeConfig {
     pub control_addr: std::net::SocketAddr,
     /// Stream-plane listen address (serving subscriptions).
     pub stream_addr: std::net::SocketAddr,
-    /// Client-plane listen address (local client↔daemon RPC).
-    pub client_addr: std::net::SocketAddr,
+    /// Client-plane Unix-domain-socket path (local client↔daemon RPC). Lives under
+    /// `data_dir` so the `0700` directory restricts who can reach the daemon.
+    pub client_path: std::path::PathBuf,
     /// Seed peers to exchange registry state with on startup.
     pub seeds: Vec<std::net::SocketAddr>,
 }

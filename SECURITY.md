@@ -17,9 +17,11 @@ administrative domain)**, the deployment for which the design was chosen (see
 are fully trusted**. The project does *not* defend against a malicious participant; it is
 not built for open, adversarial, or WAN deployment.
 
-By default the daemon binds all planes to `127.0.0.1`, which keeps it reachable only from
-the local host. Cross-machine replication requires binding a routable address — at which
-point every item below is reachable by anything on that network.
+By default the daemon binds its two network planes (stream, control) to `127.0.0.1` and
+serves the client plane on a Unix domain socket under the `0700` `data_dir`, which keeps it
+reachable only from the local host. Cross-machine replication requires binding a routable
+address for the stream/control planes — at which point every network-reachable item below is
+exposed to anything on that network.
 
 ## What a network-reachable actor can currently do
 
@@ -37,7 +39,9 @@ are properties of the current design, not bugs:
 - **History exfiltration.** Any connector to the stream plane can `Subscribe` to any hosted
   channel by name and pull its full retained history.
 - **Channel squatting / unsolicited writes.** Any connector to the client plane can create
-  channels (writing files under `data_dir`).
+  channels (writing files under `data_dir`). The client plane is a Unix domain socket under
+  the `0700` `data_dir` (created `0600`), so on a correctly-permissioned host only the owner
+  can reach it — but anything running as the owner (or root) still can.
 - **Resource exhaustion.** The registry has no TTL, tombstones, or aggregate size cap, so a
   peer can grow it without bound across connections. Stream and client connections are
   capped (a fixed `MAX_CONNECTIONS`), but peer control links are not, and there is no
@@ -50,14 +54,17 @@ pre-allocation, and caps individual frame size; there is no `unsafe` in the work
 no network-reachable panic — and even if a thread did panic, locks recover from poisoning
 rather than cascading; channel names are validated against an allowlist (`[A-Za-z0-9._-]`,
 no leading dot), rejecting separators, traversal (`..`), and `.replicas` collisions; the
-data directory is created owner-only (`0700` on Unix); and the client's daemon auto-spawn
-resolves an absolute binary path, never a `PATH` search.
+data directory is created owner-only (`0700` on Unix); the client plane is a Unix domain
+socket under that directory (created `0600`) rather than a loopback TCP port, so it is gated
+by filesystem permissions instead of being reachable by any local process; and the client's
+daemon auto-spawn resolves an absolute binary path, never a `PATH` search.
 
 ## Operational guidance
 
-- **Bind to loopback or a trusted, isolated network only.** Keep the defaults
-  (`127.0.0.1`) unless you control the network. `xchanneld` emits a warning at startup when
-  any plane is bound to a non-loopback address.
+- **Bind the network planes to loopback or a trusted, isolated network only.** Keep the
+  stream/control defaults (`127.0.0.1`) unless you control the network. `xchanneld` emits a
+  warning at startup when either network plane is bound to a non-loopback address. (The
+  client plane is a local Unix socket — keep its `data_dir` owner-only.)
 - **Place untrusted boundaries outside the mesh.** If nodes must communicate across an
   untrusted network, tunnel the connections (e.g. WireGuard, an mTLS proxy, or an SSH
   tunnel) rather than exposing the ports directly.

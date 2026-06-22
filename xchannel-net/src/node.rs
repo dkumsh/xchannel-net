@@ -32,7 +32,9 @@ use xchannel_net_core::codec::{decode_client_request, encode_client_reply};
 use xchannel_net_core::dissemination::Dissemination;
 use xchannel_net_core::identity::ChannelIdentity;
 use xchannel_net_core::stream::{self, ChannelSource, accept_subscription};
-use xchannel_net_core::transport::{Listener, TcpListener, TcpTransport, Transport};
+use xchannel_net_core::transport::{
+    Listener, TcpListener, TcpTransport, Transport, UnixListener, UnixTransport,
+};
 use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest};
 
 /// A node not heard from within this is dropped from the live set.
@@ -350,13 +352,41 @@ impl Node {
 
     // ---------------- client plane (local client RPC) ----------------
 
-    /// Bind the client-plane listener (local client↔daemon RPC).
-    pub fn bind_client(&self) -> io::Result<TcpListener> {
-        TcpListener::bind(self.config.client_addr)
+    /// Bind the client-plane listener — a Unix domain socket at `client_path`. Who may drive
+    /// the daemon is governed by filesystem permissions: the socket sits under the `0700`
+    /// data dir and is itself created `0600`, so only the owner can connect (no loopback port
+    /// any local process could reach). The bind also arbitrates single-instance startup: if a
+    /// live daemon already owns the path the bind fails with `AddrInUse` (the loser of a
+    /// `connect_or_spawn` race), while a stale socket left by a crashed daemon is detected
+    /// (nothing answers a probe connect) and reclaimed.
+    pub fn bind_client(&self) -> io::Result<UnixListener> {
+        let path = &self.config.client_path;
+        if let Some(parent) = path.parent() {
+            ensure_private_dir(parent)?;
+        }
+        let listener = match UnixListener::bind(path) {
+            Ok(l) => l,
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                // The path is taken. A live daemon answering a probe connect means we lost
+                // the race; otherwise it's a stale socket from a crash — remove and rebind.
+                if UnixTransport::connect(path).is_ok() {
+                    return Err(e);
+                }
+                std::fs::remove_file(path)?;
+                UnixListener::bind(path)?
+            }
+            Err(e) => return Err(e),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(listener)
     }
 
     /// Accept local client connections forever, handling each on its own thread.
-    pub fn serve_client(&self, mut listener: TcpListener) -> io::Result<()> {
+    pub fn serve_client(&self, mut listener: UnixListener) -> io::Result<()> {
         loop {
             let conn = listener.accept()?;
             let Some(guard) = self.acquire_conn() else {
@@ -371,7 +401,7 @@ impl Node {
     }
 
     /// Serve a client connection: one request → one reply, until it disconnects.
-    fn handle_client(&self, mut conn: TcpTransport) {
+    fn handle_client<T: Transport>(&self, mut conn: T) {
         while let Ok(bytes) = conn.recv_frame() {
             let reply = match decode_client_request(&bytes) {
                 Ok(req) => self.handle_request(req),
@@ -653,12 +683,13 @@ mod tests {
     }
 
     fn config(id: u64, data_dir: PathBuf) -> NodeConfig {
+        let client_path = data_dir.join("client.sock");
         NodeConfig {
             node_id: NodeId(id),
             data_dir,
             control_addr: "127.0.0.1:0".parse().unwrap(),
             stream_addr: "127.0.0.1:0".parse().unwrap(),
-            client_addr: "127.0.0.1:0".parse().unwrap(),
+            client_path,
             seeds: vec![],
         }
     }

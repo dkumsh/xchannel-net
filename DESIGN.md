@@ -461,10 +461,17 @@ Placement-vs-shape split: the daemon dictates *where* (under `data_dir`, for ser
 restart rediscovery), the client dictates *how* (geometry/retention via `ChannelOptions`).
 
 **Daemon lifecycle / multiple daemons.** Run several daemons explicitly with distinct
-`stream`/`control`/`client` addresses + `data_dir`, and point clients at one via
-`connect(addr)`. Or rely on the implicit single daemon: `connect_or_spawn()` connects to
-the default client endpoint and, if refused, spawns `xchanneld`; concurrent first-clients
-race to `bind()`, the losers exit, everyone converges on the winner — no lockfile needed.
+`stream`/`control` addresses, `client` socket paths, and `data_dir`, and point clients at one
+via `connect(path)`. Or rely on the implicit single daemon: `connect_or_spawn()` connects to
+the default client socket and, if refused, spawns `xchanneld`; concurrent first-clients
+race to `bind()` the socket, the losers exit, everyone converges on the winner — no lockfile
+needed (a stale socket left by a crashed daemon is reclaimed: a probe connect that nobody
+answers identifies it as dead, and it is unlinked before rebinding).
+
+Transport: stream and control are TCP (they cross hosts); the **client plane is a Unix
+domain socket** — the client always talks to its *local* daemon, so the local hop needs no
+network port, and filesystem permissions (the socket lives under the `0700` `data_dir`,
+created `0600`) gate access rather than a loopback port any local process could reach.
 
 Wire: the client plane carries `ClientRequest`/`ClientReply` (§6 `wire`) — a small
 request/reply RPC distinct from the peer-gossip `ControlMsg` and the data-plane `StreamMsg`.

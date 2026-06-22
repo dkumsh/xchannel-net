@@ -25,16 +25,20 @@ fn main() -> std::io::Result<()> {
     let control_addr: SocketAddr = env_or("XCHANNELD_CONTROL_ADDR", "127.0.0.1:7001")
         .parse()
         .expect("XCHANNELD_CONTROL_ADDR must be host:port");
-    let client_addr: SocketAddr = env_or("XCHANNELD_CLIENT_ADDR", "127.0.0.1:7002")
-        .parse()
-        .expect("XCHANNELD_CLIENT_ADDR must be host:port");
+    let data_dir = PathBuf::from(env_or("XCHANNELD_DATA_DIR", "/tmp/xchanneld"));
+    // Client plane is a Unix domain socket (local-only, permission-gated); defaults under
+    // the data dir so the 0700 directory restricts who can reach the daemon.
+    let client_path = PathBuf::from(env_or(
+        "XCHANNELD_CLIENT_PATH",
+        &data_dir.join("client.sock").to_string_lossy(),
+    ));
 
     let config = NodeConfig {
         node_id: NodeId(node_id),
-        data_dir: PathBuf::from(env_or("XCHANNELD_DATA_DIR", "/tmp/xchanneld")),
+        data_dir,
         control_addr,
         stream_addr,
-        client_addr,
+        client_path,
         seeds: vec![],
     };
     std::fs::create_dir_all(&config.data_dir)?;
@@ -44,6 +48,7 @@ fn main() -> std::io::Result<()> {
         std::fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))?;
     }
 
+    let client_path = config.client_path.clone();
     let node = Node::new(config);
     let stream_listener = node.bind_stream()?;
     let control_listener = node.bind_control()?;
@@ -53,17 +58,14 @@ fn main() -> std::io::Result<()> {
         node_id,
         stream_listener.local_addr()?,
         control_listener.local_addr()?,
-        client_listener.local_addr()?,
+        client_path.display(),
     );
 
-    // Security: all planes are unauthenticated plaintext (see SECURITY.md). Warn loudly
-    // when any plane is bound off-loopback, where any reachable host can register names,
-    // pull any channel's history, and inject registry/membership gossip.
-    for (plane, addr) in [
-        ("stream", stream_addr),
-        ("control", control_addr),
-        ("client", client_addr),
-    ] {
+    // Security: the network planes are unauthenticated plaintext (see SECURITY.md). Warn
+    // loudly when stream/control are bound off-loopback, where any reachable host can
+    // register names, pull any channel's history, and inject registry/membership gossip.
+    // (The client plane is a permission-gated local Unix socket, not a network port.)
+    for (plane, addr) in [("stream", stream_addr), ("control", control_addr)] {
         if !addr.ip().is_loopback() {
             eprintln!(
                 "xchanneld[{node_id}]: WARNING: {plane} plane bound to non-loopback {addr} \
@@ -95,5 +97,5 @@ fn main() -> std::io::Result<()> {
 
 enum Plane {
     Control(xchannel_net_core::transport::TcpListener),
-    Client(xchannel_net_core::transport::TcpListener),
+    Client(xchannel_net_core::transport::UnixListener),
 }

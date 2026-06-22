@@ -6,24 +6,25 @@
 //! on that path (no-custody — the writer writes the mmap directly; the daemon only tails
 //! and forwards it).
 //!
-//! Two ways to reach the daemon:
-//! * [`Client::connect`] — an explicit address (run multiple daemons yourself and pick one);
-//! * [`Client::connect_or_spawn`] — the well-known default endpoint, auto-starting a daemon
-//!   if none is running (single-instance falls out of bind contention).
+//! Two ways to reach the daemon, both over the local client-plane **Unix domain socket**
+//! (so access is gated by filesystem permissions, not an open loopback port):
+//! * [`Client::connect`] — an explicit socket path (run multiple daemons yourself and pick one);
+//! * [`Client::connect_or_spawn`] — the well-known default socket, auto-starting a daemon
+//!   if none is running (single-instance falls out of bind contention on the path).
 
 use std::io::{self, ErrorKind};
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use xchannel::{Reader, ReaderBuilder, ReaderMode, Writer, WriterBuilder};
 use xchannel_net_core::codec::{decode_client_reply, encode_client_request};
-use xchannel_net_core::transport::{TcpTransport, Transport};
+use xchannel_net_core::transport::{Transport, UnixTransport};
 use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest};
 
 pub use xchannel_net_core::wire::ChannelOptions as Options;
 
-/// Well-known default client-plane endpoint for the implicit single local daemon.
-pub const DEFAULT_CLIENT_ADDR: &str = "127.0.0.1:7002";
+/// Well-known default client-plane socket path for the implicit single local daemon. Mirrors
+/// the daemon's `XCHANNELD_CLIENT_PATH` default (under its `/tmp/xchanneld` data dir).
+pub const DEFAULT_CLIENT_PATH: &str = "/tmp/xchanneld/client.sock";
 
 /// Where a subscriber's returned `Reader` starts. The replica always holds full retained
 /// history; this only selects the read position.
@@ -47,33 +48,31 @@ impl From<SubscribeMode> for ReaderMode {
 /// A connection to the local node-manager daemon. Synchronous request/reply; not shared
 /// across threads (one in-flight request at a time).
 pub struct Client {
-    conn: TcpTransport,
+    conn: UnixTransport,
 }
 
 impl Client {
-    /// Connect to a daemon's client-plane address (explicit; for managed / multi-daemon
+    /// Connect to a daemon's client-plane socket (explicit; for managed / multi-daemon
     /// setups). Errors if no daemon is listening there.
-    pub fn connect(client_addr: SocketAddr) -> io::Result<Self> {
+    pub fn connect<P: AsRef<Path>>(client_path: P) -> io::Result<Self> {
         Ok(Self {
-            conn: TcpTransport::connect(client_addr)?,
+            conn: UnixTransport::connect(client_path)?,
         })
     }
 
-    /// Connect to the default local daemon ([`DEFAULT_CLIENT_ADDR`]), auto-starting one if
-    /// none is running. The spawned `xchanneld` (located via `$XCHANNELD_BIN` or `PATH`)
-    /// uses its own default addresses/data dir; if two clients race, only one daemon wins
-    /// the `bind()` and the rest connect to it.
+    /// Connect to the default local daemon ([`DEFAULT_CLIENT_PATH`]), auto-starting one if
+    /// none is running. The spawned `xchanneld` (located via `$XCHANNELD_BIN` or beside the
+    /// current executable) uses its own default socket/data dir; if two clients race, only
+    /// one daemon wins the `bind()` and the rest connect to it.
     pub fn connect_or_spawn() -> io::Result<Self> {
-        let addr: SocketAddr = DEFAULT_CLIENT_ADDR
-            .parse()
-            .expect("DEFAULT_CLIENT_ADDR is valid");
-        if let Ok(client) = Self::connect(addr) {
+        let path = PathBuf::from(DEFAULT_CLIENT_PATH);
+        if let Ok(client) = Self::connect(&path) {
             return Ok(client);
         }
         spawn_daemon()?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(client) = Self::connect(addr) {
+            if let Ok(client) = Self::connect(&path) {
                 return Ok(client);
             }
             if Instant::now() >= deadline {

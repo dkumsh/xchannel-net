@@ -42,18 +42,18 @@ fn poll_until<R>(mut f: impl FnMut() -> Option<R>) -> R {
 #[test]
 fn client_creates_and_subscribes_via_daemon() {
     let node_data_dir = temp_dir("daemon");
+    let client_path = node_data_dir.join("client.sock");
     let node = Node::new(NodeConfig {
         node_id: NodeId(1),
         data_dir: node_data_dir.clone(),
         control_addr: loopback(),
         stream_addr: loopback(),
-        client_addr: loopback(),
+        client_path: client_path.clone(),
         seeds: vec![],
     });
 
     let stream_l = node.bind_stream().unwrap();
     let client_l = node.bind_client().unwrap();
-    let client_addr = client_l.local_addr().unwrap();
 
     {
         let n = node.clone();
@@ -69,7 +69,7 @@ fn client_creates_and_subscribes_via_daemon() {
     }
 
     let n = 30u64;
-    let mut client = Client::connect(client_addr).unwrap();
+    let mut client = Client::connect(&client_path).unwrap();
 
     // Create a channel through the daemon and write to the returned Writer; drop it before
     // subscribing (single-process caveat).
@@ -103,17 +103,18 @@ fn client_creates_and_subscribes_via_daemon() {
 
 #[test]
 fn subscribe_to_unknown_channel_times_out() {
+    let data_dir = temp_dir("unknown");
+    let client_path = data_dir.join("client.sock");
     let node = Node::new(NodeConfig {
         node_id: NodeId(2),
-        data_dir: temp_dir("unknown"),
+        data_dir,
         control_addr: loopback(),
         stream_addr: loopback(),
-        client_addr: loopback(),
+        client_path: client_path.clone(),
         seeds: vec![],
     });
     let stream_l = node.bind_stream().unwrap();
     let client_l = node.bind_client().unwrap();
-    let client_addr = client_l.local_addr().unwrap();
     {
         let n = node.clone();
         std::thread::spawn(move || {
@@ -127,7 +128,7 @@ fn subscribe_to_unknown_channel_times_out() {
         });
     }
 
-    let mut client = Client::connect(client_addr).unwrap();
+    let mut client = Client::connect(&client_path).unwrap();
     let err = client
         .subscribe_path("does.not.exist", Some(Duration::from_millis(200)))
         .unwrap_err();

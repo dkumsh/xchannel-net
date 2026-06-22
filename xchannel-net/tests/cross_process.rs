@@ -4,9 +4,8 @@
 //! the origin and read the replica without tripping xchannel's same-process writer+reader
 //! rule (the constraint that forces all the in-process tests to be sequential).
 
-use std::io::{BufRead, BufReader};
-use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 use xchannel_net_client::{Client, SubscribeMode};
 use xchannel_net_core::wire::ChannelOptions;
@@ -28,36 +27,26 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
     d
 }
 
-/// Spawn `xchanneld` on ephemeral ports and parse the client-plane address it prints.
-fn spawn_daemon(data_dir: &std::path::Path) -> (Daemon, SocketAddr) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_xchanneld"))
+/// Spawn `xchanneld` on ephemeral TCP ports with its client plane at a known socket path
+/// under `data_dir`. The client plane is a Unix socket, so we hand the daemon the path
+/// rather than discovering a port from its banner.
+fn spawn_daemon(data_dir: &Path) -> (Daemon, PathBuf) {
+    let client_path = data_dir.join("client.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_xchanneld"))
         .env("XCHANNELD_NODE_ID", "1")
         .env("XCHANNELD_STREAM_ADDR", "127.0.0.1:0")
         .env("XCHANNELD_CONTROL_ADDR", "127.0.0.1:0")
-        .env("XCHANNELD_CLIENT_ADDR", "127.0.0.1:0")
+        .env("XCHANNELD_CLIENT_PATH", &client_path)
         .env("XCHANNELD_DATA_DIR", data_dir)
-        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn xchanneld");
-
-    // First stderr line: "xchanneld[1]: stream <a> | control <b> | client <c>".
-    let stderr = child.stderr.take().unwrap();
-    let mut line = String::new();
-    BufReader::new(stderr).read_line(&mut line).unwrap();
-    let client_addr: SocketAddr = line
-        .rsplit("client ")
-        .next()
-        .expect("client addr in banner")
-        .trim()
-        .parse()
-        .expect("parse client addr");
-    (Daemon(child), client_addr)
+    (Daemon(child), client_path)
 }
 
-fn connect_with_retry(addr: SocketAddr) -> Client {
+fn connect_with_retry(path: &Path) -> Client {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok(c) = Client::connect(addr) {
+        if let Ok(c) = Client::connect(path) {
             return c;
         }
         assert!(Instant::now() < deadline, "daemon never became connectable");
@@ -68,8 +57,8 @@ fn connect_with_retry(addr: SocketAddr) -> Client {
 #[test]
 fn client_replicates_through_a_spawned_daemon() {
     let data_dir = temp_dir("daemon");
-    let (_daemon, client_addr) = spawn_daemon(&data_dir);
-    let mut client = connect_with_retry(client_addr);
+    let (_daemon, client_path) = spawn_daemon(&data_dir);
+    let mut client = connect_with_retry(&client_path);
 
     let n = 50u64;
 

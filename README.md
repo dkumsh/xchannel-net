@@ -17,6 +17,10 @@ behind it, and the prior art that informed it.
 **Experimental, pre-1.0** (`version = 0.0.0`); the wire protocol and on-disk layout may
 change without notice.
 
+**Platform: Unix only.** The client plane is a permission-gated Unix domain socket and the
+data directory relies on Unix mode bits (`0700`/`0600`), so the daemon does not build on
+Windows.
+
 Working v1 data plane: an external client process talks to its local `xchanneld` daemon to
 create or subscribe to channels; the daemon discovers channels across the mesh, locates
 owners, and replicates single-writer logs between nodes, producing **record-identical**
