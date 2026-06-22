@@ -9,6 +9,7 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.89" # File::try_lock / TryLockError (data_dir .lock guard)
 license = "MIT"
 repository = "https://github.com/dkumsh/xchannel-net"
 authors = ["Dmitriy Kumshayev <dq@mail.com>"]

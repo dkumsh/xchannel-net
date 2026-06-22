@@ -179,7 +179,9 @@ channel-name allowlist (no traversal/`.replicas` collision), absolute daemon-spa
 `PATH` injection), lock-poison recovery (`util::MutexExt::lock_safe`), `MAX_CONNECTIONS` cap
 on stream+client planes, `0700` data dir, 64 MiB frame cap, and the client plane on a
 `0600` Unix socket under the data dir (no loopback port; `bind` arbitrates single-instance
-startup + reclaims stale sockets).
+startup + reclaims stale sockets). The daemon also takes an exclusive `flock` on
+`<data_dir>/.lock` at startup, so two daemons can't share a data dir (the second exits fast;
+OS-released on exit, no stale lockfile).
 **Tier-1 (required before any untrusted exposure) is future**: mTLS/Noise on the network
 planes, signed `ChannelIdentity` (don't trust `registered_at_nanos`/`owner`), authz.
 

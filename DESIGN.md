@@ -468,6 +468,14 @@ race to `bind()` the socket, the losers exit, everyone converges on the winner �
 needed (a stale socket left by a crashed daemon is reclaimed: a probe connect that nobody
 answers identifies it as dead, and it is unlinked before rebinding).
 
+Two daemons must never share a `data_dir` (they'd corrupt each other's channel files). This
+is enforced, not just documented: at startup each daemon takes an exclusive advisory lock
+(`flock`) on `<data_dir>/.lock` and holds it for its lifetime; a second daemon on the same
+dir fails fast with a clear message and exits. The lock is OS-released on exit, so a crashed
+daemon leaves nothing to clean up (unlike a PID file). The default client socket lives under
+`data_dir`, so distinct dirs also yield distinct sockets automatically — one fewer thing to
+allocate per daemon.
+
 Transport: stream and control are TCP (they cross hosts); the **client plane is a Unix
 domain socket** — the client always talks to its *local* daemon, so the local hop needs no
 network port, and filesystem permissions (the socket lives under the `0700` `data_dir`,

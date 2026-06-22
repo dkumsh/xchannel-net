@@ -48,6 +48,29 @@ fn main() -> std::io::Result<()> {
         std::fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))?;
     }
 
+    // Single-daemon-per-data_dir guard: hold an exclusive advisory lock on `<data_dir>/.lock`
+    // for the life of the process. Two daemons sharing a data dir would corrupt each other's
+    // channel files; this fails the second one fast with a clear message. The leading dot
+    // keeps the lock file from colliding with any channel name (those can't start with `.`),
+    // and the OS releases the flock automatically on exit — no stale lock to clean up.
+    let _data_dir_lock = {
+        let lock_path = config.data_dir.join(".lock");
+        let lock_file = std::fs::File::create(&lock_path)?;
+        match lock_file.try_lock() {
+            Ok(()) => lock_file,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                eprintln!(
+                    "xchanneld[{node_id}]: another daemon already holds data_dir {} \
+                     (lock {}) — exiting",
+                    config.data_dir.display(),
+                    lock_path.display(),
+                );
+                std::process::exit(1);
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    };
+
     let client_path = config.client_path.clone();
     let node = Node::new(config);
     let stream_listener = node.bind_stream()?;
