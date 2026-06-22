@@ -168,11 +168,22 @@ _As of 2026-06-22:_
     retries the replica open (async creation race).
 - ~28 tests across unit + two-node + client-RPC + cross-process; clippy clean; release builds.
 
+## Security
+
+Trust model + threats + reporting are in `SECURITY.md` (TL;DR: unauthenticated plaintext,
+**trusted-network only**; defaults bind loopback, non-loopback bind warns). **Tier-0
+hardening is done**: channel-name allowlist (no traversal/`.replicas` collision), absolute
+daemon-spawn path (no `PATH` injection), lock-poison recovery (`util::MutexExt::lock_safe`),
+`MAX_CONNECTIONS` cap on stream+client planes, `0700` data dir, 64 MiB frame cap.
+**Tier-1 (required before any untrusted exposure) is future**: mTLS/Noise on all planes,
+signed `ChannelIdentity` (don't trust `registered_at_nanos`/`owner`), authz, UDS for the
+client plane.
+
 ## Next steps (post-v1 polish, optional)
 
-1. **Auto-spawn hardening** — `connect_or_spawn` works (`$XCHANNELD_BIN`/PATH) but doesn't
-   `setsid`/daemonize; its exact wrapper isn't automated-tested (the cross-process test
-   spawns the daemon directly).
+1. **Auto-spawn hardening** — `connect_or_spawn` resolves an absolute path (no `PATH`), but
+   doesn't `setsid`/daemonize; its exact wrapper isn't automated-tested (the cross-process
+   test spawns the daemon directly).
 2. **Deregistration / tombstones** (§8) — `Deregister` is on the wire but unhandled; an old
    `Register` can resurrect a removed name.
 3. **Precise live-`head`** in `SubscribeAck` (currently `head = start` placeholder); a

@@ -15,6 +15,7 @@
 pub mod broadcast;
 pub mod node;
 pub mod registry;
+mod util;
 
 /// Node manager configuration.
 pub struct NodeConfig {

@@ -156,9 +156,33 @@ fn open_writer(path: &str, options: &ChannelOptions) -> io::Result<Writer> {
     builder.build()
 }
 
+/// Resolve the `xchanneld` binary to an **absolute** path — never a bare `PATH` search,
+/// which would let an attacker who controls `PATH` get code execution as the client's user.
+/// `$XCHANNELD_BIN` (if set) must be absolute; otherwise we look for `xchanneld` beside the
+/// current executable (the normal co-install layout).
+fn daemon_binary() -> io::Result<PathBuf> {
+    if let Ok(p) = std::env::var("XCHANNELD_BIN") {
+        let p = PathBuf::from(p);
+        if !p.is_absolute() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "XCHANNELD_BIN must be an absolute path",
+            ));
+        }
+        return Ok(p);
+    }
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::NotFound,
+            "cannot locate current executable's directory",
+        )
+    })?;
+    Ok(dir.join("xchanneld"))
+}
+
 fn spawn_daemon() -> io::Result<()> {
-    let bin = std::env::var("XCHANNELD_BIN").unwrap_or_else(|_| "xchanneld".to_string());
-    std::process::Command::new(bin)
+    std::process::Command::new(daemon_binary()?)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

@@ -38,14 +38,19 @@ are properties of the current design, not bugs:
   channel by name and pull its full retained history.
 - **Channel squatting / unsolicited writes.** Any connector to the client plane can create
   channels (writing files under `data_dir`).
-- **Memory exhaustion.** The registry has no TTL, tombstones, or aggregate size cap, so a
-  peer can grow it without bound across connections. (Individual frames are length-capped,
-  and connection handling spawns an unbounded thread per accept with no read timeout or
-  rate limit.)
+- **Resource exhaustion.** The registry has no TTL, tombstones, or aggregate size cap, so a
+  peer can grow it without bound across connections. Stream and client connections are
+  capped (a fixed `MAX_CONNECTIONS`), but peer control links are not, there is no
+  per-connection read timeout or rate limit, and replica disk usage is unbounded (replicas
+  retain full history by design).
 
-What is *defended*: the wire codec is bounds-checked and refuses attacker-controlled
-pre-allocation; there is no `unsafe` in the workspace and no network-reachable panic; and
-channel-name → filesystem-path handling rejects separators and traversal.
+What is *defended*: the wire codec is bounds-checked, refuses attacker-controlled
+pre-allocation, and caps individual frame size; there is no `unsafe` in the workspace and
+no network-reachable panic — and even if a thread did panic, locks recover from poisoning
+rather than cascading; channel names are validated against an allowlist (`[A-Za-z0-9._-]`,
+no leading dot), rejecting separators, traversal (`..`), and `.replicas` collisions; the
+data directory is created owner-only (`0700` on Unix); and the client's daemon auto-spawn
+resolves an absolute binary path, never a `PATH` search.
 
 ## Operational guidance
 
@@ -55,8 +60,9 @@ channel-name → filesystem-path handling rejects separators and traversal.
 - **Place untrusted boundaries outside the mesh.** If nodes must communicate across an
   untrusted network, tunnel the connections (e.g. WireGuard, an mTLS proxy, or an SSH
   tunnel) rather than exposing the ports directly.
-- **Treat the data directory as sensitive** — it holds replicated channel contents readable
-  by any local process with filesystem access.
+- **Treat the data directory as sensitive** — it is created owner-only (`0700` on Unix),
+  but still holds replicated channel contents in cleartext; protect it with appropriate
+  filesystem ownership.
 
 Authentication, authorization, and transport encryption are tracked as future work
 (`DESIGN.md` §8) and are not yet implemented.

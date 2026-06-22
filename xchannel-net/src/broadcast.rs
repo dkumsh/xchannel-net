@@ -24,6 +24,8 @@ use xchannel_net_core::membership::Membership;
 use xchannel_net_core::transport::{TcpTransport, Transport};
 use xchannel_net_core::wire::ControlMsg;
 
+use crate::util::MutexExt;
+
 type Inbox = Arc<Mutex<VecDeque<ChannelIdentity>>>;
 type SharedMembership = Arc<Mutex<Membership>>;
 /// Dial addresses of outbound peer links currently believed connected (for dedup +
@@ -76,17 +78,17 @@ impl BroadcastDissemination {
         addr: SocketAddr,
         initial_sync: &[ChannelIdentity],
     ) -> io::Result<()> {
-        self.connected.lock().unwrap().insert(addr);
+        self.connected.lock_safe().insert(addr);
         let r = self.adopt(transport, Some(addr), initial_sync);
         if r.is_err() {
-            self.connected.lock().unwrap().remove(&addr);
+            self.connected.lock_safe().remove(&addr);
         }
         r
     }
 
     /// Whether an outbound link to `addr` is currently believed connected.
     pub fn is_connected(&self, addr: SocketAddr) -> bool {
-        self.connected.lock().unwrap().contains(&addr)
+        self.connected.lock_safe().contains(&addr)
     }
 
     /// Spawn a reader thread, send join-time `RegistrySync` + a first `Heartbeat`, and
@@ -131,7 +133,7 @@ impl BroadcastDissemination {
 
     /// Resolve a peer's current stream address (last heartbeat wins).
     pub fn addr_of(&self, node: NodeId) -> Option<SocketAddr> {
-        self.membership.lock().unwrap().addr_of(node)
+        self.membership.lock_safe().addr_of(node)
     }
 
     /// Set the stream address advertised in heartbeats — used after binding the stream
@@ -154,7 +156,7 @@ impl Dissemination for BroadcastDissemination {
     }
 
     fn pump(&mut self) -> io::Result<Vec<ChannelIdentity>> {
-        let mut q = self.inbox.lock().unwrap();
+        let mut q = self.inbox.lock_safe();
         Ok(q.drain(..).collect())
     }
 
@@ -184,17 +186,17 @@ fn spawn_reader(
             };
             match msg {
                 ControlMsg::RegistryDelta(ids) | ControlMsg::RegistrySync(ids) => {
-                    inbox.lock().unwrap().extend(ids);
+                    inbox.lock_safe().extend(ids);
                 }
                 ControlMsg::Heartbeat { node, addr } => {
-                    membership.lock().unwrap().record(node, addr);
+                    membership.lock_safe().record(node, addr);
                 }
                 _ => {} // not expected on a peer link
             }
         }
         // Connection dropped: clear outbound tracking so the node reconnects this seed.
         if let Some(addr) = addr {
-            connected.lock().unwrap().remove(&addr);
+            connected.lock_safe().remove(&addr);
         }
     });
 }

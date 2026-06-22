@@ -24,9 +24,11 @@ pub trait Listener: Send {
 }
 
 /// Upper bound on a single frame, to bound the allocation a (possibly corrupt or hostile)
-/// length prefix can request. Far above any real message — records are bounded by the
-/// channel's region size, which is orders of magnitude smaller.
-pub const MAX_FRAME_LEN: usize = 1 << 30; // 1 GiB
+/// length prefix can request. Generous for typical use (records are bounded by the
+/// channel's region size — commonly ≤ a few MiB — and registry syncs are small), while
+/// capping the per-frame allocation an attacker can force. A deployment using regions
+/// larger than this would need to raise it.
+pub const MAX_FRAME_LEN: usize = 64 << 20; // 64 MiB
 
 /// Baseline TCP [`Transport`]: a `u32` little-endian length prefix followed by the frame
 /// body. `TCP_NODELAY` is set so small control/handshake frames are not Nagle-delayed.

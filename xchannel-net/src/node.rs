@@ -17,11 +17,12 @@
 use crate::NodeConfig;
 use crate::broadcast::BroadcastDissemination;
 use crate::registry::Registry;
+use crate::util::MutexExt;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,50 @@ use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest};
 
 /// A node not heard from within this is dropped from the live set.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on concurrent inbound stream + client connections (thread-exhaustion guard). Peer
+/// control links are not capped — they come from configured/trusted seeds.
+const MAX_CONNECTIONS: usize = 4096;
+
+/// Create a directory (and parents) and restrict it to the owner (`0700` on Unix), so
+/// other local users can't read channel files beneath it.
+fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Validate a channel name before it is used as a filesystem path component. Allowlist
+/// `[A-Za-z0-9._-]`, length 1..=200, and **no leading dot** — which rejects path traversal
+/// (`/`, `\`, `..`), the current dir (`.`), and collisions with the internal `.replicas`
+/// subtree, none of which can appear.
+fn validate_channel_name(name: &str) -> io::Result<()> {
+    let valid = (1..=200).contains(&name.len())
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "channel name must be 1..=200 chars of [A-Za-z0-9._-] with no leading dot",
+        ))
+    }
+}
+
+/// RAII token counting one live connection against [`MAX_CONNECTIONS`].
+struct ConnGuard(Arc<AtomicUsize>);
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -57,6 +102,8 @@ pub struct Node {
     bound_stream_addr: Arc<Mutex<Option<SocketAddr>>>,
     /// Live replica subscriptions this node maintains for clients, keyed by channel name.
     subscriptions: Arc<Mutex<HashMap<String, Subscription>>>,
+    /// Count of live inbound stream/client connections (capped at [`MAX_CONNECTIONS`]).
+    conns: Arc<AtomicUsize>,
 }
 
 impl Node {
@@ -69,7 +116,18 @@ impl Node {
             dissemination: Arc::new(Mutex::new(dissemination)),
             bound_stream_addr: Arc::new(Mutex::new(None)),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            conns: Arc::new(AtomicUsize::new(0)),
             config: Arc::new(config),
+        }
+    }
+
+    /// Acquire a connection slot, or `None` if at [`MAX_CONNECTIONS`].
+    fn acquire_conn(&self) -> Option<ConnGuard> {
+        if self.conns.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+            self.conns.fetch_sub(1, Ordering::Relaxed);
+            None
+        } else {
+            Some(ConnGuard(Arc::clone(&self.conns)))
         }
     }
 
@@ -88,7 +146,7 @@ impl Node {
     ) -> io::Result<Writer> {
         let path = self.channel_path(name)?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            ensure_private_dir(parent)?;
         }
         let writer = configure(WriterBuilder::new(&path))
             .region_size(region_size as usize)
@@ -105,7 +163,7 @@ impl Node {
     pub fn create_for_client(&self, name: &str, options: ChannelOptions) -> io::Result<PathBuf> {
         let path = self.channel_path(name)?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            ensure_private_dir(parent)?;
         }
         let mut builder = WriterBuilder::new(&path)
             .region_size(options.region_size as usize)
@@ -137,12 +195,12 @@ impl Node {
             earliest_index: RecordIndex(0),
             registered_at_nanos: now_nanos(),
         };
-        self.registry.lock().unwrap().merge(identity.clone());
+        self.registry.lock_safe().merge(identity.clone());
         self.dissemination
             .lock()
             .unwrap()
             .announce(std::slice::from_ref(&identity))?;
-        self.hosted.lock().unwrap().insert(
+        self.hosted.lock_safe().insert(
             name.to_string(),
             ChannelSource {
                 path,
@@ -155,12 +213,7 @@ impl Node {
 
     /// Path of an **origin** channel this node hosts: `data_dir/<name>`.
     fn channel_path(&self, name: &str) -> io::Result<PathBuf> {
-        if name.is_empty() || name.contains('/') || name.contains('\\') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "channel name must be a non-empty, path-safe identifier (no separators)",
-            ));
-        }
+        validate_channel_name(name)?;
         Ok(self.config.data_dir.join(name))
     }
 
@@ -178,8 +231,8 @@ impl Node {
     pub fn bind_stream(&self) -> io::Result<TcpListener> {
         let listener = TcpListener::bind(self.config.stream_addr)?;
         let addr = listener.local_addr()?;
-        self.dissemination.lock().unwrap().set_self_addr(addr);
-        *self.bound_stream_addr.lock().unwrap() = Some(addr);
+        self.dissemination.lock_safe().set_self_addr(addr);
+        *self.bound_stream_addr.lock_safe() = Some(addr);
         Ok(listener)
     }
 
@@ -188,9 +241,13 @@ impl Node {
     pub fn serve_stream(&self, mut listener: TcpListener) -> io::Result<()> {
         loop {
             let conn = listener.accept()?;
+            let Some(guard) = self.acquire_conn() else {
+                continue; // at capacity — drop the connection
+            };
             let hosted = Arc::clone(&self.hosted);
             std::thread::spawn(move || {
-                let resolve = |name: &str| hosted.lock().unwrap().get(name).cloned();
+                let _guard = guard; // released when this connection's thread ends
+                let resolve = |name: &str| hosted.lock_safe().get(name).cloned();
                 if let Ok(mut server) = accept_subscription(conn, resolve) {
                     let _ = server.run();
                 }
@@ -211,7 +268,7 @@ impl Node {
         loop {
             let conn = listener.accept()?;
             let snapshot = self.registry_snapshot();
-            let _ = self.dissemination.lock().unwrap().add_peer(conn, &snapshot);
+            let _ = self.dissemination.lock_safe().add_peer(conn, &snapshot);
         }
     }
 
@@ -219,7 +276,7 @@ impl Node {
     /// (deduped: a no-op if already connected). The connect happens outside the
     /// dissemination lock so a slow dial doesn't stall heartbeats/announces.
     pub fn connect_control_peer(&self, addr: SocketAddr) -> io::Result<()> {
-        if self.dissemination.lock().unwrap().is_connected(addr) {
+        if self.dissemination.lock_safe().is_connected(addr) {
             return Ok(());
         }
         let conn = TcpTransport::connect(addr)?;
@@ -235,7 +292,7 @@ impl Node {
     /// timeout so a down seed doesn't stall the loop.
     pub fn connect_seeds(&self) {
         for addr in self.config.seeds.clone() {
-            if self.dissemination.lock().unwrap().is_connected(addr) {
+            if self.dissemination.lock_safe().is_connected(addr) {
                 continue;
             }
             if let Ok(conn) = TcpTransport::connect_timeout(&addr, Duration::from_secs(1)) {
@@ -250,7 +307,7 @@ impl Node {
     }
 
     fn registry_snapshot(&self) -> Vec<ChannelIdentity> {
-        self.registry.lock().unwrap().iter().cloned().collect()
+        self.registry.lock_safe().iter().cloned().collect()
     }
 
     /// Periodic maintenance: reconnect dropped seeds, emit a heartbeat, and merge gossiped
@@ -259,12 +316,12 @@ impl Node {
         loop {
             self.connect_seeds();
             let pumped = {
-                let mut d = self.dissemination.lock().unwrap();
+                let mut d = self.dissemination.lock_safe();
                 let _ = d.emit_heartbeat();
                 d.pump()?
             };
             if !pumped.is_empty() {
-                let mut reg = self.registry.lock().unwrap();
+                let mut reg = self.registry.lock_safe();
                 for id in pumped {
                     reg.merge(id);
                 }
@@ -284,8 +341,14 @@ impl Node {
     pub fn serve_client(&self, mut listener: TcpListener) -> io::Result<()> {
         loop {
             let conn = listener.accept()?;
+            let Some(guard) = self.acquire_conn() else {
+                continue; // at capacity — drop the connection
+            };
             let node = self.clone();
-            std::thread::spawn(move || node.handle_client(conn));
+            std::thread::spawn(move || {
+                let _guard = guard;
+                node.handle_client(conn);
+            });
         }
     }
 
@@ -317,7 +380,7 @@ impl Node {
             },
             ClientRequest::Subscribe { name, wait_ms } => {
                 // Idempotent: reuse a live subscription for this channel.
-                if let Some(existing) = self.subscriptions.lock().unwrap().get(&name)
+                if let Some(existing) = self.subscriptions.lock_safe().get(&name)
                     && existing.is_active()
                 {
                     return ClientReply::Subscribed {
@@ -328,7 +391,7 @@ impl Node {
                 match self.subscribe(&name, wait) {
                     Ok(sub) => {
                         let replica_path = sub.replica_path().to_string_lossy().into_owned();
-                        self.subscriptions.lock().unwrap().insert(name, sub);
+                        self.subscriptions.lock_safe().insert(name, sub);
                         ClientReply::Subscribed { replica_path }
                     }
                     Err(e) => ClientReply::Error {
@@ -368,7 +431,7 @@ impl Node {
         self.resolve(name, resolve_timeout)?;
         let replica_path = self.replica_path(name)?;
         if let Some(parent) = replica_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            ensure_private_dir(parent)?;
         }
 
         let stopped = Arc::new(AtomicBool::new(false));
@@ -430,7 +493,7 @@ impl Node {
                 std::thread::sleep(BACKOFF);
                 continue;
             };
-            *shutdown.lock().unwrap() = shutdown_handle;
+            *shutdown.lock_safe() = shutdown_handle;
 
             // Apply records until the connection drops or we're stopped.
             loop {
@@ -442,7 +505,7 @@ impl Node {
                     Err(_) => break, // disconnected → reconnect (resuming from the new head)
                 }
             }
-            *shutdown.lock().unwrap() = None;
+            *shutdown.lock_safe() = None;
             if stopped.load(Ordering::Relaxed) {
                 return;
             }
@@ -466,7 +529,7 @@ impl Node {
     /// Stop and forget a subscription this node maintains for a client. Returns whether one
     /// was found.
     pub fn unsubscribe(&self, name: &str) -> bool {
-        if let Some(sub) = self.subscriptions.lock().unwrap().remove(name) {
+        if let Some(sub) = self.subscriptions.lock_safe().remove(name) {
             sub.stop();
             true
         } else {
@@ -483,14 +546,14 @@ impl Node {
     ) -> io::Result<(ChannelIdentity, SocketAddr)> {
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
-            let identity = self.registry.lock().unwrap().get(name).cloned();
+            let identity = self.registry.lock_safe().get(name).cloned();
             if let Some(identity) = identity {
                 // Self-owned channels resolve to our own (bound) stream address — a node
                 // never records its own heartbeat into membership.
                 let addr = if identity.owner == self.config.node_id {
-                    *self.bound_stream_addr.lock().unwrap()
+                    *self.bound_stream_addr.lock_safe()
                 } else {
-                    self.dissemination.lock().unwrap().addr_of(identity.owner)
+                    self.dissemination.lock_safe().addr_of(identity.owner)
                 };
                 if let Some(addr) = addr {
                     return Ok((identity, addr));
@@ -541,7 +604,7 @@ impl Subscription {
     /// read returns. Idempotent.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
-        if let Some(conn) = self.shutdown.lock().unwrap().as_ref() {
+        if let Some(conn) = self.shutdown.lock_safe().as_ref() {
             let _ = conn.shutdown();
         }
     }
@@ -730,12 +793,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsafe_channel_name() {
-        let node = Node::new(config(1, temp_dir("unsafe")));
-        let err = node
-            .host_channel("a/b", 1 << 20, 0, |b| b)
-            .map(|_| ())
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    fn rejects_unsafe_channel_names() {
+        // Path traversal, current-dir, separators, leading dot (incl. the .replicas
+        // subtree), empty, and over-length names are all rejected before touching the FS.
+        let long = "x".repeat(201);
+        for bad in [
+            "a/b",
+            "..",
+            ".",
+            "../etc",
+            "a\\b",
+            ".hidden",
+            ".replicas",
+            "",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                validate_channel_name(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "should reject {bad:?}"
+            );
+        }
+        // Reasonable names pass.
+        for ok in ["md.aapl", "feed-1", "a_b.c", "X"] {
+            validate_channel_name(ok).unwrap();
+        }
     }
 }
