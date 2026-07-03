@@ -37,12 +37,12 @@ owner to read-only replicas on subscribing nodes.
 - Self-healing subscriptions: resume from the replica head, reconnect on drop,
   stop/unsubscribe (§5.1, `node.rs::run_subscription`).
 - Resume handshake (`Subscribe.from` / `SubscribeAck.start`) and `Gap` on retention underrun.
+- **True `SubscribeAck.head`** — the source advertises its real high-water index at accept
+  time via `xchannel::Reader::head_record_index()` (§6.1), so a subscriber can detect when it
+  has caught up to the frontier (`StreamClient::head`). Needs `xchannel ≥ 4.1.0`.
 
 **Partial / known limitations:**
 
-- **`SubscribeAck.head` is a placeholder** equal to `start`, not the true high-water index
-  (§6.1). Harmless today because nothing consumes it; it would mislead any future HA
-  failover (§9) built on the "synchronized once applied up to `head`" contract.
 - **Membership liveness is tracked but not used in resolution.** `live_members` and the
   heartbeat timeout exist, but the resolve path uses `addr_of` regardless of liveness, so
   "known, owner unreachable" (§5.4) is not surfaced and stale peers are not pruned from

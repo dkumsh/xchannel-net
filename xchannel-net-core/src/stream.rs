@@ -80,15 +80,16 @@ pub fn accept_subscription<T: Transport>(
     }
 
     let start = RecordIndex(from.0.max(earliest.0));
+    // The channel's true high-water index at accept time (read from the newest segment,
+    // independent of where we resume from). Lets the subscriber detect catch-up to the
+    // frontier; the record flow itself is unaffected.
+    let head = source.head()?;
     source.skip_to(start)?;
     transport.send_frame(&encode_stream(&StreamMsg::SubscribeAck {
         name,
         stream_id: STREAM_ID,
         start,
-        // Best-effort lower bound; a precise live head is a manager refinement (the
-        // manager can read the origin's head when it has it). Not load-bearing for the
-        // data flow — the subscriber just applies records as they arrive.
-        head: start,
+        head,
         region_size: src.region_size,
         mtu: src.mtu,
         file_roll_size: src.file_roll_size,
@@ -158,6 +159,7 @@ pub fn subscribe<T: Transport>(
     match decode_stream(&transport.recv_frame()?)? {
         StreamMsg::SubscribeAck {
             start,
+            head,
             region_size,
             mtu,
             file_roll_size,
@@ -172,7 +174,11 @@ pub fn subscribe<T: Transport>(
                 keep_files,
                 start,
             )?;
-            Ok(StreamClient { transport, sink })
+            Ok(StreamClient {
+                transport,
+                sink,
+                head,
+            })
         }
         StreamMsg::Gap { earliest, .. } => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -186,6 +192,7 @@ pub fn subscribe<T: Transport>(
 pub struct StreamClient<T: Transport> {
     transport: T,
     sink: ReplicationSink,
+    head: RecordIndex,
 }
 
 impl<T: Transport> StreamClient<T> {
@@ -193,6 +200,14 @@ impl<T: Transport> StreamClient<T> {
     #[inline]
     pub fn expected_index(&self) -> RecordIndex {
         self.sink.expected_index()
+    }
+
+    /// The source's high-water index as of the `SubscribeAck` — the frontier this
+    /// subscriber is catching up to. Applied records `< head` are historical replay;
+    /// reaching `head` means synchronized as of accept time.
+    #[inline]
+    pub fn head(&self) -> RecordIndex {
+        self.head
     }
 
     /// Receive and apply one record. Errors when the connection drops or a gap appears.
@@ -274,6 +289,12 @@ mod tests {
 
         let conn = TcpTransport::connect(addr).unwrap();
         let mut client = subscribe(conn, "md.aapl", RecordIndex(0), &replica).unwrap();
+        // The ack advertises the origin's true head (all n records committed before accept).
+        assert_eq!(
+            client.head(),
+            RecordIndex(n),
+            "SubscribeAck head is the real frontier"
+        );
         for _ in 0..n {
             client.recv_one().unwrap();
         }
