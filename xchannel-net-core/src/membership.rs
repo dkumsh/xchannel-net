@@ -46,6 +46,16 @@ impl Membership {
         self.members.get(&node).map(|m| m.addr)
     }
 
+    /// The address of `node`, but only if it was heard from within `timeout` — i.e. a live
+    /// member. `None` if the node is unknown *or* known-but-stale; the caller treats the
+    /// stale case as "owner unreachable", distinct from "channel unknown".
+    pub fn live_addr_of(&self, node: NodeId, timeout: Duration) -> Option<SocketAddr> {
+        self.members
+            .get(&node)
+            .filter(|m| m.last_seen.elapsed() <= timeout)
+            .map(|m| m.addr)
+    }
+
     /// Nodes heard from within `timeout`.
     pub fn live_members(&self, timeout: Duration) -> Vec<NodeId> {
         let now = Instant::now();
@@ -122,5 +132,23 @@ mod tests {
         assert_eq!(m.addr_of(NodeId(1)), Some(addr(7001)));
         assert_eq!(m.forget_stale(Duration::from_millis(5)), vec![NodeId(1)]);
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn live_addr_of_gates_on_liveness() {
+        let mut m = Membership::new();
+        m.record(NodeId(1), addr(7001));
+        // Fresh: live_addr_of returns the address.
+        assert_eq!(
+            m.live_addr_of(NodeId(1), Duration::from_secs(60)),
+            Some(addr(7001))
+        );
+        // Unknown node: None (distinct from "known but stale", but same return here).
+        assert_eq!(m.live_addr_of(NodeId(2), Duration::from_secs(60)), None);
+
+        std::thread::sleep(Duration::from_millis(20));
+        // Stale beyond the timeout: None, even though addr_of still knows the address.
+        assert_eq!(m.live_addr_of(NodeId(1), Duration::from_millis(5)), None);
+        assert_eq!(m.addr_of(NodeId(1)), Some(addr(7001)));
     }
 }
