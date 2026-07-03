@@ -147,6 +147,8 @@ impl Node {
         configure: impl FnOnce(WriterBuilder) -> WriterBuilder,
     ) -> io::Result<Writer> {
         let path = self.channel_path(name)?;
+        // Reserve the name first: a lost collision fails here, before any file is created.
+        let identity = self.claim_name(name, region_size, mtu)?;
         if let Some(parent) = path.parent() {
             ensure_private_dir(parent)?;
         }
@@ -163,7 +165,7 @@ impl Node {
         // unbounded (safe direction: replicas never drop records, only over-retain).
         // Clients that need replicas to inherit disk bounds should use the client RPC
         // (`create_for_client` / `ChannelOptions`), which propagates both fields.
-        self.register_origin(name, path, region_size, mtu, 0, 0)?;
+        self.announce_hosted(&identity, path, 0, 0)?;
         Ok(writer)
     }
 
@@ -172,6 +174,8 @@ impl Node {
     /// single `Writer` itself), register + announce it, and return the path.
     pub fn create_for_client(&self, name: &str, options: ChannelOptions) -> io::Result<PathBuf> {
         let path = self.channel_path(name)?;
+        // Reserve the name first: a lost collision fails here, before the file is precreated.
+        let identity = self.claim_name(name, options.region_size, options.mtu)?;
         if let Some(parent) = path.parent() {
             ensure_private_dir(parent)?;
         }
@@ -184,30 +188,27 @@ impl Node {
             builder = builder.keep_files(options.keep_files as u64);
         }
         builder.precreate()?; // file + header exist; no writer retained
-        self.register_origin(
-            name,
+        self.announce_hosted(
+            &identity,
             path.clone(),
-            options.region_size,
-            options.mtu,
             options.file_roll_size,
             options.keep_files,
         )?;
         Ok(path)
     }
 
-    /// Register a locally-hosted origin in the registry, announce it to peers, and record
-    /// it in the hosted map (so `serve_stream` can resolve it). `file_roll_size`/`keep_files`
-    /// are the origin's rolling+retention policy, carried in the hosted `ChannelSource` so
-    /// subscribers' replicas inherit the same disk bounds via `SubscribeAck`.
-    fn register_origin(
-        &self,
-        name: &str,
-        path: PathBuf,
-        region_size: u32,
-        mtu: u32,
-        file_roll_size: u64,
-        keep_files: u32,
-    ) -> io::Result<()> {
+    /// Claim `name` for this node via the registry's first-registrant-wins merge. Returns
+    /// the locally-owned identity, or `AlreadyExists` if another node's earlier registration
+    /// already won the name — the collision notification the caller relays to its client
+    /// (DESIGN.md §2.1, `RegisterRejected`). Claiming happens *before* any file is created,
+    /// so a rejected registration leaves no orphan origin file behind.
+    ///
+    /// This detects a collision the local registry already knows about (the common case: the
+    /// winner's registration has already reached this node). A cross-node race that only
+    /// resolves after this node has already served its client a `Writer` is not covered here
+    /// — that requires server-push notification the client RPC does not yet have (tracked as
+    /// remaining work).
+    fn claim_name(&self, name: &str, region_size: u32, mtu: u32) -> io::Result<ChannelIdentity> {
         let identity = ChannelIdentity {
             name: name.to_string(),
             owner: self.config.node_id,
@@ -216,16 +217,39 @@ impl Node {
             earliest_index: RecordIndex(0),
             registered_at_nanos: now_nanos(),
         };
-        self.registry.lock_safe().merge(identity.clone());
+        let winner = self.registry.lock_safe().merge(identity.clone());
+        if winner.owner != self.config.node_id {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "channel '{name}' already registered by node {} — registration rejected",
+                    winner.owner.0
+                ),
+            ));
+        }
+        Ok(identity)
+    }
+
+    /// Announce a freshly-claimed origin to peers and record it in the hosted map (so
+    /// `serve_stream` can resolve it). `file_roll_size`/`keep_files` are the origin's
+    /// rolling+retention policy, carried in the hosted `ChannelSource` so subscribers'
+    /// replicas inherit the same disk bounds via `SubscribeAck`.
+    fn announce_hosted(
+        &self,
+        identity: &ChannelIdentity,
+        path: PathBuf,
+        file_roll_size: u64,
+        keep_files: u32,
+    ) -> io::Result<()> {
         self.dissemination
             .lock_safe()
-            .announce(std::slice::from_ref(&identity))?;
+            .announce(std::slice::from_ref(identity))?;
         self.hosted.lock_safe().insert(
-            name.to_string(),
+            identity.name.clone(),
             ChannelSource {
                 path,
-                region_size,
-                mtu,
+                region_size: identity.region_size,
+                mtu: identity.mtu,
                 file_roll_size,
                 keep_files,
             },
@@ -866,5 +890,34 @@ mod tests {
         for ok in ["md.aapl", "feed-1", "a_b.c", "X"] {
             validate_channel_name(ok).unwrap();
         }
+    }
+
+    #[test]
+    fn create_rejected_when_name_already_owned_by_peer() {
+        let node = Node::new(config(2, temp_dir("collision")));
+        // A peer registered this name earlier (smaller timestamp), so it owns it under
+        // first-registrant-wins. Seed the local registry with that winning entry.
+        node.registry.lock_safe().merge(ChannelIdentity {
+            name: "md.aapl".to_string(),
+            owner: NodeId(1),
+            region_size: 1 << 20,
+            mtu: 0,
+            earliest_index: RecordIndex(0),
+            registered_at_nanos: 1, // earlier than any now_nanos()
+        });
+
+        let err = node
+            .create_for_client("md.aapl", ChannelOptions::default())
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::AlreadyExists,
+            "losing the name collision must be rejected, not silently accepted"
+        );
+        // The name is reserved before any file is created, so a rejection leaves no orphan.
+        assert!(
+            !node.channel_path("md.aapl").unwrap().exists(),
+            "no origin file should be created for a rejected registration"
+        );
     }
 }
