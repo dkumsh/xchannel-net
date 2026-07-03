@@ -53,6 +53,14 @@ impl ReplicationSource {
         RecordIndex(self.next_index)
     }
 
+    /// The channel's current head (high-water absolute index) at the time of call —
+    /// independent of this source's read cursor. Used to advertise the true `head` in
+    /// `SubscribeAck` so a subscriber can tell when it has caught up to the frontier.
+    #[inline]
+    pub fn head(&self) -> io::Result<RecordIndex> {
+        Ok(RecordIndex(self.reader.head_record_index()?))
+    }
+
     /// Block until the next `User` record is available and return it as a frame.
     /// `Roll`/`Skip` markers are consumed by the reader and never surface here.
     pub fn next_frame(&mut self) -> io::Result<RecordFrame> {

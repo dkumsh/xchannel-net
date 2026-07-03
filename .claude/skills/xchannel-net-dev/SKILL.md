@@ -192,11 +192,9 @@ planes, signed `ChannelIdentity` (don't trust `registered_at_nanos`/`owner`), au
    test spawns the daemon directly).
 2. **Deregistration / tombstones** (§8) — `Deregister` is on the wire but unhandled; an old
    `Register` can resurrect a removed name.
-3. **Precise live-`head`** in `SubscribeAck` (currently `head = start` placeholder); a
-   "synced" milestone signal.
-4. **Membership pruning** — `Membership::forget_stale` exists but nothing calls it; the
+3. **Membership pruning** — `Membership::forget_stale` exists but nothing calls it; the
    maintenance loop could prune dead peers.
-5. **Observability / graceful shutdown** — daemon loops swallow errors (`let _ =`); no
+4. **Observability / graceful shutdown** — daemon loops swallow errors (`let _ =`); no
    logging or clean shutdown.
 
 ## Open questions (see DESIGN.md §8)
