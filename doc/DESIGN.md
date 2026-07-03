@@ -40,13 +40,15 @@ owner to read-only replicas on subscribing nodes.
 - **True `SubscribeAck.head`** — the source advertises its real high-water index at accept
   time via `xchannel::Reader::head_record_index()` (§6.1), so a subscriber can detect when it
   has caught up to the frontier (`StreamClient::head`). Needs `xchannel ≥ 4.1.0`.
+- **Liveness-gated resolution** — `resolve` requires the owner to be a live member (recent
+  heartbeat), so it reports "known but owner unreachable" (`HostUnreachable`) distinctly from
+  "channel unknown" (`TimedOut`), never handing back a stale address (§5.4).
 
 **Partial / known limitations:**
 
-- **Membership liveness is tracked but not used in resolution.** `live_members` and the
-  heartbeat timeout exist, but the resolve path uses `addr_of` regardless of liveness, so
-  "known, owner unreachable" (§5.4) is not surfaced and stale peers are not pruned from
-  lookups.
+- **Stale peers are not pruned from the membership map.** Resolution now gates on liveness
+  (below), but `Membership::forget_stale` is still not called by the maintenance loop, so
+  stale entries linger (harmless to resolution, which ignores them, but unbounded).
 - **Partition reconvergence is not guaranteed.** Delta broadcast is best-effort (a peer that
   errors is dropped, no retry); reconvergence relies on `RegistrySync` at (re)connect. With
   no `seeds` configured (the binary's default is `seeds: vec![]`) and inbound-only links not

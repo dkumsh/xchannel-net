@@ -136,6 +136,15 @@ impl BroadcastDissemination {
         self.membership.lock_safe().addr_of(node)
     }
 
+    /// Resolve a peer's stream address only if it is a **live** member (heartbeat within the
+    /// liveness timeout); `None` if unknown or stale. Lets resolution distinguish "owner
+    /// unreachable" from "owner live" instead of handing back a stale address.
+    pub fn live_addr_of(&self, node: NodeId) -> Option<SocketAddr> {
+        self.membership
+            .lock_safe()
+            .live_addr_of(node, self.liveness_timeout)
+    }
+
     /// Set the stream address advertised in heartbeats — used after binding the stream
     /// listener to an ephemeral port (`:0`), so peers learn the real address.
     pub fn set_self_addr(&mut self, addr: SocketAddr) {

@@ -608,23 +608,32 @@ impl Node {
         }
     }
 
-    /// Block (until `timeout`) until `name` is in the registry and its owner's address is
-    /// known via membership.
+    /// Block (until `timeout`) until `name` is in the registry and its owner is a **live**
+    /// member whose stream address is known. Requiring liveness (not just a last-known
+    /// address) lets us distinguish, on timeout, two states DESIGN.md §5.4 keeps separate:
+    /// `TimedOut` = the channel is unknown here, vs `HostUnreachable` = the channel is known
+    /// but its owner is not a live member (owner unreachable) — the signal the mux needs to
+    /// drive drain/stall policy rather than dial a stale address.
     fn resolve(
         &self,
         name: &str,
         timeout: Option<Duration>,
     ) -> io::Result<(ChannelIdentity, SocketAddr)> {
         let deadline = timeout.map(|t| Instant::now() + t);
+        let mut owner_unreachable = false;
         loop {
             let identity = self.registry.lock_safe().get(name).cloned();
             if let Some(identity) = identity {
                 // Self-owned channels resolve to our own (bound) stream address — a node
-                // never records its own heartbeat into membership.
+                // never records its own heartbeat into membership, and is trivially live.
                 let addr = if identity.owner == self.config.node_id {
                     *self.bound_stream_addr.lock_safe()
                 } else {
-                    self.dissemination.lock_safe().addr_of(identity.owner)
+                    let a = self.dissemination.lock_safe().live_addr_of(identity.owner);
+                    // Known channel but the owner is not a live member: unreachable, not
+                    // unknown. Keep retrying (it may recover) but remember the distinction.
+                    owner_unreachable = a.is_none();
+                    a
                 };
                 if let Some(addr) = addr {
                     return Ok((identity, addr));
@@ -633,10 +642,17 @@ impl Node {
             if let Some(dl) = deadline
                 && Instant::now() >= dl
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("channel '{name}' not resolvable within timeout"),
-                ));
+                return Err(if owner_unreachable {
+                    io::Error::new(
+                        io::ErrorKind::HostUnreachable,
+                        format!("channel '{name}' known but its owner is not a live member"),
+                    )
+                } else {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("channel '{name}' not resolvable within timeout"),
+                    )
+                });
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -918,6 +934,33 @@ mod tests {
         assert!(
             !node.channel_path("md.aapl").unwrap().exists(),
             "no origin file should be created for a rejected registration"
+        );
+    }
+
+    #[test]
+    fn resolve_distinguishes_unknown_from_unreachable_owner() {
+        let node = Node::new(config(1, temp_dir("resolve-liveness")));
+        let short = Some(Duration::from_millis(20));
+
+        // Unknown channel → TimedOut.
+        let unknown = node.resolve("nope", short).unwrap_err();
+        assert_eq!(unknown.kind(), io::ErrorKind::TimedOut);
+
+        // Known channel whose owner never heartbeats (not a live member) → HostUnreachable,
+        // not a stale address and not "unknown".
+        node.registry.lock_safe().merge(ChannelIdentity {
+            name: "md.aapl".to_string(),
+            owner: NodeId(99),
+            region_size: 1 << 20,
+            mtu: 0,
+            earliest_index: RecordIndex(0),
+            registered_at_nanos: 1,
+        });
+        let unreachable = node.resolve("md.aapl", short).unwrap_err();
+        assert_eq!(
+            unreachable.kind(),
+            io::ErrorKind::HostUnreachable,
+            "a known channel with a non-live owner is unreachable, not unknown"
         );
     }
 }
