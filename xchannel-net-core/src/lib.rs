@@ -18,6 +18,8 @@ pub mod wire;
 pub mod replication;
 pub mod stream;
 
+pub mod mux;
+
 /// Stable identifier for a node manager within the mesh.
 ///
 /// Nodes are logical: `node ~= machine` is the mental model, but two managers may
