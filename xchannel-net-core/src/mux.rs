@@ -99,6 +99,44 @@ pub fn frame_data(prov: Provenance, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Body of a [`MSG_TYPE_TOPIC_GAP`] control record: on resume, member `member_ref` could
+/// not be extended contiguously because records `[from, resumed_at)` had aged out of its
+/// retention, so the mux skipped to `resumed_at` (§6.2). The hole is explicit, attributed,
+/// and durable — consumers choose their own severity. Never silently spliced.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TopicGap {
+    pub member_ref: u16,
+    pub from: u64,
+    pub resumed_at: u64,
+}
+
+impl TopicGap {
+    /// Serialize to the 18-byte control-record payload (`u16 member_ref, u64 from, u64
+    /// resumed_at`).
+    pub fn to_payload(&self) -> [u8; 18] {
+        let mut b = [0u8; 18];
+        b[0..2].copy_from_slice(&self.member_ref.to_le_bytes());
+        b[2..10].copy_from_slice(&self.from.to_le_bytes());
+        b[10..18].copy_from_slice(&self.resumed_at.to_le_bytes());
+        b
+    }
+
+    /// Parse a `TopicGap` control-record payload.
+    pub fn decode(b: &[u8]) -> io::Result<TopicGap> {
+        if b.len() < 18 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TopicGap record too short",
+            ));
+        }
+        Ok(TopicGap {
+            member_ref: u16::from_le_bytes(b[0..2].try_into().unwrap()),
+            from: u64::from_le_bytes(b[2..10].try_into().unwrap()),
+            resumed_at: u64::from_le_bytes(b[10..18].try_into().unwrap()),
+        })
+    }
+}
+
 /// One slot-table entry: which `(name, epoch)` a `member_ref` denotes. `epoch` is the
 /// member channel's registry generation — the incarnation, so a respawned producer (new
 /// epoch) is a distinct slot and never spliced onto the old one (TOPICS §3.2, decision:
@@ -227,21 +265,31 @@ impl Mux {
         }
         let member_ref = self.next_ref;
         self.next_ref += 1;
-        let (mut source, _earliest) = ReplicationSource::open(member_path)?;
-        let cursor = self
-            .recovered
-            .get(&(name.to_string(), epoch))
-            .map(|&max| max + 1)
-            .unwrap_or(0);
-        source.skip_to(RecordIndex(cursor))?;
+        let (mut source, earliest) = ReplicationSource::open(member_path)?;
+        let recovered = self.recovered.get(&(name.to_string(), epoch)).copied();
+
+        // Where to resume. A previously-merged member resumes at `recovered + 1`; a fresh one
+        // starts at genesis. Either way, if the member has aged records out of retention below
+        // our resume point, we can't extend contiguously.
+        let want = recovered.map(|max| max + 1).unwrap_or(0);
+        let gap = recovered.is_some() && want < earliest.0;
+        let start = want.max(earliest.0);
+
+        source.skip_to(RecordIndex(start))?;
         self.slots.push(Slot {
             member_ref,
             name: name.to_string(),
             epoch,
             source,
-            cursor,
+            cursor: start,
         });
-        self.emit_slot_table()
+        self.emit_slot_table()?;
+        // Retention underrun on resume: records `[want, earliest)` are gone. Record it
+        // explicitly and attributed (§6.2) rather than silently jumping the merge forward.
+        if gap {
+            self.emit_topic_gap(member_ref, want, earliest.0)?;
+        }
+        Ok(())
     }
 
     /// Merge whatever is currently ready from each member into the topic, in arrival order,
@@ -284,6 +332,21 @@ impl Mux {
             .iter()
             .map(|s| (s.name.clone(), s.epoch, s.cursor))
             .collect()
+    }
+
+    /// Commit a [`TopicGap`] control record attributing a retention hole to a member (§6.2).
+    fn emit_topic_gap(&mut self, member_ref: u16, from: u64, resumed_at: u64) -> io::Result<()> {
+        let payload = TopicGap {
+            member_ref,
+            from,
+            resumed_at,
+        }
+        .to_payload();
+        let buf = self.topic.try_reserve(payload.len())?;
+        buf.copy_from_slice(&payload);
+        self.topic
+            .commit(MSG_TYPE_TOPIC_GAP, payload.len() as u32, 0)?;
+        Ok(())
     }
 
     /// Commit an updated slot table so a `LateJoin` topic reader can decode every member_ref.
@@ -495,6 +558,71 @@ mod tests {
             (2, 0, 200)
         );
         assert_eq!(b[0].2, b"b0");
+    }
+
+    /// Append `count` ~1 KiB records (absolute indices continue across calls) with rolling +
+    /// retention, so old records prune once enough files accumulate.
+    fn write_member_rolling(base: &Path, count: u64, roll: u64, keep: u32) {
+        let mut b = WriterBuilder::new(base)
+            .region_size(REGION)
+            .file_roll_size(roll);
+        if keep > 0 {
+            b = b.keep_files(keep as u64);
+        }
+        let mut w = b.build().unwrap();
+        let payload = vec![0xCDu8; 1024];
+        for i in 0..count {
+            let buf = w.try_reserve(payload.len()).unwrap();
+            buf.copy_from_slice(&payload);
+            w.commit(1, payload.len() as u32, i).unwrap();
+        }
+    }
+
+    #[test]
+    fn resume_retention_underrun_records_a_topic_gap() {
+        let dir = temp_dir("gap");
+        let (topic, member) = (dir.join("topic"), dir.join("m"));
+        let roll = (REGION as u64) * 2;
+        let keep = 1u32;
+
+        // Member writes a few records; the mux merges them (cursor → 3).
+        write_member_rolling(&member, 3, roll, keep);
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+            mux.add_member("m", 0, &member).unwrap();
+            assert_eq!(mux.poll().unwrap(), 3);
+            assert_eq!(mux.members()[0].2, 3);
+        }
+
+        // While the mux is down, the member writes far more with tight retention, pruning the
+        // unmerged records (index ≥ 3) below a new earliest.
+        write_member_rolling(&member, 6000, roll, keep);
+        let earliest = ReplicationSource::open(&member).unwrap().1.0;
+        assert!(
+            earliest > 3,
+            "member should prune past the mux cursor (earliest={earliest})"
+        );
+
+        // Reopen: the mux can't resume contiguously, so it records a TopicGap and skips ahead.
+        let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+        mux.add_member("m", 0, &member).unwrap();
+        assert_eq!(
+            mux.members()[0].2,
+            earliest,
+            "resumes at earliest after the gap"
+        );
+        drop(mux);
+
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        let mut gaps = Vec::new();
+        while let Some(m) = r.try_read().unwrap() {
+            if m.header().message_type == MSG_TYPE_TOPIC_GAP {
+                gaps.push(TopicGap::decode(m.payload()).unwrap());
+            }
+        }
+        assert_eq!(gaps.len(), 1, "exactly one attributed gap");
+        assert_eq!(gaps[0].from, 3);
+        assert_eq!(gaps[0].resumed_at, earliest);
     }
 
     #[test]
