@@ -160,9 +160,10 @@ pub struct Node {
     /// Per-topic member-reap threshold (§6.1), for topics that opted in (`member_reap_after`).
     /// Absent ⇒ never reap.
     topic_reap: Arc<Mutex<HashMap<String, Duration>>>,
-    /// When a member's owner was first observed unreachable, keyed by member name — drives the
-    /// reaper's "dead beyond a threshold" decision. Cleared when the owner is live again.
-    member_dead_since: Arc<Mutex<HashMap<String, Instant>>>,
+    /// When a member's owner was first observed unreachable, keyed by `(name, epoch)` — drives
+    /// the reaper's "dead beyond a threshold" decision. Keyed by incarnation so two generations
+    /// of a name never share a timer. Cleared when the owner is live again.
+    member_dead_since: Arc<Mutex<HashMap<(String, u64), Instant>>>,
     /// Count of live inbound stream/client connections (capped at [`MAX_CONNECTIONS`]).
     conns: Arc<AtomicUsize>,
 }
@@ -493,17 +494,18 @@ impl Node {
                         .lock_safe()
                         .live_addr_of(m.owner)
                         .is_some();
+                let key = (m.name.clone(), m.epoch);
                 if owner_live {
-                    self.member_dead_since.lock_safe().remove(&m.name);
+                    self.member_dead_since.lock_safe().remove(&key);
                     continue;
                 }
                 let dead_for = {
                     let mut dead = self.member_dead_since.lock_safe();
-                    let since = *dead.entry(m.name.clone()).or_insert_with(Instant::now);
+                    let since = *dead.entry(key.clone()).or_insert_with(Instant::now);
                     since.elapsed()
                 };
                 if dead_for >= reap_after {
-                    self.member_dead_since.lock_safe().remove(&m.name);
+                    self.member_dead_since.lock_safe().remove(&key);
                     if let Some(tombstone) = self.registry.lock_safe().reap(&m.name) {
                         let _ = self
                             .dissemination
