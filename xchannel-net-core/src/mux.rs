@@ -384,6 +384,24 @@ impl Mux {
         Ok(true)
     }
 
+    /// Retire the topic (§4.1): drain every member to its head (each with a `MemberClosed`
+    /// marker), then commit a terminal marker. The mux holds no members afterwards; the caller
+    /// drops it and deregisters the topic channel.
+    pub fn finish(&mut self) -> io::Result<()> {
+        let members: Vec<(String, u64)> = self
+            .slots
+            .iter()
+            .map(|s| (s.name.clone(), s.epoch))
+            .collect();
+        for (name, epoch) in members {
+            self.remove_member(&name, epoch)?;
+        }
+        let buf = self.topic.try_reserve(0)?;
+        debug_assert!(buf.is_empty());
+        self.topic.commit(MSG_TYPE_TERMINAL, 0, 0)?;
+        Ok(())
+    }
+
     /// Commit a [`MemberClosed`] control record.
     fn emit_member_closed(&mut self, member_ref: u16, final_index: u64) -> io::Result<()> {
         let payload = MemberClosed {

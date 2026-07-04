@@ -458,6 +458,46 @@ impl Node {
         self.muxes.lock_safe().get(topic).map(|m| m.members().len())
     }
 
+    /// Retire a topic this node owns (§4.1): drain and close every member (each `MemberClosed`),
+    /// commit a terminal marker, stop replicating remote members, then tombstone + announce the
+    /// topic channel so peers hide it. Returns whether a hosted topic was found. Members keep
+    /// their own channels; only the merge stops.
+    pub fn deregister_topic(&self, topic: &str) -> io::Result<bool> {
+        let mux = self.muxes.lock_safe().remove(topic);
+        let Some(mut mux) = mux else {
+            return Ok(false);
+        };
+        mux.finish()?; // drain all members + terminal marker
+        drop(mux);
+
+        // Stop replicating this topic's remote members.
+        let members: Vec<String> = {
+            let reg = self.registry.lock_safe();
+            reg.iter()
+                .filter(|id| id.member_of.as_deref() == Some(topic))
+                .map(|id| id.name.clone())
+                .collect()
+        };
+        for m in members {
+            if let Some(sub) = self.subscriptions.lock_safe().remove(&m) {
+                sub.stop();
+            }
+        }
+
+        // Tombstone the topic channel itself so it's no longer discoverable.
+        if let Some(tombstone) = self
+            .registry
+            .lock_safe()
+            .deregister(topic, self.config.node_id)
+        {
+            self.hosted.lock_safe().remove(topic);
+            self.dissemination
+                .lock_safe()
+                .announce(std::slice::from_ref(&tombstone))?;
+        }
+        Ok(true)
+    }
+
     /// Announce a freshly-claimed origin to peers and record it in the hosted map (so
     /// `serve_stream` can resolve it). `file_roll_size`/`keep_files` are the origin's
     /// rolling+retention policy, carried in the hosted `ChannelSource` so subscribers'
@@ -1245,6 +1285,37 @@ mod tests {
         assert!(node.deregister("mem.a").unwrap());
         node.attach_pending_members();
         assert_eq!(node.topic_member_count("agg"), Some(0));
+    }
+
+    #[test]
+    fn deregister_topic_retires_mux_and_writes_terminal() {
+        use xchannel_net_core::mux::MSG_TYPE_TERMINAL;
+
+        let node = Node::new(config(1, temp_dir("retire")));
+        let topic_path = node.create_topic("agg", ChannelOptions::default()).unwrap();
+        node.publish_to_topic("agg", "mem.a", ChannelOptions::default())
+            .unwrap();
+        assert_eq!(node.topic_member_count("agg"), Some(1));
+
+        assert!(node.deregister_topic("agg").unwrap());
+        assert_eq!(node.topic_member_count("agg"), None, "mux retired");
+        assert!(
+            node.registry.lock_safe().get("agg").is_none(),
+            "topic channel tombstoned"
+        );
+
+        // The topic channel ends with a terminal marker.
+        let mut r = ReaderBuilder::new(&topic_path)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        let mut terminal = false;
+        while let Some(m) = r.try_read().unwrap() {
+            if m.header().message_type == MSG_TYPE_TERMINAL {
+                terminal = true;
+            }
+        }
+        assert!(terminal, "a terminal marker was committed");
     }
 
     #[test]
