@@ -225,6 +225,7 @@ mod tests {
             registered_at_nanos: 1,
             epoch: 0,
             deleted: false,
+            member_of: None,
         }
     }
 

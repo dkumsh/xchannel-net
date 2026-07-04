@@ -156,6 +156,13 @@ fn put_identity(w: &mut W, id: &ChannelIdentity) {
     w.u64(id.registered_at_nanos);
     w.u64(id.epoch);
     w.u8(id.deleted as u8);
+    match &id.member_of {
+        Some(topic) => {
+            w.u8(1);
+            w.str(topic);
+        }
+        None => w.u8(0),
+    }
 }
 
 fn get_identity(r: &mut R) -> io::Result<ChannelIdentity> {
@@ -168,6 +175,7 @@ fn get_identity(r: &mut R) -> io::Result<ChannelIdentity> {
         registered_at_nanos: r.u64()?,
         epoch: r.u64()?,
         deleted: r.u8()? != 0,
+        member_of: if r.u8()? != 0 { Some(r.str()?) } else { None },
     })
 }
 
@@ -514,6 +522,7 @@ mod tests {
             registered_at_nanos: 123_456_789,
             epoch: 3,
             deleted: false,
+            member_of: Some("agg.topic".to_string()),
         }
     }
 
