@@ -170,10 +170,10 @@ _As of 2026-06-22:_
     retries the replica open (async creation race).
 - ~28 tests across unit + two-node + client-RPC + cross-process; clippy clean; release builds.
 
-### Topics (multi-producer fan-in) — in progress (`doc/TOPICS.md`)
+### Topics (multi-producer fan-in) — full design implemented (`doc/TOPICS.md`)
 
-Building the full topic stack (Phases 0→2). **Phase 0 (the §1 prerequisites) — 4 of 5 landed**,
-each its own commit, all `just check`-green (37 tests):
+The complete TOPICS.md design (§0–§8) is built on the `topics` branch, ~53 tests green
+(`just check` clean). **Phase 0 (the §1 prerequisites):**
 - **`RegisterRejected`**: `claim_name` reserves the name before file creation and fails
   `AlreadyExists` on a lost collision (`de6f558`).
 - **True `SubscribeAck.head`**: via `xchannel::Reader::head_record_index()` — dep bumped to
@@ -203,10 +203,6 @@ creates member channels, the daemon's mux merges them into the topic channel, an
 - **Client RPC** (`CreateTopic`/`PublishToTopic`) + `main.rs` mux loop + **cross-process
   end-to-end test** (`this commit`).
 
-Simplifications to revisit in Phase 2: mux poll holds the muxes lock during IO; members must be
-local (topic must be hosted on the same node); a topic tombstone doesn't stop a running mux; no
-`TopicGap`/drain/reaper yet; recovery scans from genesis (not the bounded last-slot-table scan).
-
 **Phase 2 core (remote members) — landed.** A member on any node feeds a topic hosted on
 another: `member_of` rides `ChannelIdentity` (`3492da1`), and the topic owner's maintenance
 loop (`attach_pending_members`) discovers members and attaches them — local ones by origin
@@ -215,12 +211,33 @@ threads, which xchannel supports) (`4f2643e`). `publish_to_topic` no longer requ
 to be local. Proven by a two-node test (member on B → topic on A). `add_member` is idempotent
 so publish-time and discovery-time attach don't collide.
 
-**Phase 2 remaining (§6 lifecycle) — not yet:** `TopicGap` control record on member retention
-underrun (silent splicing is prohibited by design); clean-leave **drain** → `MemberClosed`;
-the **reaper** (`member_reap_after`) that tombstones a dead member's owner so its incarnation
-can be reclaimed; stopping a mux when its topic is tombstoned. Also still open from Phase 1:
-mux poll holds the muxes lock during IO; recovery scans from genesis (not the bounded
-last-slot-table scan). These are refinements on a working fan-in core.
+**Phase 2 lifecycle (§6) + observability (§8) — landed.** The full design (§0–§8) is now
+implemented:
+- **`TopicGap`** (`4521b4b`): on resume, if a member aged records out of retention below the
+  mux cursor, an attributed `TopicGap{member_ref, from, resumed_at}` is committed and the merge
+  resumes at `earliest` — never a silent splice (§6.2).
+- **Clean leave** (`9f425f4`): `Mux::remove_member` drains to head → `MemberClosed{final_index}`;
+  the node detaches members whose registry entry is tombstoned/gone (drain + stop subscription).
+- **Topic retirement** (`0f2b556`): `Node::deregister_topic` drains all members, writes a
+  terminal marker, tombstones the topic channel, stops member subscriptions (§4.1).
+- **`TopicOptions` + reaper** (`6cbd868`): `create_topic(&TopicOptions)` carries geometry +
+  `max_batch_per_member` + `member_reap_after`; the reaper tombstones a member whose owner has
+  been unreachable past the (opt-in, default-never) threshold so its incarnation can be
+  reclaimed — `Registry::reap` is the deliberate not-owner-only exception.
+- **Observability** (`2f1c0be`): `Node::topic_status` → per-member `{merged, head, lag, state:
+  Quiet|Active|Unreachable}`, topic head, gaps emitted, slot-table version (§8).
+
+**Honest remainders (not correctness gaps):**
+- Recovery `recover_cursors` scans from genesis — correct, but not the bounded scan §5.2
+  sketches; the bound needs reverse reads (an xchannel feature) to stay correct for quiet
+  members, so left as an O(topic) scan.
+- Mux poll holds the `muxes` lock during IO (§4.3 promotion path is the eventual remedy).
+- Reserved control `msg_type` range is fixed (not per-`TopicOptions` as §4.2 muses).
+- §9 open questions remain open **by design**: hierarchical topics (gated on registry cycle
+  detection), per-topic promotion trigger (default: operator-configured), standalone-mux
+  discovery (filesystem-watch candidate), cross-topic txns (explicitly out of scope).
+- Client RPC surfaces `create_topic`/`publish_to_topic`; `deregister_topic`/`topic_status` are
+  Node APIs (thin client-RPC wrappers are a trivial future add).
 
 ## Security
 
