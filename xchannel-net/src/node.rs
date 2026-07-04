@@ -31,6 +31,7 @@ use xchannel_net_core::RecordIndex;
 use xchannel_net_core::codec::{decode_client_request, encode_client_reply};
 use xchannel_net_core::dissemination::Dissemination;
 use xchannel_net_core::identity::ChannelIdentity;
+use xchannel_net_core::mux::Mux;
 use xchannel_net_core::stream::{self, ChannelSource, accept_subscription};
 use xchannel_net_core::transport::{
     Listener, TcpListener, TcpTransport, Transport, UnixListener, UnixTransport,
@@ -43,6 +44,11 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on concurrent inbound stream + client connections (thread-exhaustion guard). Peer
 /// control links are not capped — they come from configured/trusted seeds.
 const MAX_CONNECTIONS: usize = 4096;
+
+/// Per-member records merged per mux poll cycle — the fairness bound so one hot member can't
+/// monopolize the interleave or head-of-line-block other topics on the shared loop
+/// (`doc/TOPICS.md` §4.3).
+const MAX_BATCH_PER_MEMBER: usize = 256;
 
 /// Create a directory (and parents) and restrict it to the owner (`0700` on Unix), so
 /// other local users can't read channel files beneath it.
@@ -104,6 +110,9 @@ pub struct Node {
     bound_stream_addr: Arc<Mutex<Option<SocketAddr>>>,
     /// Live replica subscriptions this node maintains for clients, keyed by channel name.
     subscriptions: Arc<Mutex<HashMap<String, Subscription>>>,
+    /// Muxes for topics this node owns, keyed by topic name. Each merges its member channels
+    /// into the topic channel; polled by the mux loop (`doc/TOPICS.md` §4).
+    muxes: Arc<Mutex<HashMap<String, Mux>>>,
     /// Count of live inbound stream/client connections (capped at [`MAX_CONNECTIONS`]).
     conns: Arc<AtomicUsize>,
 }
@@ -118,6 +127,7 @@ impl Node {
             dissemination: Arc::new(Mutex::new(dissemination)),
             bound_stream_addr: Arc::new(Mutex::new(None)),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            muxes: Arc::new(Mutex::new(HashMap::new())),
             conns: Arc::new(AtomicUsize::new(0)),
             config: Arc::new(config),
         }
@@ -253,6 +263,82 @@ impl Node {
             .lock_safe()
             .announce(std::slice::from_ref(&tombstone))?;
         Ok(true)
+    }
+
+    // ---------------- topics (multi-producer fan-in, doc/TOPICS.md) ----------------
+
+    /// Create a topic this node owns: the topic channel is an ordinary channel (created +
+    /// registered like any origin, so it is discoverable and subscribable), plus a [`Mux`]
+    /// that merges its members into it. Returns the topic channel path. The mux is driven by
+    /// [`run_mux`](Self::run_mux). (Phase 1: members must be local — see
+    /// [`publish_to_topic`](Self::publish_to_topic).)
+    pub fn create_topic(&self, name: &str, options: ChannelOptions) -> io::Result<PathBuf> {
+        let path = self.create_for_client(name, options)?;
+        let mux = Mux::open(
+            &path,
+            options.region_size,
+            options.mtu,
+            MAX_BATCH_PER_MEMBER,
+        )?;
+        self.muxes.lock_safe().insert(name.to_string(), mux);
+        Ok(path)
+    }
+
+    /// Create a member channel and attach it to a topic's mux. The member is an ordinary
+    /// channel (created + registered like any origin; the caller opens its single `Writer` at
+    /// the returned path) — "membership" is just its attachment to the mux. Its epoch (registry
+    /// generation) is its incarnation, so a respawn is a distinct slot (TOPICS §3.2). Errors if
+    /// this node does not own the topic (Phase 1 is local-members-only; remote members are
+    /// Phase 2).
+    pub fn publish_to_topic(
+        &self,
+        topic: &str,
+        member: &str,
+        options: ChannelOptions,
+    ) -> io::Result<PathBuf> {
+        if !self.muxes.lock_safe().contains_key(topic) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("topic '{topic}' is not hosted on this node"),
+            ));
+        }
+        let member_path = self.create_for_client(member, options)?;
+        let epoch = self
+            .registry
+            .lock_safe()
+            .get_raw(member)
+            .map(|id| id.epoch)
+            .unwrap_or(0);
+        self.muxes
+            .lock_safe()
+            .get_mut(topic)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "topic vanished"))?
+            .add_member(member, epoch, &member_path)?;
+        Ok(member_path)
+    }
+
+    /// Merge whatever is ready across every hosted topic. Returns the total records merged.
+    pub fn poll_muxes(&self) -> io::Result<usize> {
+        let mut muxes = self.muxes.lock_safe();
+        let mut total = 0;
+        for mux in muxes.values_mut() {
+            total += mux.poll()?;
+        }
+        Ok(total)
+    }
+
+    /// Drive the muxes forever: poll all hosted topics every `interval`. (Phase 1 runs this on
+    /// its own thread; §4.1's shared-loop integration and per-topic promotion are later.)
+    pub fn run_mux(&self, interval: Duration) {
+        loop {
+            let _ = self.poll_muxes();
+            std::thread::sleep(interval);
+        }
+    }
+
+    /// Number of members currently attached to a hosted topic's mux (for tests/observability).
+    pub fn topic_member_count(&self, topic: &str) -> Option<usize> {
+        self.muxes.lock_safe().get(topic).map(|m| m.members().len())
     }
 
     /// Announce a freshly-claimed origin to peers and record it in the hosted map (so
@@ -991,5 +1077,31 @@ mod tests {
             io::ErrorKind::HostUnreachable,
             "a known channel with a non-live owner is unreachable, not unknown"
         );
+    }
+
+    #[test]
+    fn create_topic_and_publish_members() {
+        let node = Node::new(config(1, temp_dir("topics")));
+
+        // A topic is an ordinary (registered, subscribable) channel plus a mux.
+        node.create_topic("agg", ChannelOptions::default()).unwrap();
+        assert!(node.registry.lock_safe().get("agg").is_some());
+        assert_eq!(node.topic_member_count("agg"), Some(0));
+
+        // Members are ordinary registered channels attached to the mux.
+        node.publish_to_topic("agg", "mem.a", ChannelOptions::default())
+            .unwrap();
+        node.publish_to_topic("agg", "mem.b", ChannelOptions::default())
+            .unwrap();
+        assert_eq!(node.topic_member_count("agg"), Some(2));
+        assert!(node.registry.lock_safe().get("mem.a").is_some());
+
+        // Publishing to an unknown topic is rejected (Phase 1: local members only).
+        let err = node
+            .publish_to_topic("nope", "mem.c", ChannelOptions::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // The rejected member was never created.
+        assert!(node.registry.lock_safe().get("mem.c").is_none());
     }
 }
