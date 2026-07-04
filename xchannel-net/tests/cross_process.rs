@@ -4,10 +4,12 @@
 //! the origin and read the replica without tripping xchannel's same-process writer+reader
 //! rule (the constraint that forces all the in-process tests to be sequential).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 use xchannel_net_client::{Client, SubscribeMode};
+use xchannel_net_core::mux::{Provenance, is_control};
 use xchannel_net_core::wire::ChannelOptions;
 
 /// Kills the spawned daemon on drop (even if the test panics).
@@ -102,4 +104,84 @@ fn client_replicates_through_a_spawned_daemon() {
         seen, n,
         "replica should receive every record through the daemon"
     );
+}
+
+#[test]
+fn topic_merges_local_members_end_to_end() {
+    let data_dir = temp_dir("topic");
+    let (_daemon, client_path) = spawn_daemon(&data_dir);
+    let mut client = connect_with_retry(&client_path);
+    let opts = ChannelOptions::default();
+
+    client.create_topic("agg", &opts).unwrap();
+
+    // Two producers publish member channels and write to them; the daemon's mux merges them
+    // into the "agg" topic channel with provenance. Bodies chosen so each is identifiable.
+    let a_bodies: Vec<Vec<u8>> = (0..3).map(|i| format!("a{i}").into_bytes()).collect();
+    let b_bodies: Vec<Vec<u8>> = (0..2).map(|i| format!("b{i}").into_bytes()).collect();
+    {
+        let mut wa = client.publish_to_topic("agg", "mem.a", &opts).unwrap();
+        for (i, body) in a_bodies.iter().enumerate() {
+            let buf = wa.try_reserve(body.len()).unwrap();
+            buf.copy_from_slice(body);
+            wa.commit(1, body.len() as u32, 100 + i as u64).unwrap();
+        }
+    }
+    {
+        let mut wb = client.publish_to_topic("agg", "mem.b", &opts).unwrap();
+        for (i, body) in b_bodies.iter().enumerate() {
+            let buf = wb.try_reserve(body.len()).unwrap();
+            buf.copy_from_slice(body);
+            wb.commit(2, body.len() as u32, 200 + i as u64).unwrap();
+        }
+    }
+
+    // A consumer subscribes to the topic like any channel and decodes provenance.
+    let total = a_bodies.len() + b_bodies.len();
+    let mut reader = client
+        .subscribe("agg", SubscribeMode::LateJoin, Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Collect data records (skipping mux control records) grouped by member_ref.
+    let mut by_ref: HashMap<u16, Vec<(u64, u64, Vec<u8>)>> = HashMap::new();
+    let mut count = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while count < total && Instant::now() < deadline {
+        if let Some(m) = reader
+            .read_blocking(Some(Duration::from_millis(200)))
+            .unwrap()
+        {
+            if is_control(m.header().message_type) {
+                continue;
+            }
+            let (prov, body) = Provenance::split(m.payload()).unwrap();
+            by_ref.entry(prov.member_ref).or_default().push((
+                prov.member_index,
+                prov.orig_user_meta,
+                body.to_vec(),
+            ));
+            count += 1;
+        }
+    }
+    assert_eq!(count, total, "every member record should reach the topic");
+    assert_eq!(by_ref.len(), 2, "two distinct members");
+
+    // Each member's records arrive in order, contiguous from index 0, preserving the original
+    // body and user_meta (provenance option (b)). Match by the recovered bodies, not by ref
+    // (the arrival interleave across members is timing-dependent and not asserted).
+    let mut groups: Vec<Vec<(u64, u64, Vec<u8>)>> = by_ref.into_values().collect();
+    for g in &groups {
+        for (k, (idx, _, _)) in g.iter().enumerate() {
+            assert_eq!(*idx, k as u64, "per-member indices are contiguous from 0");
+        }
+    }
+    groups.sort_by_key(|g| g.len());
+    let bodies = |g: &Vec<(u64, u64, Vec<u8>)>| -> Vec<Vec<u8>> {
+        g.iter().map(|(_, _, b)| b.clone()).collect()
+    };
+    assert_eq!(bodies(&groups[0]), b_bodies, "member b: 2 records in order");
+    assert_eq!(bodies(&groups[1]), a_bodies, "member a: 3 records in order");
+    // Original user_meta preserved in provenance (not consumed by the topic record).
+    assert_eq!(groups[1][0].1, 100);
+    assert_eq!(groups[0][0].1, 200);
 }

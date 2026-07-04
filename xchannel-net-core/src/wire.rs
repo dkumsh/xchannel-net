@@ -160,6 +160,22 @@ pub enum ClientRequest {
     /// replies [`Subscribed`](ClientReply::Subscribed) with the replica path; the client
     /// opens a `Reader`. `wait_ms` is the resolve timeout (0 = block until available).
     Subscribe { name: ChannelName, wait_ms: u64 },
+    /// Create a topic (multi-producer fan-in) this node owns: an ordinary channel plus a mux
+    /// that merges its members into it (`doc/TOPICS.md`). Replies
+    /// [`Created`](ClientReply::Created) with the topic channel path (a consumer subscribes to
+    /// it like any channel).
+    CreateTopic {
+        name: ChannelName,
+        options: ChannelOptions,
+    },
+    /// Create a member channel and attach it to `topic`'s mux; replies
+    /// [`Created`](ClientReply::Created) with the member channel path, whose single `Writer`
+    /// the producer opens. (Phase 1: the topic must be hosted on the local node.)
+    PublishToTopic {
+        topic: ChannelName,
+        member: ChannelName,
+        options: ChannelOptions,
+    },
 }
 
 /// Local daemon → client reply.

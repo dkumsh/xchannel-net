@@ -115,6 +115,11 @@ fn main() -> std::io::Result<()> {
             let _ = node.run_maintenance(std::time::Duration::from_millis(500));
         });
     }
+    {
+        // Drive topic muxes: merge member channels into their topic channels (doc/TOPICS.md).
+        let node = node.clone();
+        std::thread::spawn(move || node.run_mux(std::time::Duration::from_millis(5)));
+    }
     node.serve_stream(stream_listener)
 }
 

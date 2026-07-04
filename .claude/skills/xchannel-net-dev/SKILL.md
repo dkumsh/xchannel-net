@@ -189,10 +189,27 @@ each its own commit, all `just check`-green (37 tests):
   standalone code — reuses the epoch; the crash bridge (reaper) is Phase 2 (§6.1). If we later
   prefer a separate incarnation field (TOPICS §3.2 as literally written), revisit here.
 
-**Next: Phase 1 (local-only topics)** — `TopicIdentity`/`member_of` registry entries,
-`create_topic`/`publish_to_topic` client API, the mux as poll-items in the forwarding loop,
-provenance **option (b)** (18-byte prefix header + slot-table records, per TOPICS §4.2),
-recovery via forward-scan-from-slot-table. Paused here for review before building the subsystem.
+**Phase 1 (local-only topics) — landed.** End-to-end: a client `create_topic`s, `publish_to_topic`
+creates member channels, the daemon's mux merges them into the topic channel, and a consumer
+`subscribe`s to the topic like any channel. Pieces:
+- **Record format** (`core/mux.rs`): provenance **option (b)** — 18-byte prefix
+  `{member_ref, member_index, orig_user_meta}` + slot-table control records; reserved control
+  `msg_type` range (`d525b2a`).
+- **Mux engine** (`core/mux.rs`): merges member `ReplicationSource`s into one topic `Writer` in
+  arrival order with provenance, `max_batch_per_member` fairness, and **cursor recovery by
+  scanning the topic tail** (no sidecar) — permutation-free but restart-safe (`6227435`).
+- **Node API** (`create_topic`/`publish_to_topic`/`poll_muxes`/`run_mux`), members are ordinary
+  registered channels; epoch = incarnation (`5ccf397`).
+- **Client RPC** (`CreateTopic`/`PublishToTopic`) + `main.rs` mux loop + **cross-process
+  end-to-end test** (`this commit`).
+
+Simplifications to revisit in Phase 2: mux poll holds the muxes lock during IO; members must be
+local (topic must be hosted on the same node); a topic tombstone doesn't stop a running mux; no
+`TopicGap`/drain/reaper yet; recovery scans from genesis (not the bounded last-slot-table scan).
+
+**Next: Phase 2 (remote members)** — mux subscribes to remote members via the stream plane;
+`member_of` in the registry for cross-node discovery; `TopicGap` on retention underrun; member
+drain/quiesce + the reaper that bridges crash→reclaim (§6).
 
 ## Security
 

@@ -104,6 +104,40 @@ impl Client {
         }
     }
 
+    /// Create a topic (multi-producer fan-in) owned by the local node: an ordinary channel
+    /// plus a mux that merges its members into it (`doc/TOPICS.md`). A consumer reads the
+    /// merged stream by `subscribe`-ing to `name` like any channel.
+    pub fn create_topic(&mut self, name: &str, options: &ChannelOptions) -> io::Result<()> {
+        match self.request(&ClientRequest::CreateTopic {
+            name: name.to_string(),
+            options: *options,
+        })? {
+            ClientReply::Created { .. } => Ok(()),
+            ClientReply::Error { message } => Err(rpc_error(message)),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Create member channel `member` and attach it to `topic`'s mux, returning the member's
+    /// single `Writer` (records the producer writes are merged, in arrival order, into the
+    /// topic channel). Phase 1: `topic` must be hosted on the local daemon.
+    pub fn publish_to_topic(
+        &mut self,
+        topic: &str,
+        member: &str,
+        options: &ChannelOptions,
+    ) -> io::Result<Writer> {
+        match self.request(&ClientRequest::PublishToTopic {
+            topic: topic.to_string(),
+            member: member.to_string(),
+            options: *options,
+        })? {
+            ClientReply::Created { path } => open_writer(&path, options),
+            ClientReply::Error { message } => Err(rpc_error(message)),
+            _ => Err(unexpected()),
+        }
+    }
+
     /// Subscribe and return the local replica path (the daemon keeps it synced). Use this
     /// when you want to open the reader yourself (custom `ReaderBuilder` options).
     ///
