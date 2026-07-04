@@ -5,8 +5,10 @@
 //! rule (the constraint that forces all the in-process tests to be sequential).
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use xchannel_net_client::{Client, SubscribeMode};
 use xchannel_net_core::mux::{Provenance, is_control};
@@ -43,6 +45,56 @@ fn spawn_daemon(data_dir: &Path) -> (Daemon, PathBuf) {
         .spawn()
         .expect("spawn xchanneld");
     (Daemon(child), client_path)
+}
+
+/// Spawn `xchanneld` with a node id, data dir, and seed control addresses, capturing its
+/// startup banner to recover the ephemeral control-plane address it bound. A background thread
+/// drains the rest of stderr so the daemon never blocks on a full pipe.
+fn spawn_daemon_seeded(
+    node_id: u64,
+    data_dir: &Path,
+    seeds: &[SocketAddr],
+) -> (Daemon, PathBuf, SocketAddr) {
+    let client_path = data_dir.join("client.sock");
+    let seeds_str = seeds
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xchanneld"))
+        .env("XCHANNELD_NODE_ID", node_id.to_string())
+        .env("XCHANNELD_STREAM_ADDR", "127.0.0.1:0")
+        .env("XCHANNELD_CONTROL_ADDR", "127.0.0.1:0")
+        .env("XCHANNELD_CLIENT_PATH", &client_path)
+        .env("XCHANNELD_DATA_DIR", data_dir)
+        .env("XCHANNELD_SEEDS", seeds_str)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn xchanneld");
+    let mut reader = BufReader::new(child.stderr.take().unwrap());
+    // Banner: "xchanneld[N]: stream <a> | control <b> | client <c>".
+    let control = loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "daemon exited before printing its banner"
+        );
+        if let Some(addr) = line
+            .split("control ")
+            .nth(1)
+            .and_then(|rest| rest.split(" |").next())
+            .and_then(|s| s.trim().parse::<SocketAddr>().ok())
+        {
+            break addr;
+        }
+    };
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
+            sink.clear();
+        }
+    });
+    (Daemon(child), client_path, control)
 }
 
 fn connect_with_retry(path: &Path) -> Client {
@@ -151,6 +203,169 @@ fn plain_channel_reregisters_after_daemon_restart() {
         got, expected,
         "plain channel re-registered and served after restart"
     );
+}
+
+/// Two real daemons: a member on node B feeds a topic hosted on node A, across the network,
+/// and the merge resumes after A restarts. Exercises the cross-process remote-member path +
+/// seed-based peering + restart re-host of a remote member (the highest-risk distributed path).
+#[test]
+fn remote_member_merges_and_resumes_across_two_daemons() {
+    let dir_a = temp_dir("2node-a");
+    let dir_b = temp_dir("2node-b");
+    let opts = ChannelOptions::default();
+
+    // Node A hosts the topic; node B seeds to A and hosts the member.
+    let (daemon_a, a_client, a_control) = spawn_daemon_seeded(1, &dir_a, &[]);
+    let (_daemon_b, b_client, b_control) = spawn_daemon_seeded(2, &dir_b, &[a_control]);
+
+    let mut client_a = connect_with_retry(&a_client);
+    client_a
+        .create_topic("agg", &TopicOptions::default())
+        .unwrap();
+
+    let mut client_b = connect_with_retry(&b_client);
+    let mut wb = client_b.publish_to_topic("agg", "mem.b", &opts).unwrap();
+    for i in 0..5u64 {
+        let p = format!("b{i}").into_bytes();
+        let buf = wb.try_reserve(p.len()).unwrap();
+        buf.copy_from_slice(&p);
+        wb.commit(1, p.len() as u32, i).unwrap();
+    }
+
+    // A discovers mem.b via gossip, subscribes to B, and merges it into the topic.
+    let read_topic_bodies = |client: &mut Client, want: usize| -> Vec<Vec<u8>> {
+        let mut reader = client
+            .subscribe("agg", SubscribeMode::LateJoin, Some(Duration::from_secs(8)))
+            .unwrap();
+        let mut bodies = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while bodies.len() < want && Instant::now() < deadline {
+            if let Some(m) = reader
+                .read_blocking(Some(Duration::from_millis(200)))
+                .unwrap()
+            {
+                if is_control(m.header().message_type) {
+                    continue;
+                }
+                let (_p, body) = Provenance::split(m.payload()).unwrap();
+                bodies.push(body.to_vec());
+            }
+        }
+        bodies
+    };
+    assert_eq!(
+        read_topic_bodies(&mut client_a, 5),
+        (0..5)
+            .map(|i| format!("b{i}").into_bytes())
+            .collect::<Vec<_>>(),
+        "remote member merged across the network"
+    );
+
+    // Restart A; B keeps running and writing. A rebinds a fresh ephemeral port, so we seed the
+    // restarted A to B (B's address is stable) — A re-dials B, relearns the member, re-subscribes,
+    // and resumes merging.
+    drop(daemon_a);
+    let _daemon_a2 = spawn_daemon_seeded(1, &dir_a, &[b_control]).0;
+    for i in 5..10u64 {
+        let p = format!("b{i}").into_bytes();
+        let buf = wb.try_reserve(p.len()).unwrap();
+        buf.copy_from_slice(&p);
+        wb.commit(1, p.len() as u32, i).unwrap();
+    }
+    let mut client_a = connect_with_retry(&a_client);
+    assert_eq!(
+        read_topic_bodies(&mut client_a, 10),
+        (0..10)
+            .map(|i| format!("b{i}").into_bytes())
+            .collect::<Vec<_>>(),
+        "remote member resumed merging after node A restarted"
+    );
+}
+
+#[test]
+fn topic_with_two_members_rehosts_and_resumes_after_restart() {
+    let data_dir = temp_dir("restart2");
+    let opts = ChannelOptions::default();
+    let (mut wa, mut wb);
+
+    // Session 1: topic + two members, 3 records each, confirm 6 merged, kill daemon.
+    {
+        let (daemon1, client_path) = spawn_daemon(&data_dir);
+        let mut client = connect_with_retry(&client_path);
+        client
+            .create_topic("agg", &TopicOptions::default())
+            .unwrap();
+        wa = client.publish_to_topic("agg", "mem.a", &opts).unwrap();
+        wb = client.publish_to_topic("agg", "mem.b", &opts).unwrap();
+        for i in 0..3u64 {
+            for (w, tag) in [(&mut wa, "a"), (&mut wb, "b")] {
+                let p = format!("{tag}{i}").into_bytes();
+                let buf = w.try_reserve(p.len()).unwrap();
+                buf.copy_from_slice(&p);
+                w.commit(1, p.len() as u32, i).unwrap();
+            }
+        }
+        let mut reader = client
+            .subscribe("agg", SubscribeMode::LateJoin, Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut seen = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen < 6 && Instant::now() < deadline {
+            if let Some(m) = reader
+                .read_blocking(Some(Duration::from_millis(200)))
+                .unwrap()
+                && !is_control(m.header().message_type)
+            {
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 6, "session 1 merged all 6 records");
+        drop(daemon1);
+    }
+
+    // Session 2: respawn; both members must re-attach and resume — neither spuriously retired.
+    let (_daemon2, client_path) = spawn_daemon(&data_dir);
+    let mut client = connect_with_retry(&client_path);
+    for i in 3..6u64 {
+        for (w, tag) in [(&mut wa, "a"), (&mut wb, "b")] {
+            let p = format!("{tag}{i}").into_bytes();
+            let buf = w.try_reserve(p.len()).unwrap();
+            buf.copy_from_slice(&p);
+            w.commit(1, p.len() as u32, i).unwrap();
+        }
+    }
+
+    let mut reader = client
+        .subscribe("agg", SubscribeMode::LateJoin, Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut by_member: HashMap<u8, Vec<u64>> = HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while by_member.values().map(Vec::len).sum::<usize>() < 12 && Instant::now() < deadline {
+        if let Some(m) = reader
+            .read_blocking(Some(Duration::from_millis(200)))
+            .unwrap()
+        {
+            if is_control(m.header().message_type) {
+                continue;
+            }
+            let (prov, body) = Provenance::split(m.payload()).unwrap();
+            by_member
+                .entry(body[0])
+                .or_default()
+                .push(prov.member_index);
+        }
+    }
+    // Each member contributed 6 records (0..5), contiguous — resumed across the restart.
+    for tag in [b'a', b'b'] {
+        let mut idx = by_member.remove(&tag).unwrap_or_default();
+        idx.sort_unstable();
+        assert_eq!(
+            idx,
+            (0..6).collect::<Vec<_>>(),
+            "member {} resumed contiguously",
+            tag as char
+        );
+    }
 }
 
 #[test]
