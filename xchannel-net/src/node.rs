@@ -36,7 +36,7 @@ use xchannel_net_core::stream::{self, ChannelSource, accept_subscription};
 use xchannel_net_core::transport::{
     Listener, TcpListener, TcpTransport, Transport, UnixListener, UnixTransport,
 };
-use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest};
+use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest, TopicOptions};
 
 /// A node not heard from within this is dropped from the live set.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -126,6 +126,12 @@ pub struct Node {
     /// Muxes for topics this node owns, keyed by topic name. Each merges its member channels
     /// into the topic channel; polled by the mux loop (`doc/TOPICS.md` §4).
     muxes: Arc<Mutex<HashMap<String, Mux>>>,
+    /// Per-topic member-reap threshold (§6.1), for topics that opted in (`member_reap_after`).
+    /// Absent ⇒ never reap.
+    topic_reap: Arc<Mutex<HashMap<String, Duration>>>,
+    /// When a member's owner was first observed unreachable, keyed by member name — drives the
+    /// reaper's "dead beyond a threshold" decision. Cleared when the owner is live again.
+    member_dead_since: Arc<Mutex<HashMap<String, Instant>>>,
     /// Count of live inbound stream/client connections (capped at [`MAX_CONNECTIONS`]).
     conns: Arc<AtomicUsize>,
 }
@@ -141,6 +147,8 @@ impl Node {
             bound_stream_addr: Arc::new(Mutex::new(None)),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             muxes: Arc::new(Mutex::new(HashMap::new())),
+            topic_reap: Arc::new(Mutex::new(HashMap::new())),
+            member_dead_since: Arc::new(Mutex::new(HashMap::new())),
             conns: Arc::new(AtomicUsize::new(0)),
             config: Arc::new(config),
         }
@@ -301,17 +309,28 @@ impl Node {
     /// Create a topic this node owns: the topic channel is an ordinary channel (created +
     /// registered like any origin, so it is discoverable and subscribable), plus a [`Mux`]
     /// that merges its members into it. Returns the topic channel path. The mux is driven by
-    /// [`run_mux`](Self::run_mux). (Phase 1: members must be local — see
-    /// [`publish_to_topic`](Self::publish_to_topic).)
-    pub fn create_topic(&self, name: &str, options: ChannelOptions) -> io::Result<PathBuf> {
-        let path = self.create_for_client(name, options)?;
+    /// [`run_mux`](Self::run_mux); members (local or remote) attach via
+    /// [`attach_pending_members`](Self::attach_pending_members).
+    pub fn create_topic(&self, name: &str, options: TopicOptions) -> io::Result<PathBuf> {
+        let path = self.create_for_client(name, options.channel)?;
+        let batch = if options.max_batch_per_member == 0 {
+            MAX_BATCH_PER_MEMBER
+        } else {
+            options.max_batch_per_member as usize
+        };
         let mux = Mux::open(
             &path,
-            options.region_size,
-            options.mtu,
-            MAX_BATCH_PER_MEMBER,
+            options.channel.region_size,
+            options.channel.mtu,
+            batch,
         )?;
         self.muxes.lock_safe().insert(name.to_string(), mux);
+        if options.member_reap_after_ms != 0 {
+            self.topic_reap.lock_safe().insert(
+                name.to_string(),
+                Duration::from_millis(options.member_reap_after_ms),
+            );
+        }
         Ok(path)
     }
 
@@ -417,6 +436,54 @@ impl Node {
         }
     }
 
+    /// Reap members whose owner has been an unreachable member beyond the topic's
+    /// `member_reap_after` threshold (§6.1): tombstone them so a respawn can reclaim the name at
+    /// a new incarnation. Opt-in per topic (default never). The tombstone is disseminated;
+    /// [`attach_pending_members`](Self::attach_pending_members) then drains+detaches the slot.
+    pub fn reap_dead_members(&self) {
+        let topics: Vec<(String, Duration)> = self
+            .topic_reap
+            .lock_safe()
+            .iter()
+            .map(|(t, d)| (t.clone(), *d))
+            .collect();
+        for (topic, reap_after) in topics {
+            let members: Vec<ChannelIdentity> = {
+                let reg = self.registry.lock_safe();
+                reg.iter()
+                    .filter(|id| !id.deleted && id.member_of.as_deref() == Some(topic.as_str()))
+                    .cloned()
+                    .collect()
+            };
+            for m in members {
+                let owner_live = m.owner == self.config.node_id
+                    || self
+                        .dissemination
+                        .lock_safe()
+                        .live_addr_of(m.owner)
+                        .is_some();
+                if owner_live {
+                    self.member_dead_since.lock_safe().remove(&m.name);
+                    continue;
+                }
+                let dead_for = {
+                    let mut dead = self.member_dead_since.lock_safe();
+                    let since = *dead.entry(m.name.clone()).or_insert_with(Instant::now);
+                    since.elapsed()
+                };
+                if dead_for >= reap_after {
+                    self.member_dead_since.lock_safe().remove(&m.name);
+                    if let Some(tombstone) = self.registry.lock_safe().reap(&m.name) {
+                        let _ = self
+                            .dissemination
+                            .lock_safe()
+                            .announce(std::slice::from_ref(&tombstone));
+                    }
+                }
+            }
+        }
+    }
+
     /// Ensure a self-healing subscription is replicating remote member `name` locally, so its
     /// replica can feed the mux. Reuses the subscription map (idempotent); a short resolve
     /// timeout keeps the maintenance loop responsive if the owner isn't reachable yet.
@@ -469,6 +536,7 @@ impl Node {
         };
         mux.finish()?; // drain all members + terminal marker
         drop(mux);
+        self.topic_reap.lock_safe().remove(topic);
 
         // Stop replicating this topic's remote members.
         let members: Vec<String> = {
@@ -638,8 +706,9 @@ impl Node {
                     reg.merge(id);
                 }
             }
-            // React to (possibly just-merged) `member_of` registrations: attach members of any
-            // topic we host, subscribing to remote ones.
+            // Retire members whose owner has been dead too long (opt-in), then react to
+            // `member_of` registrations: attach live members, detach reaped/tombstoned ones.
+            self.reap_dead_members();
             self.attach_pending_members();
             std::thread::sleep(interval);
         }
@@ -1248,7 +1317,7 @@ mod tests {
         let node = Node::new(config(1, temp_dir("topics")));
 
         // A topic is an ordinary (registered, subscribable) channel plus a mux.
-        node.create_topic("agg", ChannelOptions::default()).unwrap();
+        node.create_topic("agg", TopicOptions::default()).unwrap();
         assert!(node.registry.lock_safe().get("agg").is_some());
         assert_eq!(node.topic_member_count("agg"), Some(0));
 
@@ -1276,7 +1345,7 @@ mod tests {
     #[test]
     fn tombstoned_member_is_detached_from_the_mux() {
         let node = Node::new(config(1, temp_dir("detach")));
-        node.create_topic("agg", ChannelOptions::default()).unwrap();
+        node.create_topic("agg", TopicOptions::default()).unwrap();
         node.publish_to_topic("agg", "mem.a", ChannelOptions::default())
             .unwrap();
         assert_eq!(node.topic_member_count("agg"), Some(1));
@@ -1288,11 +1357,47 @@ mod tests {
     }
 
     #[test]
+    fn reaper_tombstones_a_member_with_a_dead_owner() {
+        let node = Node::new(config(1, temp_dir("reap")));
+        node.create_topic(
+            "agg",
+            TopicOptions {
+                member_reap_after_ms: 1, // opt in with a tiny threshold
+                ..TopicOptions::default()
+            },
+        )
+        .unwrap();
+
+        // A member of "agg" owned by a node that is never a live member (owner 99).
+        node.registry.lock_safe().merge(ChannelIdentity {
+            name: "feed.x".to_string(),
+            owner: NodeId(99),
+            region_size: 1 << 20,
+            mtu: 0,
+            earliest_index: RecordIndex(0),
+            registered_at_nanos: 1,
+            epoch: 0,
+            member_of: Some("agg".to_string()),
+            deleted: false,
+        });
+
+        // First pass records "dead since now"; after the threshold elapses, the next pass reaps.
+        node.reap_dead_members();
+        assert!(node.registry.lock_safe().get("feed.x").is_some());
+        std::thread::sleep(Duration::from_millis(3));
+        node.reap_dead_members();
+        assert!(
+            node.registry.lock_safe().get("feed.x").is_none(),
+            "a member whose owner stayed dead past the threshold is reaped (tombstoned)"
+        );
+    }
+
+    #[test]
     fn deregister_topic_retires_mux_and_writes_terminal() {
         use xchannel_net_core::mux::MSG_TYPE_TERMINAL;
 
         let node = Node::new(config(1, temp_dir("retire")));
-        let topic_path = node.create_topic("agg", ChannelOptions::default()).unwrap();
+        let topic_path = node.create_topic("agg", TopicOptions::default()).unwrap();
         node.publish_to_topic("agg", "mem.a", ChannelOptions::default())
             .unwrap();
         assert_eq!(node.topic_member_count("agg"), Some(1));
@@ -1326,7 +1431,7 @@ mod tests {
         let (b, _b_stream, _b_control) = start(2, "topic-b");
 
         // A hosts the topic and drives its mux.
-        let topic_path = a.create_topic("agg", ChannelOptions::default()).unwrap();
+        let topic_path = a.create_topic("agg", TopicOptions::default()).unwrap();
         {
             let a = a.clone();
             std::thread::spawn(move || a.run_mux(Duration::from_millis(2)));

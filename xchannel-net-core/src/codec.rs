@@ -18,7 +18,9 @@
 //! the hot read side.
 
 use crate::identity::ChannelIdentity;
-use crate::wire::{ChannelOptions, ClientReply, ClientRequest, ControlMsg, RecordFrame, StreamMsg};
+use crate::wire::{
+    ChannelOptions, ClientReply, ClientRequest, ControlMsg, RecordFrame, StreamMsg, TopicOptions,
+};
 use crate::{NodeId, RecordIndex, StreamId};
 use std::io;
 
@@ -415,6 +417,20 @@ fn get_options(r: &mut R) -> io::Result<ChannelOptions> {
     })
 }
 
+fn put_topic_options(w: &mut W, o: &TopicOptions) {
+    put_options(w, &o.channel);
+    w.u32(o.max_batch_per_member);
+    w.u64(o.member_reap_after_ms);
+}
+
+fn get_topic_options(r: &mut R) -> io::Result<TopicOptions> {
+    Ok(TopicOptions {
+        channel: get_options(r)?,
+        max_batch_per_member: r.u32()?,
+        member_reap_after_ms: r.u64()?,
+    })
+}
+
 pub fn encode_client_request(m: &ClientRequest) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut w = W::new(&mut buf);
@@ -432,7 +448,7 @@ pub fn encode_client_request(m: &ClientRequest) -> Vec<u8> {
         ClientRequest::CreateTopic { name, options } => {
             w.u8(client_req_tag::CREATE_TOPIC);
             w.str(name);
-            put_options(&mut w, options);
+            put_topic_options(&mut w, options);
         }
         ClientRequest::PublishToTopic {
             topic,
@@ -461,7 +477,7 @@ pub fn decode_client_request(bytes: &[u8]) -> io::Result<ClientRequest> {
         },
         client_req_tag::CREATE_TOPIC => ClientRequest::CreateTopic {
             name: r.str()?,
-            options: get_options(&mut r)?,
+            options: get_topic_options(&mut r)?,
         },
         client_req_tag::PUBLISH_TO_TOPIC => ClientRequest::PublishToTopic {
             topic: r.str()?,

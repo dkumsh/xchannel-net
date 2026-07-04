@@ -10,7 +10,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 use xchannel_net_client::{Client, SubscribeMode};
 use xchannel_net_core::mux::{Provenance, is_control};
-use xchannel_net_core::wire::ChannelOptions;
+use xchannel_net_core::wire::{ChannelOptions, TopicOptions};
 
 /// Kills the spawned daemon on drop (even if the test panics).
 struct Daemon(Child);
@@ -113,7 +113,9 @@ fn topic_merges_local_members_end_to_end() {
     let mut client = connect_with_retry(&client_path);
     let opts = ChannelOptions::default();
 
-    client.create_topic("agg", &opts).unwrap();
+    client
+        .create_topic("agg", &TopicOptions::default())
+        .unwrap();
 
     // Two producers publish member channels and write to them; the daemon's mux merges them
     // into the "agg" topic channel with provenance. Bodies chosen so each is identifiable.
