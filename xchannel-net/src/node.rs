@@ -110,6 +110,37 @@ fn created_or_error(r: io::Result<PathBuf>) -> ClientReply {
     }
 }
 
+/// How a topic member is currently behaving (§6.1), derived from merge lag + owner liveness.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemberState {
+    /// Owner live and the merge is caught up (no pending records).
+    Quiet,
+    /// Owner live and the merge is behind (records pending).
+    Active,
+    /// Owner is not a live member — records aren't flowing (distinct from quiet).
+    Unreachable,
+}
+
+/// Per-member row of a [`TopicStatus`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MemberInfo {
+    pub name: String,
+    pub epoch: u64,
+    pub merged: u64,
+    pub head: u64,
+    pub lag: u64,
+    pub state: MemberState,
+}
+
+/// Observability snapshot of a hosted topic (§8).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TopicStatus {
+    pub members: Vec<MemberInfo>,
+    pub topic_head: u64,
+    pub gaps_emitted: u64,
+    pub slot_table_version: u64,
+}
+
 #[derive(Clone)]
 pub struct Node {
     config: Arc<NodeConfig>,
@@ -523,6 +554,56 @@ impl Node {
     /// Number of members currently attached to a hosted topic's mux (for tests/observability).
     pub fn topic_member_count(&self, topic: &str) -> Option<usize> {
         self.muxes.lock_safe().get(topic).map(|m| m.members().len())
+    }
+
+    /// Observability snapshot for a hosted topic (§8): the mux's merge health augmented with
+    /// each member's owner liveness, so each member reads as `Active` (behind, owner live),
+    /// `Quiet` (caught up, owner live), or `Unreachable` (owner not a live member). `None` if
+    /// this node doesn't host the topic.
+    pub fn topic_status(&self, topic: &str) -> Option<io::Result<TopicStatus>> {
+        let mux_status = self.muxes.lock_safe().get(topic)?.status();
+        let status = mux_status.map(|s| {
+            let members = s
+                .members
+                .into_iter()
+                .map(|m| {
+                    let owner = self
+                        .registry
+                        .lock_safe()
+                        .get_raw(&m.name)
+                        .map(|id| id.owner);
+                    let owner_live = match owner {
+                        Some(o) => {
+                            o == self.config.node_id
+                                || self.dissemination.lock_safe().live_addr_of(o).is_some()
+                        }
+                        None => false,
+                    };
+                    let state = if !owner_live {
+                        MemberState::Unreachable
+                    } else if m.lag == 0 {
+                        MemberState::Quiet
+                    } else {
+                        MemberState::Active
+                    };
+                    MemberInfo {
+                        name: m.name,
+                        epoch: m.epoch,
+                        merged: m.merged,
+                        head: m.head,
+                        lag: m.lag,
+                        state,
+                    }
+                })
+                .collect();
+            TopicStatus {
+                members,
+                topic_head: s.topic_head,
+                gaps_emitted: s.gaps_emitted,
+                slot_table_version: s.slot_table_version,
+            }
+        });
+        Some(status)
     }
 
     /// Retire a topic this node owns (§4.1): drain and close every member (each `MemberClosed`),
@@ -1354,6 +1435,27 @@ mod tests {
         assert!(node.deregister("mem.a").unwrap());
         node.attach_pending_members();
         assert_eq!(node.topic_member_count("agg"), Some(0));
+    }
+
+    #[test]
+    fn topic_status_reports_members_and_counters() {
+        let node = Node::new(config(1, temp_dir("status")));
+        node.create_topic("agg", TopicOptions::default()).unwrap();
+        node.publish_to_topic("agg", "mem.a", ChannelOptions::default())
+            .unwrap();
+
+        let status = node.topic_status("agg").unwrap().unwrap();
+        assert_eq!(status.members.len(), 1);
+        let m = &status.members[0];
+        assert_eq!(m.name, "mem.a");
+        assert_eq!((m.merged, m.head, m.lag), (0, 0, 0), "no records yet");
+        // Local member owned by this (live) node, caught up ⇒ Quiet.
+        assert_eq!(m.state, MemberState::Quiet);
+        assert!(status.slot_table_version >= 1, "a slot table was emitted");
+        assert_eq!(status.gaps_emitted, 0);
+
+        // A topic we don't host has no status.
+        assert!(node.topic_status("nope").is_none());
     }
 
     #[test]

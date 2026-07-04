@@ -256,6 +256,34 @@ pub struct Mux {
     /// Per-`(name, epoch)` highest member-index already merged, recovered from the topic tail
     /// at open; consumed as members (re)attach so they resume without re-merging.
     recovered: HashMap<(String, u64), u64>,
+    /// Count of `TopicGap` records emitted (observability, §8).
+    gaps_emitted: u64,
+    /// Count of slot-table emissions — bumps on every membership change (§8 slot-table version).
+    slot_table_version: u64,
+}
+
+/// Per-member merge status (§8): how far the mux has merged vs the member's head.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MemberStat {
+    pub name: String,
+    pub epoch: u64,
+    /// Absolute index of the next record to merge (= records merged so far).
+    pub merged: u64,
+    /// The member channel's current head.
+    pub head: u64,
+    /// `head - merged` — how far behind the merge is for this member.
+    pub lag: u64,
+}
+
+/// A snapshot of a mux's merge health (§8 "minimum bar to ship"). Combine with owner liveness
+/// (at the node layer) to classify a member as quiet / behind / unreachable.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MuxStatus {
+    pub members: Vec<MemberStat>,
+    /// The topic channel's head (all records: data + control).
+    pub topic_head: u64,
+    pub gaps_emitted: u64,
+    pub slot_table_version: u64,
 }
 
 impl Mux {
@@ -284,6 +312,30 @@ impl Mux {
             next_ref: 0,
             max_batch_per_member: max_batch_per_member.max(1),
             recovered,
+            gaps_emitted: 0,
+            slot_table_version: 0,
+        })
+    }
+
+    /// Snapshot the mux's merge health (§8): per-member merged/head/lag, topic head, gaps
+    /// emitted, and slot-table version. Reading each member's head is a cheap header read.
+    pub fn status(&self) -> io::Result<MuxStatus> {
+        let mut members = Vec::with_capacity(self.slots.len());
+        for s in &self.slots {
+            let head = s.source.head()?.0;
+            members.push(MemberStat {
+                name: s.name.clone(),
+                epoch: s.epoch,
+                merged: s.cursor,
+                head,
+                lag: head.saturating_sub(s.cursor),
+            });
+        }
+        Ok(MuxStatus {
+            members,
+            topic_head: self.topic.next_record_index(),
+            gaps_emitted: self.gaps_emitted,
+            slot_table_version: self.slot_table_version,
         })
     }
 
@@ -443,6 +495,7 @@ impl Mux {
         buf.copy_from_slice(&payload);
         self.topic
             .commit(MSG_TYPE_TOPIC_GAP, payload.len() as u32, 0)?;
+        self.gaps_emitted += 1;
         Ok(())
     }
 
@@ -462,6 +515,7 @@ impl Mux {
         buf.copy_from_slice(&payload);
         self.topic
             .commit(MSG_TYPE_SLOT_TABLE, payload.len() as u32, 0)?;
+        self.slot_table_version += 1;
         Ok(())
     }
 }
