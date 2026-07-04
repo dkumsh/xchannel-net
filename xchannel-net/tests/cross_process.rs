@@ -107,6 +107,53 @@ fn client_replicates_through_a_spawned_daemon() {
 }
 
 #[test]
+fn plain_channel_reregisters_after_daemon_restart() {
+    let data_dir = temp_dir("reregister");
+    let opts = ChannelOptions::default();
+
+    // Session 1: create a plain channel, write 5 records, drop the writer, kill the daemon.
+    {
+        let (daemon1, client_path) = spawn_daemon(&data_dir);
+        let mut client = connect_with_retry(&client_path);
+        let mut w = client.create_channel("md.x", &opts).unwrap();
+        for i in 0..5u64 {
+            let p = format!("r{i}").into_bytes();
+            let buf = w.try_reserve(p.len()).unwrap();
+            buf.copy_from_slice(&p);
+            w.commit(1, p.len() as u32, i).unwrap();
+        }
+        drop(daemon1);
+    }
+
+    // Session 2: respawn on the same data_dir. reconstruct must re-register md.x (recovering its
+    // geometry from the header) so a subscriber can resolve + replicate it — no re-create.
+    let (_daemon2, client_path) = spawn_daemon(&data_dir);
+    let mut client = connect_with_retry(&client_path);
+    let mut reader = client
+        .subscribe(
+            "md.x",
+            SubscribeMode::LateJoin,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while got.len() < 5 && Instant::now() < deadline {
+        if let Some(m) = reader
+            .read_blocking(Some(Duration::from_millis(200)))
+            .unwrap()
+        {
+            got.push(m.payload().to_vec());
+        }
+    }
+    let expected: Vec<Vec<u8>> = (0..5).map(|i| format!("r{i}").into_bytes()).collect();
+    assert_eq!(
+        got, expected,
+        "plain channel re-registered and served after restart"
+    );
+}
+
+#[test]
 fn topic_rehosts_and_resumes_after_daemon_restart() {
     let data_dir = temp_dir("restart");
     let opts = ChannelOptions::default();

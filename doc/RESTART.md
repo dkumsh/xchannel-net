@@ -59,9 +59,16 @@ required to honor §6.3.
   defaults (reap reverts to *never* — safe; batch to default).
 - **Remote members** resume from their on-disk replica and refresh once the owner is reachable
   again (membership rebuilt from heartbeats).
-- General **origin re-registration** for non-topic channels is the broader §5.2 item; this note
-  covers topics. (b) would additionally survive empty topics and remove the retained-slot-table
-  dependency.
+- **General origin re-registration** for non-topic channels **is now implemented** too:
+  `reconstruct_from_disk` re-registers every channel it finds, recovering geometry from the
+  header via `xchannel::Reader::region_size()` / `mtu()` (added in xchannel 4.2.0 — a generic,
+  topic-agnostic accessor, *not* option (b)'s topic marker). `member_of` and rolling/retention
+  are not persisted, so a re-registered member reconciles `member_of` via peer anti-entropy on a
+  mesh (a local topic re-attaches its members from its own slot table regardless), and replicas
+  of a reconstructed origin fall back to no rolling (same as in-process `host_channel`).
+- **Option (b)** (a topic marker in the header) was **considered and rejected**: its only real
+  benefit is surviving *empty* topics (no data, no members — a reconnecting client re-creates
+  them), which isn't worth pushing the topic concept into the substrate. Not planned.
 
 ## Test
 
