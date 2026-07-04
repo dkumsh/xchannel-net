@@ -171,7 +171,7 @@ impl Node {
     ) -> io::Result<Writer> {
         let path = self.channel_path(name)?;
         // Reserve the name first: a lost collision fails here, before any file is created.
-        let identity = self.claim_name(name, region_size, mtu)?;
+        let identity = self.claim_name(name, region_size, mtu, None)?;
         if let Some(parent) = path.parent() {
             ensure_private_dir(parent)?;
         }
@@ -196,9 +196,20 @@ impl Node {
     /// channel under `data_dir` with `options` (no live writer kept — the client opens the
     /// single `Writer` itself), register + announce it, and return the path.
     pub fn create_for_client(&self, name: &str, options: ChannelOptions) -> io::Result<PathBuf> {
+        self.create_origin(name, options, None)
+    }
+
+    /// Shared origin-creation path. `member_of` tags the channel as a topic member so the
+    /// topic's owner can discover and attach it (§3.1); `None` for an ordinary channel.
+    fn create_origin(
+        &self,
+        name: &str,
+        options: ChannelOptions,
+        member_of: Option<String>,
+    ) -> io::Result<PathBuf> {
         let path = self.channel_path(name)?;
         // Reserve the name first: a lost collision fails here, before the file is precreated.
-        let identity = self.claim_name(name, options.region_size, options.mtu)?;
+        let identity = self.claim_name(name, options.region_size, options.mtu, member_of)?;
         if let Some(parent) = path.parent() {
             ensure_private_dir(parent)?;
         }
@@ -231,7 +242,13 @@ impl Node {
     /// resolves after this node has already served its client a `Writer` is not covered here
     /// — that requires server-push notification the client RPC does not yet have (tracked as
     /// remaining work).
-    fn claim_name(&self, name: &str, region_size: u32, mtu: u32) -> io::Result<ChannelIdentity> {
+    fn claim_name(
+        &self,
+        name: &str,
+        region_size: u32,
+        mtu: u32,
+        member_of: Option<String>,
+    ) -> io::Result<ChannelIdentity> {
         // Choose epoch and merge under one lock so the reclaim generation can't shift between
         // reading it and registering. A tombstoned name is reclaimed at the next generation;
         // a live name is contested in its own generation (and lost if we're not the earliest).
@@ -245,6 +262,7 @@ impl Node {
             registered_at_nanos: now_nanos(),
             epoch: reg.claim_epoch(name),
             deleted: false,
+            member_of,
         };
         let winner = reg.merge(identity.clone());
         drop(reg);
@@ -315,7 +333,10 @@ impl Node {
                 format!("topic '{topic}' is not hosted on this node"),
             ));
         }
-        let member_path = self.create_for_client(member, options)?;
+        // Tag the member with `member_of` so the topic owner (here, us) discovers it; attach
+        // it directly since it's local. add_member is idempotent, so the discovery loop
+        // (Phase 2) re-finding it is a no-op.
+        let member_path = self.create_origin(member, options, Some(topic.to_string()))?;
         let epoch = self
             .registry
             .lock_safe()
@@ -1048,6 +1069,7 @@ mod tests {
             registered_at_nanos: 1, // earlier than any now_nanos()
             epoch: 0,
             deleted: false,
+            member_of: None,
         });
 
         let err = node
@@ -1085,6 +1107,7 @@ mod tests {
             registered_at_nanos: 1,
             epoch: 0,
             deleted: false,
+            member_of: None,
         });
         let unreachable = node.resolve("md.aapl", short).unwrap_err();
         assert_eq!(

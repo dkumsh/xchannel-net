@@ -43,6 +43,12 @@ pub struct ChannelIdentity {
     /// beating stale re-registrations of its generation) but hidden from
     /// [`Registry::get`](crate) — a deregistered name reads as absent.
     pub deleted: bool,
+
+    /// If this channel is a **topic member**, the topic it feeds (`doc/TOPICS.md` §3.1). The
+    /// topic's owner discovers members through this field (gossiped like any identity) and
+    /// attaches them to its mux — local members by their origin file, remote members via a
+    /// stream subscription. `None` for an ordinary channel.
+    pub member_of: Option<ChannelName>,
 }
 
 impl ChannelIdentity {

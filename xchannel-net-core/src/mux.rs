@@ -220,6 +220,11 @@ impl Mux {
     /// was merged before, else from genesis — late discovery loses nothing (§4.1). Re-emits
     /// the slot table so a topic reader can decode the new member's provenance (§6.3).
     pub fn add_member(&mut self, name: &str, epoch: u64, member_path: &Path) -> io::Result<()> {
+        // Idempotent: attaching an already-attached (name, epoch) is a no-op, so the publish
+        // path and the discovery loop can both call it safely.
+        if self.has_member(name, epoch) {
+            return Ok(());
+        }
         let member_ref = self.next_ref;
         self.next_ref += 1;
         let (mut source, _earliest) = ReplicationSource::open(member_path)?;
@@ -264,6 +269,13 @@ impl Mux {
             }
         }
         Ok(merged)
+    }
+
+    /// Whether a member with this `(name, epoch)` is already attached.
+    pub fn has_member(&self, name: &str, epoch: u64) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.name == name && s.epoch == epoch)
     }
 
     /// Current members as `(name, epoch, next_cursor)` — for observability/tests.
