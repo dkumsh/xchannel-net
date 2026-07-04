@@ -73,6 +73,21 @@ impl Registry {
         Some(self.merge(tombstone))
     }
 
+    /// Tombstone `name` regardless of owner — the topic-member **reaper**'s authority (§6.1),
+    /// used to retire a member whose owner has been dead beyond the threshold. Unlike
+    /// [`deregister`](Self::deregister) (owner-only), this is the deliberate exception for
+    /// reclaiming a dead member's name; callers gate it on a liveness timeout. Returns the
+    /// tombstone to disseminate, or `None` if already absent/tombstoned.
+    pub fn reap(&mut self, name: &str) -> Option<ChannelIdentity> {
+        let current = self.channels.get(name)?;
+        if current.deleted {
+            return None;
+        }
+        let mut tombstone = current.clone();
+        tombstone.deleted = true;
+        Some(self.merge(tombstone))
+    }
+
     /// All raw entries including tombstones — for anti-entropy, which must carry deletions so
     /// a reconnecting peer learns them (else it could resurrect a deregistered name).
     pub fn iter(&self) -> impl Iterator<Item = &ChannelIdentity> {

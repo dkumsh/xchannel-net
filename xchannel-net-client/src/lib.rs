@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use xchannel::{Reader, ReaderBuilder, ReaderMode, Writer, WriterBuilder};
 use xchannel_net_core::codec::{decode_client_reply, encode_client_request};
 use xchannel_net_core::transport::{Transport, UnixTransport};
-use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest};
+use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest, TopicOptions};
 
 pub use xchannel_net_core::wire::ChannelOptions as Options;
 
@@ -107,7 +107,7 @@ impl Client {
     /// Create a topic (multi-producer fan-in) owned by the local node: an ordinary channel
     /// plus a mux that merges its members into it (`doc/TOPICS.md`). A consumer reads the
     /// merged stream by `subscribe`-ing to `name` like any channel.
-    pub fn create_topic(&mut self, name: &str, options: &ChannelOptions) -> io::Result<()> {
+    pub fn create_topic(&mut self, name: &str, options: &TopicOptions) -> io::Result<()> {
         match self.request(&ClientRequest::CreateTopic {
             name: name.to_string(),
             options: *options,

@@ -144,6 +144,29 @@ impl Default for ChannelOptions {
     }
 }
 
+/// Options for creating a topic (multi-producer fan-in, `doc/TOPICS.md` §3.1). Wraps the
+/// topic channel's geometry plus mux policy; serializable so it crosses the client↔daemon link.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TopicOptions {
+    /// Geometry/retention of the topic channel itself (the merged output).
+    pub channel: ChannelOptions,
+    /// Fairness bound: records merged per member per poll cycle (§4.3). `0` ⇒ daemon default.
+    pub max_batch_per_member: u32,
+    /// Auto-reap a member whose owner has been an unreachable member for at least this long
+    /// (§6.1). `0` ⇒ **never** reap (the default; reaping is an operator opt-in).
+    pub member_reap_after_ms: u64,
+}
+
+impl Default for TopicOptions {
+    fn default() -> Self {
+        Self {
+            channel: ChannelOptions::default(),
+            max_batch_per_member: 0,
+            member_reap_after_ms: 0,
+        }
+    }
+}
+
 /// Client → local daemon request (the client↔manager control protocol). A client never
 /// talks to remote nodes; it asks its local daemon, which handles registration,
 /// discovery, and replication, and replies with a local path the client opens itself.
@@ -166,7 +189,7 @@ pub enum ClientRequest {
     /// it like any channel).
     CreateTopic {
         name: ChannelName,
-        options: ChannelOptions,
+        options: TopicOptions,
     },
     /// Create a member channel and attach it to `topic`'s mux; replies
     /// [`Created`](ClientReply::Created) with the member channel path, whose single `Writer`
