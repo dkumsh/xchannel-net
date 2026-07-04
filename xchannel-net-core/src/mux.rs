@@ -1112,6 +1112,34 @@ mod tests {
     }
 
     #[test]
+    fn finish_drains_members_then_writes_terminal() {
+        let dir = temp_dir("finish");
+        let (topic, m) = (dir.join("topic"), dir.join("m"));
+        write_member(&m, &[(1, 0, b"m0"), (1, 1, b"m1")]);
+
+        let mut mux = Mux::open(&topic, REGION_U32, 0, 1).unwrap();
+        mux.add_member("m", 0, &m).unwrap();
+        assert_eq!(mux.poll().unwrap(), 1); // batch=1, one merged, one pending
+        mux.finish().unwrap();
+        assert!(mux.members().is_empty());
+        drop(mux);
+
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        let (mut data, mut closed, mut terminal) = (0, 0, 0);
+        while let Some(msg) = r.try_read().unwrap() {
+            match msg.header().message_type {
+                MSG_TYPE_MEMBER_CLOSED => closed += 1,
+                MSG_TYPE_TERMINAL => terminal += 1,
+                mt if !is_control(mt) => data += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(data, 2, "finish drained both member records");
+        assert_eq!(closed, 1, "member drained + closed");
+        assert_eq!(terminal, 1, "a terminal marker was committed");
+    }
+
+    #[test]
     fn remove_member_drains_then_emits_member_closed() {
         let dir = temp_dir("close");
         let (topic, member) = (dir.join("topic"), dir.join("m"));

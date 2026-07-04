@@ -335,6 +335,12 @@ impl Node {
         self.dissemination
             .lock_safe()
             .announce(std::slice::from_ref(&tombstone))?;
+        // Delete the on-disk channel so a later restart's data-dir scan can't resurrect this
+        // deregistered name (`reconstruct_from_disk` has no tombstone to consult on an isolated
+        // restart — the registry is rebuilt from scratch). Deregistration is deliberate removal.
+        if let Ok(path) = self.channel_path(name) {
+            xchannel::cleanup_channel_files(&path);
+        }
         Ok(true)
     }
 
@@ -446,8 +452,12 @@ impl Node {
                 }
             }
 
-            // Detach members the registry no longer lists (tombstoned / left): clean-leave
-            // drain → MemberClosed, then stop replicating a remote one (§6.1).
+            // Detach members the registry says have **left**: clean-leave drain → MemberClosed,
+            // then stop replicating a remote one (§6.1). Only a *positive* signal retires a
+            // member — a tombstone, or its `member_of` moved to another topic. Mere **absence**
+            // from the registry must NOT retire it (the registry may just be incomplete — e.g.
+            // right after a restart, before reconstruct/gossip catches up); otherwise we'd drain
+            // a member that never left.
             let live_set: std::collections::HashSet<(String, u64)> =
                 live.iter().map(|m| (m.name.clone(), m.epoch)).collect();
             let attached: Vec<(String, u64)> = self
@@ -459,6 +469,12 @@ impl Node {
             for (name, epoch) in attached {
                 if live_set.contains(&(name.clone(), epoch)) {
                     continue;
+                }
+                let left = self.registry.lock_safe().get_raw(&name).is_some_and(|id| {
+                    id.deleted || id.member_of.as_deref() != Some(topic.as_str())
+                });
+                if !left {
+                    continue; // absent, not departed — keep merging
                 }
                 if let Some(mux) = self.muxes.lock_safe().get_mut(&topic) {
                     let _ = mux.remove_member(&name, epoch);
@@ -575,6 +591,8 @@ impl Node {
             .filter_map(|e| e.file_name().to_str().map(String::from))
             .collect();
         let present: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        let mut topics: Vec<(String, mux::TopicConfig)> = Vec::new();
+        let mut origins: Vec<String> = Vec::new();
         for name in &names {
             if name.starts_with('.') {
                 continue; // .lock and other dotfiles
@@ -591,16 +609,21 @@ impl Node {
             }
             let path = self.config.data_dir.join(name);
             match mux::topic_config(&path) {
-                Ok(Some(cfg)) => {
-                    let _ = self.rehost_topic(name, &cfg);
-                }
-                // A plain origin (or a topic member): re-register it so it's discoverable and
-                // subscribable again (§5.2). `Err`/`Ok(None)` from a non-channel file is ignored.
-                Ok(None) => {
-                    let _ = self.reregister_origin(name);
-                }
+                Ok(Some(cfg)) => topics.push((name.clone(), cfg)),
+                Ok(None) => origins.push(name.clone()),
                 Err(_) => {}
             }
+        }
+        // Re-host topics FIRST: rehost_topic re-registers each *local* member with its
+        // `member_of`, so the origin pass then skips those (already hosted) rather than
+        // re-registering them with `member_of = None` — which would make the detach pass retire a
+        // member that never left.
+        for (name, cfg) in &topics {
+            let _ = self.rehost_topic(name, cfg);
+        }
+        // Then re-register the remaining plain origins (skips anything already hosted).
+        for name in &origins {
+            let _ = self.reregister_origin(name);
         }
     }
 
@@ -640,8 +663,21 @@ impl Node {
         let mux = Mux::open(&path, cfg.region_size, cfg.mtu, MAX_BATCH_PER_MEMBER)?;
         self.muxes.lock_safe().insert(name.to_string(), mux);
         for (member, epoch) in &cfg.members {
-            // Prefer a local origin, fall back to a remote replica; add_member's source open
-            // fails harmlessly if a candidate file isn't present.
+            // A member with a **local origin** is one we own: re-register it with `member_of`
+            // (recovering its geometry via the header accessor) so it's back in the topic's live
+            // set — otherwise the detach pass would drain a member that never left. Then attach
+            // it from the origin. A member with only a **replica** is remote: attach the replica
+            // and let peer anti-entropy restore its `member_of` (it's not ours to register).
+            let origin = self.channel_path(member).ok().filter(|p| p.exists());
+            if let Some(op) = &origin
+                && let Ok(reader) = xchannel::ReaderBuilder::new(op).late_join().build()
+            {
+                let (rs, mtu) = (reader.region_size() as u32, reader.mtu());
+                drop(reader);
+                if let Ok(id) = self.claim_name(member, rs, mtu, Some(name.to_string())) {
+                    let _ = self.announce_hosted(&id, op.clone(), 0, 0);
+                }
+            }
             for cand in [self.channel_path(member), self.replica_path(member)]
                 .into_iter()
                 .flatten()
@@ -748,6 +784,11 @@ impl Node {
             self.dissemination
                 .lock_safe()
                 .announce(std::slice::from_ref(&tombstone))?;
+        }
+        // Delete the topic channel on disk so a later restart's data-dir scan can't re-host this
+        // retired topic (the terminal marker above is best-effort for still-connected subscribers).
+        if let Ok(path) = self.channel_path(topic) {
+            xchannel::cleanup_channel_files(&path);
         }
         Ok(true)
     }
@@ -1600,9 +1641,32 @@ mod tests {
     }
 
     #[test]
-    fn deregister_topic_retires_mux_and_writes_terminal() {
-        use xchannel_net_core::mux::MSG_TYPE_TERMINAL;
+    fn reconstruct_does_not_resurrect_a_deregistered_channel() {
+        let dir = temp_dir("noresurrect");
+        // Session 1: one channel kept, one deregistered (which deletes its files).
+        {
+            let node = Node::new(config(1, dir.clone()));
+            node.create_for_client("md.keep", ChannelOptions::default())
+                .unwrap();
+            node.create_for_client("md.gone", ChannelOptions::default())
+                .unwrap();
+            assert!(node.deregister("md.gone").unwrap());
+        }
+        // Session 2: fresh node (empty registry) on the same data_dir reconstructs from disk.
+        let node2 = Node::new(config(1, dir.clone()));
+        node2.reconstruct_from_disk();
+        assert!(
+            node2.registry.lock_safe().get("md.keep").is_some(),
+            "a live channel is re-registered on restart"
+        );
+        assert!(
+            node2.registry.lock_safe().get("md.gone").is_none(),
+            "a deregistered channel is NOT resurrected (its files were deleted)"
+        );
+    }
 
+    #[test]
+    fn deregister_topic_retires_mux_and_deletes_files() {
         let node = Node::new(config(1, temp_dir("retire")));
         let topic_path = node.create_topic("agg", TopicOptions::default()).unwrap();
         node.publish_to_topic("agg", "mem.a", ChannelOptions::default())
@@ -1615,19 +1679,10 @@ mod tests {
             node.registry.lock_safe().get("agg").is_none(),
             "topic channel tombstoned"
         );
-
-        // The topic channel ends with a terminal marker.
-        let mut r = ReaderBuilder::new(&topic_path)
-            .mode(ReaderMode::LateJoin)
-            .build()
-            .unwrap();
-        let mut terminal = false;
-        while let Some(m) = r.try_read().unwrap() {
-            if m.header().message_type == MSG_TYPE_TERMINAL {
-                terminal = true;
-            }
-        }
-        assert!(terminal, "a terminal marker was committed");
+        // The topic channel is deleted from disk, so a later restart won't resurrect it.
+        // (The terminal marker `finish` writes is best-effort for still-connected subscribers;
+        // Mux::finish's terminal emission is covered by a mux-level test.)
+        assert!(!topic_path.exists(), "retired topic's files are removed");
     }
 
     #[test]
