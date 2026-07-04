@@ -327,28 +327,86 @@ impl Node {
         member: &str,
         options: ChannelOptions,
     ) -> io::Result<PathBuf> {
-        if !self.muxes.lock_safe().contains_key(topic) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("topic '{topic}' is not hosted on this node"),
-            ));
-        }
-        // Tag the member with `member_of` so the topic owner (here, us) discovers it; attach
-        // it directly since it's local. add_member is idempotent, so the discovery loop
-        // (Phase 2) re-finding it is a no-op.
+        // The member is an ordinary channel this node owns, tagged `member_of` so the topic's
+        // owner discovers it. The topic may be owned by *any* node (§3.1): if we host it,
+        // attach immediately; otherwise the owner attaches via `attach_pending_members` once
+        // the `member_of` registration gossips to it. `add_member` is idempotent.
         let member_path = self.create_origin(member, options, Some(topic.to_string()))?;
-        let epoch = self
-            .registry
-            .lock_safe()
-            .get_raw(member)
-            .map(|id| id.epoch)
-            .unwrap_or(0);
-        self.muxes
-            .lock_safe()
-            .get_mut(topic)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "topic vanished"))?
-            .add_member(member, epoch, &member_path)?;
+        if self.muxes.lock_safe().contains_key(topic) {
+            let epoch = self
+                .registry
+                .lock_safe()
+                .get_raw(member)
+                .map(|id| id.epoch)
+                .unwrap_or(0);
+            if let Some(mux) = self.muxes.lock_safe().get_mut(topic) {
+                mux.add_member(member, epoch, &member_path)?;
+            }
+        }
         Ok(member_path)
+    }
+
+    /// Attach any not-yet-attached members of the topics this node hosts, discovered from the
+    /// registry via `member_of` (§4.1). A **local** member is read straight from its origin
+    /// file; a **remote** member is replicated here first (a stream subscription builds a local
+    /// replica) and the mux then reads that replica identically. Idempotent and best-effort:
+    /// a member whose replica isn't ready yet is retried on the next call. Runs on the
+    /// maintenance loop, so it reacts as `member_of` registrations gossip in.
+    pub fn attach_pending_members(&self) {
+        let topics: Vec<String> = self.muxes.lock_safe().keys().cloned().collect();
+        for topic in topics {
+            let members: Vec<ChannelIdentity> = {
+                let reg = self.registry.lock_safe();
+                reg.iter()
+                    .filter(|id| !id.deleted && id.member_of.as_deref() == Some(topic.as_str()))
+                    .cloned()
+                    .collect()
+            };
+            for m in members {
+                let already = self
+                    .muxes
+                    .lock_safe()
+                    .get(&topic)
+                    .is_none_or(|mx| mx.has_member(&m.name, m.epoch));
+                if already {
+                    continue;
+                }
+                // Resolve the path the mux reads: a local origin, or a locally-synced replica
+                // of a remote member (skip until the replica exists — retried next cycle).
+                let path = if m.owner == self.config.node_id {
+                    match self.channel_path(&m.name) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    }
+                } else {
+                    self.ensure_member_subscription(&m.name);
+                    match self.replica_path(&m.name) {
+                        Ok(p) if p.exists() => p,
+                        _ => continue,
+                    }
+                };
+                if let Some(mux) = self.muxes.lock_safe().get_mut(&topic) {
+                    let _ = mux.add_member(&m.name, m.epoch, &path);
+                }
+            }
+        }
+    }
+
+    /// Ensure a self-healing subscription is replicating remote member `name` locally, so its
+    /// replica can feed the mux. Reuses the subscription map (idempotent); a short resolve
+    /// timeout keeps the maintenance loop responsive if the owner isn't reachable yet.
+    fn ensure_member_subscription(&self, name: &str) {
+        let live = self
+            .subscriptions
+            .lock_safe()
+            .get(name)
+            .is_some_and(|s| s.is_active());
+        if live {
+            return;
+        }
+        if let Ok(sub) = self.subscribe(name, Some(Duration::from_millis(200))) {
+            self.subscriptions.lock_safe().insert(name.to_string(), sub);
+        }
     }
 
     /// Merge whatever is ready across every hosted topic. Returns the total records merged.
@@ -515,6 +573,9 @@ impl Node {
                     reg.merge(id);
                 }
             }
+            // React to (possibly just-merged) `member_of` registrations: attach members of any
+            // topic we host, subscribing to remote ones.
+            self.attach_pending_members();
             std::thread::sleep(interval);
         }
     }
@@ -1134,12 +1195,78 @@ mod tests {
         assert_eq!(node.topic_member_count("agg"), Some(2));
         assert!(node.registry.lock_safe().get("mem.a").is_some());
 
-        // Publishing to an unknown topic is rejected (Phase 1: local members only).
-        let err = node
-            .publish_to_topic("nope", "mem.c", ChannelOptions::default())
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        // The rejected member was never created.
-        assert!(node.registry.lock_safe().get("mem.c").is_none());
+        // Publishing to a topic this node doesn't host is allowed (the topic may be remote):
+        // the member is created and tagged `member_of`, for the owner to discover and attach.
+        node.publish_to_topic("remote.topic", "mem.c", ChannelOptions::default())
+            .unwrap();
+        let m = node.registry.lock_safe().get("mem.c").cloned();
+        assert_eq!(
+            m.and_then(|id| id.member_of).as_deref(),
+            Some("remote.topic")
+        );
+        // Not attached to any local mux (we don't host that topic).
+        assert_eq!(node.topic_member_count("remote.topic"), None);
+    }
+
+    #[test]
+    fn remote_member_merges_into_topic_across_two_nodes() {
+        use xchannel_net_core::mux::{Provenance, is_control};
+
+        let (a, _a_stream, a_control) = start(1, "topic-a");
+        let (b, _b_stream, _b_control) = start(2, "topic-b");
+
+        // A hosts the topic and drives its mux.
+        let topic_path = a.create_topic("agg", ChannelOptions::default()).unwrap();
+        {
+            let a = a.clone();
+            std::thread::spawn(move || a.run_mux(Duration::from_millis(2)));
+        }
+
+        // B hosts a member of "agg" (B does not own the topic) and writes to it, dropping the
+        // writer before it's served (single-process test: avoid concurrent writer+reader on
+        // B's origin).
+        let n = 20u64;
+        {
+            let member_path = b
+                .publish_to_topic("agg", "feed.b", ChannelOptions::default())
+                .unwrap();
+            let mut w = WriterBuilder::new(&member_path)
+                .region_size(1 << 20)
+                .build()
+                .unwrap();
+            for i in 0..n {
+                let p = format!("m{i}").into_bytes();
+                let buf = w.try_reserve(p.len()).unwrap();
+                buf.copy_from_slice(&p);
+                w.commit(1, p.len() as u32, i).unwrap();
+            }
+        }
+
+        // Link B → A: A learns feed.b (member_of = agg) via gossip and B's stream address via
+        // heartbeat, then A's maintenance loop subscribes to feed.b and its mux merges it.
+        b.connect_control_peer(a_control).unwrap();
+
+        // A's topic channel eventually holds all n member records, provenance-stamped.
+        let mut bodies = poll_until(|| {
+            let mut r = ReaderBuilder::new(&topic_path)
+                .mode(ReaderMode::LateJoin)
+                .build()
+                .ok()?;
+            let mut got = Vec::new();
+            while let Some(m) = r.try_read().ok()? {
+                if is_control(m.header().message_type) {
+                    continue;
+                }
+                let (prov, body) = Provenance::split(m.payload()).ok()?;
+                got.push((prov.member_index, body.to_vec()));
+            }
+            (got.len() as u64 == n).then_some(got)
+        });
+
+        bodies.sort_by_key(|(idx, _)| *idx);
+        for (i, (idx, body)) in bodies.iter().enumerate() {
+            assert_eq!(*idx, i as u64, "member indices contiguous from 0");
+            assert_eq!(body, format!("m{i}").as_bytes(), "original body preserved");
+        }
     }
 }
