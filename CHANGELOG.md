@@ -4,6 +4,57 @@ All notable changes to xchannel-net are documented here. Versioning is pre-1.0 a
 experimental: the wire protocol and on-disk layout may change without notice (see
 `SECURITY.md`).
 
+## Unreleased
+
+**Topics — multi-producer fan-in** (`doc/TOPICS.md`): a set of single-writer member channels
+merged by a **mux** into one totally-ordered **topic channel** (itself an ordinary xchannel
+channel — locally readable, network-replicable), without violating single-writer discipline.
+
+### Added
+- **Mux engine**: merges member channels into a topic in arrival order, stamping every record
+  with mandatory provenance (`member_ref`, `member_index`, original `user_meta` — 18-byte prefix,
+  option (b)); `max_batch_per_member` fairness; per-topic slot-table control records mapping
+  `member_ref → (name, epoch)`, re-emitted on membership change and periodically so a recent one
+  is always retained.
+- **Topic client API**: `create_topic` / `publish_to_topic` (RPC); `TopicOptions` (channel
+  geometry + `max_batch_per_member` + `member_reap_after`); topics are read via ordinary
+  `subscribe`.
+- **Member lifecycle (§6)**: `TopicGap` on retention underrun / fresh-pruned genesis;
+  `MemberRegressed` on a source that reset under the same identity; clean-leave drain →
+  `MemberClosed`; topic retirement → terminal marker; an opt-in **reaper** (`member_reap_after`)
+  that tombstones a member whose owner has been unreachable too long.
+- **Remote members**: a member on any node feeds a topic hosted elsewhere, discovered via a
+  `member_of` tag on `ChannelIdentity` and replicated to the mux node; re-subscribed on
+  reconnect/restart so stale replicas refresh.
+- **Registry tombstones + reclaim**: the CRDT merge carries an `(epoch, deleted)` generation —
+  deregistration tombstones (a stale `Register` can't resurrect a name), and a reclaim wins at
+  `epoch + 1`. Member incarnation is that epoch.
+- **`RegisterRejected`**: a create that loses a name collision now fails fast (`AlreadyExists`)
+  before any file is created, instead of silently believing it owns the name.
+- **Liveness-gated resolution**: `resolve` distinguishes "owner unreachable" (`HostUnreachable`)
+  from "channel unknown" (`TimedOut`).
+- **True `SubscribeAck.head`**: the source advertises its real high-water index (via
+  `xchannel::Reader::head_record_index()`).
+- **Restart = reconstruct** (`doc/RESTART.md`): a restarted daemon re-hosts its topics from disk
+  (identified by their self-describing slot table, which also carries geometry) and re-registers
+  plain origins (geometry via `Reader::region_size()`/`mtu()`), resuming without a client
+  re-issuing `create_topic`. Deregistration deletes channel files so a restart can't resurrect a
+  retired name.
+- **`XCHANNELD_SEEDS`**: configure seed peers (comma-separated control `host:port`) for the
+  daemon to form/re-form the mesh.
+- **Observability**: `Node::topic_status` — per-member `merged`/`head`/`lag`/`state`/`rejected`,
+  topic head, gaps emitted, slot-table version (§8).
+
+### Changed
+- Bumped `xchannel` **4.0.0 → 4.2.0** (adds `Reader::head_record_index()`, `region_size()`,
+  `mtu()` — generic, topic-agnostic accessors).
+
+### Notes
+- Deliberate deviations from `doc/TOPICS.md`, all documented: the mux runs on its own thread
+  (not §4.1's shared forwarding loop); recovery is correct but scans from genesis (not §5.2's
+  bounded scan); empty topics aren't re-hosted on restart. The network planes remain
+  unauthenticated (trusted-LAN only) — control-plane auth is unchanged Tier-1 work.
+
 ## 0.0.1 (2026-06-22)
 
 First tagged release. A decentralized network of node managers (`xchanneld`) that replicate
