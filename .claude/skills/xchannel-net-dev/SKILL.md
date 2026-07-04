@@ -254,9 +254,19 @@ xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
   different scheduling); the promotion path is therefore unwired.
 - Recovery is correct but scans from genesis — not the bounded §5.2 scan (needs reverse reads).
 - Reconstruct covers **topics + non-topic origins** (the latter recovering geometry via xchannel
-  4.2.0 `Reader::region_size()`/`mtu()`). Not re-hosted: **empty** topics (no slot table). A
-  reconstructed member's `member_of` reconciles via peers; remote members refresh when peers return.
-  Dep is `xchannel = "4.2.0"` (published on crates.io; no patch).
+  4.2.0 `Reader::region_size()`/`mtu()`). Not re-hosted: **empty** topics (no slot table). Dep is
+  `xchannel = "4.2.0"` (published; no patch).
+
+**Council whole-branch review — both blockers fixed:** (1) member records using a reserved control
+`msg_type` are now **rejected** at `merge_one` (never forge a control record into the topic —
+`e7e643f`); (2) restart no longer **resurrects** a deregistered channel (deregister deletes its
+files — `b64336a`) nor **spuriously retires** a re-hosted member (detach only on a positive
+registry signal; rehost re-registers local members with `member_of`). Remote members are
+**re-subscribed on reconnect/restart** so stale replicas refresh (`6351ef7`); `XCHANNELD_SEEDS`
+now configures peering. Test gaps closed: 2-member restart + **2-node remote merge/resume** cross-
+process tests. Added Socrates' ordering-contract paragraph (TOPICS §4.3: topic order is arrival-
+order only — no causal/reproducible/cross-producer meaning; use per-member provenance).
+Follow-up (perf, not correctness): reconstruct double-scans each topic.
 - Mux poll holds the `muxes` lock during IO (§4.3 promotion path is the eventual remedy).
 - Reserved control `msg_type` range is fixed (not per-`TopicOptions` as §4.2 muses).
 - §9 open questions remain open **by design**: hierarchical topics (gated on registry cycle
