@@ -349,8 +349,16 @@ impl Mux {
         if self.has_member(name, epoch) {
             return Ok(());
         }
+        // `member_ref` is a u16 slot index; exhausting it in a single session would wrap and
+        // collide (two live members sharing a ref breaks provenance + recovery). Fail loudly
+        // instead — a restart resets the counter and recovery re-keys on (name, epoch).
         let member_ref = self.next_ref;
-        self.next_ref += 1;
+        self.next_ref = self.next_ref.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "mux member_ref space exhausted (65536 attaches this session) — restart the mux",
+            )
+        })?;
         let (mut source, earliest) = ReplicationSource::open(member_path)?;
         let head = source.head()?.0;
         let recovered = self.recovered.get(&(name.to_string(), epoch)).copied();
