@@ -352,14 +352,28 @@ impl Mux {
         let member_ref = self.next_ref;
         self.next_ref += 1;
         let (mut source, earliest) = ReplicationSource::open(member_path)?;
+        let head = source.head()?.0;
         let recovered = self.recovered.get(&(name.to_string(), epoch)).copied();
 
-        // Where to resume. A previously-merged member resumes at `recovered + 1`; a fresh one
-        // starts at genesis. Either way, if the member has aged records out of retention below
-        // our resume point, we can't extend contiguously.
+        // Where to resume, and whether a hole must be recorded. `want` is the next index we
+        // believe we need: `recovered + 1` on resume, else genesis. We never skip_to past a
+        // hole or past the source head silently (§6.2) — every discontinuity is an attributed
+        // `TopicGap`. `gap = Some((from, resumed_at))`.
         let want = recovered.map(|max| max + 1).unwrap_or(0);
-        let gap = recovered.is_some() && want < earliest.0;
-        let start = want.max(earliest.0);
+        let (start, gap) = if want < earliest.0 {
+            // Records `[want, earliest)` aged out of retention (or, for a fresh member, its
+            // genesis was pruned before we ever saw it: `want = 0 < earliest`). Resume at
+            // `earliest`, attributing the hole.
+            (earliest.0, Some((want, earliest.0)))
+        } else if want > head {
+            // Our cursor is past the source's head: the member reset/respawned under the same
+            // `(name, epoch)` (an upstream §3.2 anti-splice violation). Never skip_to past
+            // `head` — that would hang or strand the new incarnation's records. Resume at
+            // `head` and record the anomaly.
+            (head, Some((want, head)))
+        } else {
+            (want, None)
+        };
 
         source.skip_to(RecordIndex(start))?;
         self.slots.push(Slot {
@@ -370,10 +384,8 @@ impl Mux {
             cursor: start,
         });
         self.emit_slot_table()?;
-        // Retention underrun on resume: records `[want, earliest)` are gone. Record it
-        // explicitly and attributed (§6.2) rather than silently jumping the merge forward.
-        if gap {
-            self.emit_topic_gap(member_ref, want, earliest.0)?;
+        if let Some((from, resumed_at)) = gap {
+            self.emit_topic_gap(member_ref, from, resumed_at)?;
         }
         Ok(())
     }
@@ -528,26 +540,27 @@ impl Mux {
 /// record once every current member is seen) is a later optimization.
 fn recover_cursors(path: &Path) -> io::Result<HashMap<(String, u64), u64>> {
     let mut reader = ReaderBuilder::new(path).late_join().build()?;
-    let mut ref_to_member: HashMap<u16, (String, u64)> = HashMap::new();
-    let mut max_index: HashMap<u16, u64> = HashMap::new();
+    // The ref → (name, epoch) mapping *in force at the current scan position*. `member_ref` is
+    // a per-session counter reset on every `Mux::open`, so the same ref denotes different
+    // members across reopens — we must resolve each record's ref through the slot table active
+    // when that record was written (positional), NOT the latest one. Keying the recovered
+    // cursor on the bare ref (max over the whole log) would conflate incarnations and resume a
+    // member past its own head, silently skipping its committed records.
+    let mut active: HashMap<u16, (String, u64)> = HashMap::new();
+    let mut out: HashMap<(String, u64), u64> = HashMap::new();
     while let Some(m) = reader.try_read()? {
         let mt = m.header().message_type;
         if mt == MSG_TYPE_SLOT_TABLE {
-            // The latest slot table wins the ref → member mapping.
-            ref_to_member = decode_slot_table(m.payload())?
+            active = decode_slot_table(m.payload())?
                 .into_iter()
                 .map(|e| (e.member_ref, (e.name, e.epoch)))
                 .collect();
         } else if !is_control(mt) {
             let (prov, _) = Provenance::split(m.payload())?;
-            let e = max_index.entry(prov.member_ref).or_insert(0);
-            *e = (*e).max(prov.member_index);
-        }
-    }
-    let mut out = HashMap::new();
-    for (member_ref, idx) in max_index {
-        if let Some(member) = ref_to_member.get(&member_ref) {
-            out.insert(member.clone(), idx);
+            if let Some(member) = active.get(&prov.member_ref) {
+                let e = out.entry(member.clone()).or_insert(0);
+                *e = (*e).max(prov.member_index);
+            }
         }
     }
     Ok(out)
@@ -729,6 +742,77 @@ mod tests {
         }
     }
 
+    /// Append `n` records `<tag><i>` (indices continue across calls); drop the writer after.
+    fn append_records(base: &Path, tag: &str, n: u64) {
+        let mut w = WriterBuilder::new(base)
+            .region_size(REGION)
+            .build()
+            .unwrap();
+        for i in 0..n {
+            let p = format!("{tag}{i}").into_bytes();
+            let buf = w.try_reserve(p.len()).unwrap();
+            buf.copy_from_slice(&p);
+            w.commit(1, p.len() as u32, i).unwrap();
+        }
+    }
+
+    /// Two distinct members reuse `member_ref` 0 across reopens (member "a" in session 1, "b"
+    /// in session 2, because `next_ref` resets each open). Recovery must key cursors on
+    /// (name, epoch) positionally — NOT max over the bare ref — or "b" inherits "a"'s far-ahead
+    /// index and silently skips its own committed records. (Council-verified data-loss repro.)
+    #[test]
+    fn recovery_does_not_conflate_two_members_sharing_a_ref() {
+        let dir = temp_dir("refswap");
+        let (topic, a, b) = (dir.join("topic"), dir.join("a"), dir.join("b"));
+
+        // Session 1: "a" (ref 0) merges 100 records (member_index 0..99).
+        append_records(&a, "a", 100);
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            mux.add_member("a", 0, &a).unwrap();
+            assert_eq!(mux.poll().unwrap(), 100);
+        }
+
+        // Session 2: "a" is gone; "b" attaches and (next_ref reset) also gets ref 0, merging
+        // its first 10 records (member_index 0..9).
+        append_records(&b, "b", 10);
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            mux.add_member("b", 0, &b).unwrap();
+            assert_eq!(mux.poll().unwrap(), 10);
+        }
+
+        // "b" produces more (now member_index 0..149).
+        append_records(&b, "b", 140);
+
+        // Session 3: reopen and resume "b". Correct recovery resumes at 10; the bug resumes at
+        // 100 (inheriting "a"'s max under ref 0) and skips b's records 10..99.
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            mux.add_member("b", 0, &b).unwrap();
+            mux.poll().unwrap();
+        }
+
+        // Every one of b's 150 records must appear exactly once, contiguously.
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        let mut b_indices = Vec::new();
+        while let Some(m) = r.try_read().unwrap() {
+            if is_control(m.header().message_type) {
+                continue;
+            }
+            let (prov, body) = Provenance::split(m.payload()).unwrap();
+            if body.starts_with(b"b") {
+                b_indices.push(prov.member_index);
+            }
+        }
+        b_indices.sort_unstable();
+        let expected: Vec<u64> = (0..150).collect();
+        assert_eq!(
+            b_indices, expected,
+            "b must not skip its own committed records"
+        );
+    }
+
     #[test]
     fn remove_member_drains_then_emits_member_closed() {
         let dir = temp_dir("close");
@@ -811,6 +895,40 @@ mod tests {
     }
 
     #[test]
+    fn fresh_member_with_pruned_genesis_records_a_gap() {
+        let dir = temp_dir("freshgap");
+        let (topic, m) = (dir.join("topic"), dir.join("m"));
+        // Write enough with tight retention that genesis prunes away (earliest > 0) before the
+        // mux ever sees the member.
+        write_member_rolling(&m, 6000, (REGION as u64) * 2, 1);
+        let earliest = ReplicationSource::open(&m).unwrap().1.0;
+        assert!(
+            earliest > 0,
+            "genesis should have pruned (earliest={earliest})"
+        );
+
+        let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap(); // fresh topic, no cursor
+        mux.add_member("m", 0, &m).unwrap();
+        assert_eq!(
+            mux.members()[0].2,
+            earliest,
+            "fresh member begins at earliest"
+        );
+        drop(mux);
+
+        // The pruned prefix [0, earliest) is recorded as an attributed gap, not spliced away.
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        let mut gaps = Vec::new();
+        while let Some(m) = r.try_read().unwrap() {
+            if m.header().message_type == MSG_TYPE_TOPIC_GAP {
+                gaps.push(TopicGap::decode(m.payload()).unwrap());
+            }
+        }
+        assert_eq!(gaps.len(), 1);
+        assert_eq!((gaps[0].from, gaps[0].resumed_at), (0, earliest));
+    }
+
+    #[test]
     fn recovers_cursors_after_restart_without_duplication() {
         let dir = temp_dir("recover");
         let (topic, m_a) = (dir.join("topic"), dir.join("a"));
@@ -834,5 +952,99 @@ mod tests {
         let (data, _) = read_topic(&topic);
         let indices: Vec<u64> = data.iter().map(|(_, p, _)| p.member_index).collect();
         assert_eq!(indices, vec![0, 1, 2], "no duplicates, contiguous resume");
+    }
+
+    /// COUNCIL FINDING (do-not-ship): `recover_cursors` conflates records that share a
+    /// reused `member_ref` across mux reopens, silently dropping a member's committed data
+    /// on restart.
+    ///
+    /// Root cause: `member_ref` is a per-session counter reset to 0 on every `Mux::open`
+    /// (`next_ref: 0`), while the topic log persists across reopens. `Provenance` carries no
+    /// epoch, and `recover_cursors` takes `max(member_index)` over the *bare* `member_ref`
+    /// across the whole log (mux.rs:543), then attributes that max via the *latest* slot
+    /// table (mux.rs:536-540). So once ref 0 has denoted two incarnations, the survivor
+    /// inherits the other's max and resumes past its own cursor — records skipped, no
+    /// `TopicGap` (the gap check at mux.rs:361 fires only on retention underrun).
+    ///
+    /// This repro removes ordering nondeterminism entirely: a single member "a" reclaimed at
+    /// a new epoch (the supported tombstone→reclaim lifecycle, §3.2/§6.1) on a fresh log. It
+    /// asserts the CORRECT behavior and therefore FAILS on current HEAD (resumes at 5, not 2).
+    ///
+    /// The fix must key recovery on `(name, epoch)` positionally (track the active slot table
+    /// as the tail is scanned), or make `member_ref` durable across reopens (seed `next_ref`
+    /// above every ref ever written). Note: had epoch2's head been *below* the conflated
+    /// cursor, `add_member` would instead **hang forever** in `skip_to` (`read_blocking(None)`
+    /// past head) — a second, worse manifestation of the same defect.
+    #[test]
+    fn recovery_must_not_conflate_reused_member_ref_across_incarnations() {
+        let dir = temp_dir("conflate");
+        let topic = dir.join("topic");
+        let a1 = dir.join("a-inc1"); // incarnation epoch=1's channel
+        let a2 = dir.join("a-inc2"); // incarnation epoch=2's channel — a fresh log, restarts at index 0
+
+        // Boot 1: member "a"@epoch1 merges indices 0..=4. First attach ⇒ member_ref 0.
+        write_member(
+            &a1,
+            &[
+                (1, 0, b"e1-0"),
+                (1, 1, b"e1-1"),
+                (1, 2, b"e1-2"),
+                (1, 3, b"e1-3"),
+                (1, 4, b"e1-4"),
+            ],
+        );
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+            mux.add_member("a", 1, &a1).unwrap();
+            assert_eq!(mux.poll().unwrap(), 5);
+        }
+
+        // Boot 2: "a" is reclaimed at epoch2 on a fresh log and merges only indices 0,1 so far.
+        // `next_ref` reset to 0 ⇒ epoch2 reuses member_ref 0. The topic now holds ref-0 data
+        // from BOTH incarnations, and the latest slot table maps ref 0 → (a, epoch 2).
+        write_member(&a2, &[(1, 0, b"e2-0"), (1, 1, b"e2-1")]);
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+            mux.add_member("a", 2, &a2).unwrap();
+            assert_eq!(
+                mux.poll().unwrap(),
+                2,
+                "epoch2 merges its first two records"
+            );
+            assert_eq!(
+                mux.members()[0].2,
+                2,
+                "epoch2 cursor is 2 before the restart"
+            );
+        }
+
+        // epoch2 keeps producing while the mux is down: indices 2..=7 (its head becomes 8).
+        write_member(
+            &a2,
+            &[
+                (1, 2, b"e2-2"),
+                (1, 3, b"e2-3"),
+                (1, 4, b"e2-4"),
+                (1, 5, b"e2-5"),
+                (1, 6, b"e2-6"),
+                (1, 7, b"e2-7"),
+            ],
+        );
+
+        // Boot 3: recover "a"@epoch2's cursor. It truly merged through index 1, so it must
+        // resume at 2 and merge 2..=7. The bug: recovery maxes ref-0 across BOTH incarnations
+        // (max = 4, from epoch1) and resumes epoch2 at 5, silently dropping indices 2,3,4.
+        let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+        mux.add_member("a", 2, &a2).unwrap();
+        assert_eq!(
+            mux.members()[0].2,
+            2,
+            "epoch2 must resume at its own cursor (2), not epoch1's conflated max+1 (5)"
+        );
+        assert_eq!(
+            mux.poll().unwrap(),
+            6,
+            "indices 2..=7 must all merge; conflation drops 2,3,4 and merges only 5,6,7"
+        );
     }
 }
