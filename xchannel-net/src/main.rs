@@ -33,13 +33,26 @@ fn main() -> std::io::Result<()> {
         &data_dir.join("client.sock").to_string_lossy(),
     ));
 
+    // Seed peers to exchange registry state with on startup: `XCHANNELD_SEEDS` is a
+    // comma-separated list of control-plane `host:port` addresses. Without it a daemon runs
+    // standalone (no peers) — the maintenance loop re-dials these to (re)form the mesh.
+    let seeds: Vec<SocketAddr> = env_or("XCHANNELD_SEEDS", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse()
+                .expect("XCHANNELD_SEEDS entries must be host:port")
+        })
+        .collect();
+
     let config = NodeConfig {
         node_id: NodeId(node_id),
         data_dir,
         control_addr,
         stream_addr,
         client_path,
-        seeds: vec![],
+        seeds,
     };
     std::fs::create_dir_all(&config.data_dir)?;
     #[cfg(unix)]

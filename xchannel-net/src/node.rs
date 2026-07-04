@@ -423,8 +423,16 @@ impl Node {
                     .collect()
             };
 
-            // Attach any not-yet-attached live member.
             for m in &live {
+                let remote = m.owner != self.config.node_id;
+                // Keep a **remote** member's replica fresh whether or not it's attached yet.
+                // This is essential after a restart: reconstruct may re-attach a member from a
+                // *stale* replica, so we must (re)start its subscription to resume its stream —
+                // idempotent, a no-op if already replicating.
+                if remote {
+                    self.ensure_member_subscription(&m.name);
+                }
+
                 let already = self
                     .muxes
                     .lock_safe()
@@ -433,18 +441,17 @@ impl Node {
                 if already {
                     continue;
                 }
-                // Resolve the path the mux reads: a local origin, or a locally-synced replica
-                // of a remote member (skip until the replica exists — retried next cycle).
-                let path = if m.owner == self.config.node_id {
-                    match self.channel_path(&m.name) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    }
-                } else {
-                    self.ensure_member_subscription(&m.name);
+                // Resolve the path the mux reads: a local origin, or the remote member's
+                // locally-synced replica (skip until it exists — retried next cycle).
+                let path = if remote {
                     match self.replica_path(&m.name) {
                         Ok(p) if p.exists() => p,
                         _ => continue,
+                    }
+                } else {
+                    match self.channel_path(&m.name) {
+                        Ok(p) => p,
+                        Err(_) => continue,
                     }
                 };
                 if let Some(mux) = self.muxes.lock_safe().get_mut(&topic) {
