@@ -32,23 +32,54 @@ pub struct ChannelIdentity {
     // --- registration tiebreak (deterministic first-registrant-wins) ---
     /// Wall-clock registration time at the owner, used as the primary tiebreak key.
     pub registered_at_nanos: u64,
+
+    // --- tombstone / reclaim generation (see `resolve_collision`) ---
+    /// Reclaim generation. A first registration of a never-used name is `0`; reclaiming a
+    /// *tombstoned* name uses `prev.epoch + 1`. Higher epoch always wins the merge, so a
+    /// fresh owner can take over a deregistered name while a stale in-flight registration
+    /// of the old generation cannot resurrect it.
+    pub epoch: u64,
+    /// Tombstone flag. A `deleted` entry is retained in the registry map (so it keeps
+    /// beating stale re-registrations of its generation) but hidden from
+    /// [`Registry::get`](crate) — a deregistered name reads as absent.
+    pub deleted: bool,
 }
 
 impl ChannelIdentity {
-    /// Deterministic total order used to resolve a name collision between two
-    /// concurrent registrations. Every node computes the same winner without
-    /// coordination: earliest registration wins; `NodeId` breaks exact ties.
+    /// Deterministic total order resolving which entry occupies a name, computed identically
+    /// on every node with no coordination. Winner = the maximum under this lexicographic key:
     ///
-    /// Returns the registration that *wins* the name.
+    /// 1. **higher `epoch` wins** — a reclaim (new generation) supersedes any older
+    ///    generation, tombstone or not;
+    /// 2. within an epoch, **a tombstone (`deleted`) beats a live registration** — delete is
+    ///    terminal for its generation, so a stale `Register` of that generation can't revive it;
+    /// 3. within an epoch, between two same-liveness entries, **earliest `registered_at_nanos`
+    ///    wins, then lowest `NodeId`** — the original first-registrant-wins tiebreak.
+    ///
+    /// Being a total order makes the merge commutative, associative, and idempotent, so the
+    /// registry converges regardless of delta order or duplication.
     pub fn resolve_collision<'a>(
         a: &'a ChannelIdentity,
         b: &'a ChannelIdentity,
     ) -> &'a ChannelIdentity {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        match a.epoch.cmp(&b.epoch) {
+            Greater => return a,
+            Less => return b,
+            Equal => {}
+        }
+        // Same generation: a tombstone dominates a live entry.
+        match (a.deleted, b.deleted) {
+            (true, false) => return a,
+            (false, true) => return b,
+            _ => {}
+        }
+        // Same generation and liveness: earliest registration, then lowest NodeId.
         match a.registered_at_nanos.cmp(&b.registered_at_nanos) {
-            std::cmp::Ordering::Less => a,
-            std::cmp::Ordering::Greater => b,
-            std::cmp::Ordering::Equal if a.owner <= b.owner => a,
-            std::cmp::Ordering::Equal => b,
+            Less => a,
+            Greater => b,
+            Equal if a.owner <= b.owner => a,
+            Equal => b,
         }
     }
 }

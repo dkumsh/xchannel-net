@@ -223,6 +223,8 @@ mod tests {
             mtu: 0,
             earliest_index: RecordIndex(0),
             registered_at_nanos: 1,
+            epoch: 0,
+            deleted: false,
         }
     }
 

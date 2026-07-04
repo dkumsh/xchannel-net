@@ -43,6 +43,16 @@ owner to read-only replicas on subscribing nodes.
 - **Liveness-gated resolution** — `resolve` requires the owner to be a live member (recent
   heartbeat), so it reports "known but owner unreachable" (`HostUnreachable`) distinctly from
   "channel unknown" (`TimedOut`), never handing back a stale address (§5.4).
+- **Registry tombstones + reclaim (§5.4)** — the CRDT merge carries `(epoch, deleted)`: a
+  tombstone dominates its generation (a stale `Register` can't resurrect a deregistered name)
+  and a reclaim at `epoch + 1` lets a new owner retake the name. Tombstones are hidden from
+  `get` but retained and propagated by anti-entropy. `Node::deregister` tombstones + announces;
+  convergence is covered by a permutation test. *Remaining: a client-facing `Deregister` RPC.*
+- **Lost-collision detection (`RegisterRejected`)** — `claim_name` reserves the name before
+  creating any file and fails with `AlreadyExists` if an earlier registration owns it, so the
+  client is told rather than silently believing it owns the name (§"Name collisions").
+  *Remaining: notifying a client whose ownership is lost to a cross-node race only after it has
+  already been served a `Writer`.*
 
 **Partial / known limitations:**
 
@@ -64,12 +74,6 @@ owner to read-only replicas on subscribing nodes.
 - **Restart = reconstruct (§5.2)** — there is no data-dir scan / re-register on startup. A
   restarted daemon does **not** automatically re-register hosted channels or re-attach
   replicas; recovery currently depends on clients reconnecting and re-declaring.
-- **Registry tombstones / `Deregister` (§5.4)** — `Deregister` is a wire/codec shape only;
-  the merge has no deleted-flag, so a name once registered cannot be removed and a stale
-  `Register` cannot be tombstoned.
-- **`RegisterRejected` collision notification** — wire/codec shape only; `register_origin`
-  does not detect a lost collision or notify the client, so a losing registrant silently
-  believes it owns the name (see §"Name collisions").
 - **Stream multiplexing (§6)** — `StreamId` is hardcoded to `0`; one connection carries one
   subscription. The multiplexing described in §6 is not built.
 - **Authentication / authorization / encryption (§8)** — none. All three planes are
@@ -370,9 +374,12 @@ then resumes forwarding from its remembered `RecordIndex`. No special support ne
 
 ### 5.4 Refinements this surfaces (track in §8)
 
-- **Registry needs tombstones.** A plain LWW map can't express "permanently deregistered";
-  an old `Register` could resurrect a deleted name. Deregistration must be a tombstone
-  (deleted-flag + timestamp) inside the same merge.
+- **Registry tombstones — implemented (§0).** A plain LWW map can't express "permanently
+  deregistered"; an old `Register` could resurrect a deleted name. Deregistration is a
+  tombstone inside the same merge, keyed by a `(epoch, deleted)` generation: a tombstone
+  dominates its generation and a reclaim wins at `epoch + 1`. (Kept here for the rationale;
+  a simple `deleted` + monotone timestamp is insufficient because registration is
+  *first*-registrant-wins, so reclaim needs the epoch bump — see `resolve_collision`.)
 - **Registry liveness vs membership.** CRDT entries have no TTL. A channel whose owner node
   is not currently a live member is *listed-but-unreachable*; discovery should surface
   "known, owner unreachable" distinctly from "known and live."
