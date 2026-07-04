@@ -115,6 +115,9 @@ fn main() -> std::io::Result<()> {
             let _ = node.run_maintenance(std::time::Duration::from_millis(500));
         });
     }
+    // Restart = reconstruct (DESIGN.md §5.2, doc/RESTART.md): re-host topics found on disk so a
+    // restarted daemon resumes merging without waiting for a client to re-issue create_topic.
+    node.reconstruct_from_disk();
     {
         // Drive topic muxes: merge member channels into their topic channels (doc/TOPICS.md).
         let node = node.clone();

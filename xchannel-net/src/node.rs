@@ -31,7 +31,7 @@ use xchannel_net_core::RecordIndex;
 use xchannel_net_core::codec::{decode_client_request, encode_client_reply};
 use xchannel_net_core::dissemination::Dissemination;
 use xchannel_net_core::identity::ChannelIdentity;
-use xchannel_net_core::mux::Mux;
+use xchannel_net_core::mux::{self, Mux};
 use xchannel_net_core::stream::{self, ChannelSource, accept_subscription};
 use xchannel_net_core::transport::{
     Listener, TcpListener, TcpTransport, Transport, UnixListener, UnixTransport,
@@ -556,6 +556,78 @@ impl Node {
     /// Number of members currently attached to a hosted topic's mux (for tests/observability).
     pub fn topic_member_count(&self, topic: &str) -> Option<usize> {
         self.muxes.lock_safe().get(topic).map(|m| m.members().len())
+    }
+
+    /// Restart reconstruction (`DESIGN.md` §5.2, `doc/RESTART.md`): scan `data_dir`, re-host every
+    /// topic found on disk, and re-attach its members — with no persisted marker. A topic is
+    /// identified by content (a decodable slot table, via `mux::topic_config`) and its geometry +
+    /// membership come from that self-describing slot table. Call once at startup. Best-effort:
+    /// a channel that fails to re-host is skipped (a client re-issuing `create_topic` recovers it).
+    pub fn reconstruct_from_disk(&self) {
+        let Ok(rd) = std::fs::read_dir(&self.config.data_dir) else {
+            return;
+        };
+        let names: Vec<String> = rd
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect();
+        let present: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        for name in &names {
+            if name.starts_with('.') {
+                continue; // .lock and other dotfiles
+            }
+            // Skip a rolled segment "<base>.<n>" whose base channel is also present.
+            if let Some((base, suffix)) = name.rsplit_once('.')
+                && suffix.parse::<u64>().is_ok()
+                && present.contains(base)
+            {
+                continue;
+            }
+            if validate_channel_name(name).is_err() {
+                continue;
+            }
+            let path = self.config.data_dir.join(name);
+            if let Ok(Some(cfg)) = mux::topic_config(&path) {
+                let _ = self.rehost_topic(name, &cfg);
+            }
+        }
+    }
+
+    /// Re-host one topic from disk (helper for [`reconstruct_from_disk`]): re-register the topic
+    /// channel we own, reopen its mux (which recovers per-member cursors from the tail), and
+    /// re-attach the members named in its last slot table — a local member by its origin file, a
+    /// remote member by its on-disk replica (refreshed later when its owner is reachable and the
+    /// discovery loop re-subscribes). Members are not re-registered here (that is general origin
+    /// reconstruction, §5.2); the mux reads their files directly.
+    fn rehost_topic(&self, name: &str, cfg: &mux::TopicConfig) -> io::Result<()> {
+        if self.muxes.lock_safe().contains_key(name) {
+            return Ok(());
+        }
+        let path = self.channel_path(name)?;
+        let identity = self.claim_name(name, cfg.region_size, cfg.mtu, None)?;
+        self.announce_hosted(&identity, path.clone(), 0, 0)?;
+        let mux = Mux::open(&path, cfg.region_size, cfg.mtu, MAX_BATCH_PER_MEMBER)?;
+        self.muxes.lock_safe().insert(name.to_string(), mux);
+        for (member, epoch) in &cfg.members {
+            // Prefer a local origin, fall back to a remote replica; add_member's source open
+            // fails harmlessly if a candidate file isn't present.
+            for cand in [self.channel_path(member), self.replica_path(member)]
+                .into_iter()
+                .flatten()
+            {
+                let attached = self
+                    .muxes
+                    .lock_safe()
+                    .get_mut(name)
+                    .map(|mx| mx.add_member(member, *epoch, &cand).is_ok())
+                    .unwrap_or(false);
+                if attached {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Observability snapshot for a hosted topic (§8): the mux's merge health augmented with
