@@ -207,9 +207,20 @@ Simplifications to revisit in Phase 2: mux poll holds the muxes lock during IO; 
 local (topic must be hosted on the same node); a topic tombstone doesn't stop a running mux; no
 `TopicGap`/drain/reaper yet; recovery scans from genesis (not the bounded last-slot-table scan).
 
-**Next: Phase 2 (remote members)** — mux subscribes to remote members via the stream plane;
-`member_of` in the registry for cross-node discovery; `TopicGap` on retention underrun; member
-drain/quiesce + the reaper that bridges crash→reclaim (§6).
+**Phase 2 core (remote members) — landed.** A member on any node feeds a topic hosted on
+another: `member_of` rides `ChannelIdentity` (`3492da1`), and the topic owner's maintenance
+loop (`attach_pending_members`) discovers members and attaches them — local ones by origin
+file, remote ones by subscribing (a replica the mux reads, concurrent R+W across daemon
+threads, which xchannel supports) (`4f2643e`). `publish_to_topic` no longer requires the topic
+to be local. Proven by a two-node test (member on B → topic on A). `add_member` is idempotent
+so publish-time and discovery-time attach don't collide.
+
+**Phase 2 remaining (§6 lifecycle) — not yet:** `TopicGap` control record on member retention
+underrun (silent splicing is prohibited by design); clean-leave **drain** → `MemberClosed`;
+the **reaper** (`member_reap_after`) that tombstones a dead member's owner so its incarnation
+can be reclaimed; stopping a mux when its topic is tombstoned. Also still open from Phase 1:
+mux poll holds the muxes lock during IO; recovery scans from genesis (not the bounded
+last-slot-table scan). These are refinements on a working fan-in core.
 
 ## Security
 
