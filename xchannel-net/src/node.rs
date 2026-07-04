@@ -129,6 +129,8 @@ pub struct MemberInfo {
     pub merged: u64,
     pub head: u64,
     pub lag: u64,
+    /// Records dropped for using a reserved control `msg_type` (contract violations).
+    pub rejected: u64,
     pub state: MemberState,
 }
 
@@ -694,6 +696,7 @@ impl Node {
                         merged: m.merged,
                         head: m.head,
                         lag: m.lag,
+                        rejected: m.rejected,
                         state,
                     }
                 })
