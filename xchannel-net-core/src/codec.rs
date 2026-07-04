@@ -154,6 +154,8 @@ fn put_identity(w: &mut W, id: &ChannelIdentity) {
     w.u32(id.mtu);
     w.u64(id.earliest_index.0);
     w.u64(id.registered_at_nanos);
+    w.u64(id.epoch);
+    w.u8(id.deleted as u8);
 }
 
 fn get_identity(r: &mut R) -> io::Result<ChannelIdentity> {
@@ -164,6 +166,8 @@ fn get_identity(r: &mut R) -> io::Result<ChannelIdentity> {
         mtu: r.u32()?,
         earliest_index: RecordIndex(r.u64()?),
         registered_at_nanos: r.u64()?,
+        epoch: r.u64()?,
+        deleted: r.u8()? != 0,
     })
 }
 
@@ -482,6 +486,8 @@ mod tests {
             mtu: 0,
             earliest_index: RecordIndex(7),
             registered_at_nanos: 123_456_789,
+            epoch: 3,
+            deleted: false,
         }
     }
 

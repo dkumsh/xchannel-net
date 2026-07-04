@@ -209,6 +209,10 @@ impl Node {
     /// — that requires server-push notification the client RPC does not yet have (tracked as
     /// remaining work).
     fn claim_name(&self, name: &str, region_size: u32, mtu: u32) -> io::Result<ChannelIdentity> {
+        // Choose epoch and merge under one lock so the reclaim generation can't shift between
+        // reading it and registering. A tombstoned name is reclaimed at the next generation;
+        // a live name is contested in its own generation (and lost if we're not the earliest).
+        let mut reg = self.registry.lock_safe();
         let identity = ChannelIdentity {
             name: name.to_string(),
             owner: self.config.node_id,
@@ -216,9 +220,12 @@ impl Node {
             mtu,
             earliest_index: RecordIndex(0),
             registered_at_nanos: now_nanos(),
+            epoch: reg.claim_epoch(name),
+            deleted: false,
         };
-        let winner = self.registry.lock_safe().merge(identity.clone());
-        if winner.owner != self.config.node_id {
+        let winner = reg.merge(identity.clone());
+        drop(reg);
+        if winner.owner != self.config.node_id || winner.deleted {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
@@ -228,6 +235,24 @@ impl Node {
             ));
         }
         Ok(identity)
+    }
+
+    /// Deregister a channel this node owns: tombstone it in the registry, stop hosting it, and
+    /// disseminate the tombstone so peers hide it too (and a stale `Register` can't resurrect
+    /// it). Returns whether a live channel owned by this node was found to deregister.
+    pub fn deregister(&self, name: &str) -> io::Result<bool> {
+        let tombstone = self
+            .registry
+            .lock_safe()
+            .deregister(name, self.config.node_id);
+        let Some(tombstone) = tombstone else {
+            return Ok(false);
+        };
+        self.hosted.lock_safe().remove(name);
+        self.dissemination
+            .lock_safe()
+            .announce(std::slice::from_ref(&tombstone))?;
+        Ok(true)
     }
 
     /// Announce a freshly-claimed origin to peers and record it in the hosted map (so
@@ -920,6 +945,8 @@ mod tests {
             mtu: 0,
             earliest_index: RecordIndex(0),
             registered_at_nanos: 1, // earlier than any now_nanos()
+            epoch: 0,
+            deleted: false,
         });
 
         let err = node
@@ -955,6 +982,8 @@ mod tests {
             mtu: 0,
             earliest_index: RecordIndex(0),
             registered_at_nanos: 1,
+            epoch: 0,
+            deleted: false,
         });
         let unreachable = node.resolve("md.aapl", short).unwrap_err();
         assert_eq!(

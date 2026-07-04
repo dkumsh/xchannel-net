@@ -190,8 +190,10 @@ planes, signed `ChannelIdentity` (don't trust `registered_at_nanos`/`owner`), au
 1. **Auto-spawn hardening** — `connect_or_spawn` resolves an absolute path (no `PATH`), but
    doesn't `setsid`/daemonize; its exact wrapper isn't automated-tested (the cross-process
    test spawns the daemon directly).
-2. **Deregistration / tombstones** (§8) — `Deregister` is on the wire but unhandled; an old
-   `Register` can resurrect a removed name.
+2. **Client `Deregister` RPC** — tombstones + `Node::deregister` exist (registry merge carries
+   `(epoch, deleted)`, reclaim at `epoch+1`), but there is no `ClientRequest::Deregister` to
+   invoke it from a client, and an incoming tombstone doesn't proactively stop a live local
+   subscription (it fails to re-resolve on next reconnect).
 3. **Membership pruning** — `Membership::forget_stale` exists but nothing calls it; the
    maintenance loop could prune dead peers.
 4. **Observability / graceful shutdown** — daemon loops swallow errors (`let _ =`); no
@@ -201,9 +203,9 @@ planes, signed `ChannelIdentity` (don't trust `registered_at_nanos`/`owner`), au
 
 Serialization codec; peer discovery (seed list vs config); backpressure/retention
 coupling and `Gap` handling; security/auth of connections; multiple replicas of one
-channel on a node + stream dedup; **registry tombstones** (deregister as deleted-flag +
-timestamp in the merge); **registry liveness vs membership** ("known, owner unreachable"
-vs "known and live").
+channel on a node + stream dedup. (Resolved: **registry tombstones** now use an
+`(epoch, deleted)` generation in the merge; **registry liveness vs membership** — `resolve`
+now gates on owner liveness, `HostUnreachable` vs `TimedOut`.)
 
 ---
 **Maintenance note for the assistant:** keep this skill current as the project evolves —
