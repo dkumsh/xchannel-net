@@ -239,11 +239,22 @@ that scan position** and keying the cursor on the resulting `(name, epoch)`. Als
 a resume that overshoots the source head (never `skip_to` past head). Failing repro landed first,
 then the fix.
 
+**Restart = reconstruct** (`doc/RESTART.md`): a restarted daemon **re-hosts its topics from disk**
+(`Node::reconstruct_from_disk` at startup) with no persisted marker — a topic is content-sniffed
+via its slot table (`mux::topic_config`), which now also **carries the topic's geometry**
+(`region_size`/`mtu`) so the writer can reopen; members are re-attached from that slot table
+(local origin / remote replica). Slot tables are **re-emitted every `SLOT_TABLE_REFRESH` records**
+so a recent one is always retained (roll/prune safe; also honors §6.3's late-consumer-decode
+promise). Proven by a cross-process daemon-restart test. Chose option (a) content-sniff over (b) an
+xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
+
 **Honest remainders / known deviations:**
 - **§4.1 execution model:** the mux runs on its **own thread** (`run_mux`, poll+sleep), not as
   poll-items in the daemon's shared forwarding loop as §4.1 specifies (same engine/invariants,
   different scheduling); the promotion path is therefore unwired.
 - Recovery is correct but scans from genesis — not the bounded §5.2 scan (needs reverse reads).
+- Reconstruct covers **topics**; general origin re-registration for non-topic channels, and
+  **empty** topics (no slot table), are not re-hosted. Remote members refresh when peers return.
 - Mux poll holds the `muxes` lock during IO (§4.3 promotion path is the eventual remedy).
 - Reserved control `msg_type` range is fixed (not per-`TopicOptions` as §4.2 muses).
 - §9 open questions remain open **by design**: hierarchical topics (gated on registry cycle

@@ -64,7 +64,11 @@ every hole in the LWW map in production.
 > incarnations across reopens); local + remote members via `member_of` discovery; `TopicGap` on
 > retention underrun / fresh-pruned-genesis / resume-overshoot (§6.2, never a silent splice);
 > clean-leave drain → `MemberClosed` (§6.1); topic retirement + terminal marker (§4.1);
-> `TopicOptions` + reaper (§6.1); status/observability (§8).
+> `TopicOptions` + reaper (§6.1); status/observability (§8); and **restart = reconstruct** — a
+> restarted daemon re-hosts its topics from disk (content-sniff via the self-describing slot
+> table, which also carries the topic's geometry; `doc/RESTART.md`) and resumes merging without a
+> client re-issuing `create_topic` (cross-process restart test). Slot tables are re-emitted
+> periodically so a recent one is always retained (roll/prune safe; also honors §6.3).
 >
 > **Known deviations / not-yet (honest):**
 > - **Execution model (§4.1):** the mux runs on its **own thread** (`Node::run_mux`, a poll+sleep
@@ -73,6 +77,10 @@ every hole in the LWW map in production.
 >   (shared-loop → thread → process) is therefore not wired.
 > - **Recovery cost (§5.2):** correct, but scans from genesis rather than the bounded
 >   last-slot-table scan (a correct bound needs reverse reads, an xchannel feature).
+> - **Reconstruct scope:** topics re-host on restart; general **origin re-registration** for
+>   *non-topic* channels is still the broader §5.2 item. **Empty** topics (no member ever ⇒ no
+>   slot table) aren't re-hosted (a reconnecting client re-creates them); remote members resume
+>   from their on-disk replica and refresh when their owner is reachable again.
 > - Mux poll holds the `muxes` lock across IO; reserved `msg_type` range is fixed (not
 >   per-`TopicOptions`); `deregister_topic`/`topic_status` are Node APIs (no client RPC yet).
 > - The §9 open questions remain open **by design**.
