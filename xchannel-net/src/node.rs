@@ -97,6 +97,19 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
+/// Map a create-style result (which yields a local path the client opens) into a
+/// [`ClientReply`]: the path on success, the error message otherwise.
+fn created_or_error(r: io::Result<PathBuf>) -> ClientReply {
+    match r {
+        Ok(path) => ClientReply::Created {
+            path: path.to_string_lossy().into_owned(),
+        },
+        Err(e) => ClientReply::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
 #[derive(Clone)]
 pub struct Node {
     config: Arc<NodeConfig>,
@@ -552,15 +565,9 @@ impl Node {
 
     fn handle_request(&self, req: ClientRequest) -> ClientReply {
         match req {
-            ClientRequest::Create { name, options } => match self.create_for_client(&name, options)
-            {
-                Ok(path) => ClientReply::Created {
-                    path: path.to_string_lossy().into_owned(),
-                },
-                Err(e) => ClientReply::Error {
-                    message: e.to_string(),
-                },
-            },
+            ClientRequest::Create { name, options } => {
+                created_or_error(self.create_for_client(&name, options))
+            }
             ClientRequest::Subscribe { name, wait_ms } => {
                 // Idempotent: reuse a live subscription for this channel.
                 if let Some(existing) = self.subscriptions.lock_safe().get(&name)
@@ -582,6 +589,14 @@ impl Node {
                     },
                 }
             }
+            ClientRequest::CreateTopic { name, options } => {
+                created_or_error(self.create_topic(&name, options))
+            }
+            ClientRequest::PublishToTopic {
+                topic,
+                member,
+                options,
+            } => created_or_error(self.publish_to_topic(&topic, &member, options)),
         }
     }
 

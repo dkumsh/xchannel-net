@@ -381,6 +381,8 @@ pub fn decode_stream(bytes: &[u8]) -> io::Result<StreamMsg> {
 mod client_req_tag {
     pub const CREATE: u8 = 0;
     pub const SUBSCRIBE: u8 = 1;
+    pub const CREATE_TOPIC: u8 = 2;
+    pub const PUBLISH_TO_TOPIC: u8 = 3;
 }
 
 mod client_reply_tag {
@@ -419,6 +421,21 @@ pub fn encode_client_request(m: &ClientRequest) -> Vec<u8> {
             w.str(name);
             w.u64(*wait_ms);
         }
+        ClientRequest::CreateTopic { name, options } => {
+            w.u8(client_req_tag::CREATE_TOPIC);
+            w.str(name);
+            put_options(&mut w, options);
+        }
+        ClientRequest::PublishToTopic {
+            topic,
+            member,
+            options,
+        } => {
+            w.u8(client_req_tag::PUBLISH_TO_TOPIC);
+            w.str(topic);
+            w.str(member);
+            put_options(&mut w, options);
+        }
     }
     buf
 }
@@ -433,6 +450,15 @@ pub fn decode_client_request(bytes: &[u8]) -> io::Result<ClientRequest> {
         client_req_tag::SUBSCRIBE => ClientRequest::Subscribe {
             name: r.str()?,
             wait_ms: r.u64()?,
+        },
+        client_req_tag::CREATE_TOPIC => ClientRequest::CreateTopic {
+            name: r.str()?,
+            options: get_options(&mut r)?,
+        },
+        client_req_tag::PUBLISH_TO_TOPIC => ClientRequest::PublishToTopic {
+            topic: r.str()?,
+            member: r.str()?,
+            options: get_options(&mut r)?,
         },
         _ => return Err(invalid("unknown ClientRequest tag")),
     };
