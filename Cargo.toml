@@ -23,9 +23,3 @@ xchannel = { version = "4.2.0" }
 # Internal crates referencing each other. `version` is required for crates.io publishing
 # (the registry rejects a bare path dep); the `path` still wins for local/workspace builds.
 xchannel-net-core = { path = "xchannel-net-core", version = "0.0.1" }
-
-# DEV ONLY: xchannel 4.2.0 is not yet published to crates.io — source it from the sibling repo
-# so restart origin re-registration can use the geometry accessors. Remove this patch (and
-# confirm `xchannel = "4.2.0"` resolves from the registry) before publishing/releasing.
-[patch.crates-io]
-xchannel = { path = "../xchannel" }

@@ -20,6 +20,8 @@ dependencies = [
 [[package]]
 name = "xchannel"
 version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e19fdf67622cc412c4e2344f4fe024a3aa405d2cb24ec0de5236f078a88f55d6"
 dependencies = [
  "libc",
  "memmap2",
