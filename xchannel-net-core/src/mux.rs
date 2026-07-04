@@ -137,6 +137,40 @@ impl TopicGap {
     }
 }
 
+/// Body of a [`MSG_TYPE_MEMBER_CLOSED`] control record: member `member_ref` left cleanly and
+/// was drained to `final_index` (its head at close), then its slot was closed (§6.1). The
+/// `member_ref`/incarnation is never reused, so a later record for it can't be confused with a
+/// respawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemberClosed {
+    pub member_ref: u16,
+    pub final_index: u64,
+}
+
+impl MemberClosed {
+    /// Serialize to the 10-byte control-record payload (`u16 member_ref, u64 final_index`).
+    pub fn to_payload(&self) -> [u8; 10] {
+        let mut b = [0u8; 10];
+        b[0..2].copy_from_slice(&self.member_ref.to_le_bytes());
+        b[2..10].copy_from_slice(&self.final_index.to_le_bytes());
+        b
+    }
+
+    /// Parse a `MemberClosed` control-record payload.
+    pub fn decode(b: &[u8]) -> io::Result<MemberClosed> {
+        if b.len() < 10 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MemberClosed record too short",
+            ));
+        }
+        Ok(MemberClosed {
+            member_ref: u16::from_le_bytes(b[0..2].try_into().unwrap()),
+            final_index: u64::from_le_bytes(b[2..10].try_into().unwrap()),
+        })
+    }
+}
+
 /// One slot-table entry: which `(name, epoch)` a `member_ref` denotes. `epoch` is the
 /// member channel's registry generation — the incarnation, so a respawned producer (new
 /// epoch) is a distinct slot and never spliced onto the old one (TOPICS §3.2, decision:
@@ -300,23 +334,68 @@ impl Mux {
         let mut merged = 0;
         for i in 0..self.slots.len() {
             for _ in 0..max_batch {
-                let Some(frame) = self.slots[i].source.try_next_frame()? else {
+                if self.merge_one(i)? {
+                    merged += 1;
+                } else {
                     break;
-                };
-                let prov = Provenance {
-                    member_ref: self.slots[i].member_ref,
-                    member_index: frame.index.0,
-                    orig_user_meta: frame.user_meta,
-                };
-                let payload = frame_data(prov, &frame.payload);
-                let buf = self.topic.try_reserve(payload.len())?;
-                buf.copy_from_slice(&payload);
-                self.topic.commit(frame.msg_type, payload.len() as u32, 0)?;
-                self.slots[i].cursor = frame.index.0 + 1;
-                merged += 1;
+                }
             }
         }
         Ok(merged)
+    }
+
+    /// Merge the next ready record from slot `i` into the topic with provenance. Returns
+    /// whether a record was merged (`false` = the member is currently caught up).
+    fn merge_one(&mut self, i: usize) -> io::Result<bool> {
+        let Some(frame) = self.slots[i].source.try_next_frame()? else {
+            return Ok(false);
+        };
+        let prov = Provenance {
+            member_ref: self.slots[i].member_ref,
+            member_index: frame.index.0,
+            orig_user_meta: frame.user_meta,
+        };
+        let payload = frame_data(prov, &frame.payload);
+        let buf = self.topic.try_reserve(payload.len())?;
+        buf.copy_from_slice(&payload);
+        self.topic.commit(frame.msg_type, payload.len() as u32, 0)?;
+        self.slots[i].cursor = frame.index.0 + 1;
+        Ok(true)
+    }
+
+    /// Clean leave (§6.1): drain member `(name, epoch)` to its current head, commit a
+    /// [`MemberClosed`] marker with that final index, close the slot, and re-emit the slot
+    /// table. Returns whether the member was attached. The `member_ref` is retired, never
+    /// reused — a stale record for it can't be mistaken for a respawn (incarnation rule).
+    pub fn remove_member(&mut self, name: &str, epoch: u64) -> io::Result<bool> {
+        let Some(pos) = self
+            .slots
+            .iter()
+            .position(|s| s.name == name && s.epoch == epoch)
+        else {
+            return Ok(false);
+        };
+        while self.merge_one(pos)? {} // drain to head
+        let member_ref = self.slots[pos].member_ref;
+        let final_index = self.slots[pos].cursor;
+        self.emit_member_closed(member_ref, final_index)?;
+        self.slots.remove(pos);
+        self.emit_slot_table()?;
+        Ok(true)
+    }
+
+    /// Commit a [`MemberClosed`] control record.
+    fn emit_member_closed(&mut self, member_ref: u16, final_index: u64) -> io::Result<()> {
+        let payload = MemberClosed {
+            member_ref,
+            final_index,
+        }
+        .to_payload();
+        let buf = self.topic.try_reserve(payload.len())?;
+        buf.copy_from_slice(&payload);
+        self.topic
+            .commit(MSG_TYPE_MEMBER_CLOSED, payload.len() as u32, 0)?;
+        Ok(())
     }
 
     /// Whether a member with this `(name, epoch)` is already attached.
@@ -576,6 +655,40 @@ mod tests {
             buf.copy_from_slice(&payload);
             w.commit(1, payload.len() as u32, i).unwrap();
         }
+    }
+
+    #[test]
+    fn remove_member_drains_then_emits_member_closed() {
+        let dir = temp_dir("close");
+        let (topic, member) = (dir.join("topic"), dir.join("m"));
+        write_member(&member, &[(1, 0, b"m0"), (1, 1, b"m1"), (1, 2, b"m2")]);
+
+        let mut mux = Mux::open(&topic, REGION_U32, 0, 1).unwrap();
+        mux.add_member("m", 0, &member).unwrap();
+        // Merge only one (bounded batch = 1), leaving records behind.
+        assert_eq!(mux.poll().unwrap(), 1);
+
+        // Clean leave drains the rest (indices 1,2), then closes the slot.
+        assert!(mux.remove_member("m", 0).unwrap());
+        assert!(mux.members().is_empty());
+        drop(mux);
+
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        let mut data = 0;
+        let mut closed = None;
+        while let Some(m) = r.try_read().unwrap() {
+            match m.header().message_type {
+                MSG_TYPE_MEMBER_CLOSED => closed = Some(MemberClosed::decode(m.payload()).unwrap()),
+                mt if !is_control(mt) => data += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            data, 3,
+            "all three records were merged (one polled, two drained)"
+        );
+        let closed = closed.expect("a MemberClosed marker");
+        assert_eq!(closed.final_index, 3, "drained to head (next index = 3)");
     }
 
     #[test]

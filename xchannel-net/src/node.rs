@@ -355,14 +355,17 @@ impl Node {
     pub fn attach_pending_members(&self) {
         let topics: Vec<String> = self.muxes.lock_safe().keys().cloned().collect();
         for topic in topics {
-            let members: Vec<ChannelIdentity> = {
+            // Members the registry says belong to this topic right now (live, non-tombstoned).
+            let live: Vec<ChannelIdentity> = {
                 let reg = self.registry.lock_safe();
                 reg.iter()
                     .filter(|id| !id.deleted && id.member_of.as_deref() == Some(topic.as_str()))
                     .cloned()
                     .collect()
             };
-            for m in members {
+
+            // Attach any not-yet-attached live member.
+            for m in &live {
                 let already = self
                     .muxes
                     .lock_safe()
@@ -387,6 +390,28 @@ impl Node {
                 };
                 if let Some(mux) = self.muxes.lock_safe().get_mut(&topic) {
                     let _ = mux.add_member(&m.name, m.epoch, &path);
+                }
+            }
+
+            // Detach members the registry no longer lists (tombstoned / left): clean-leave
+            // drain → MemberClosed, then stop replicating a remote one (§6.1).
+            let live_set: std::collections::HashSet<(String, u64)> =
+                live.iter().map(|m| (m.name.clone(), m.epoch)).collect();
+            let attached: Vec<(String, u64)> = self
+                .muxes
+                .lock_safe()
+                .get(&topic)
+                .map(|mx| mx.members().into_iter().map(|(n, e, _)| (n, e)).collect())
+                .unwrap_or_default();
+            for (name, epoch) in attached {
+                if live_set.contains(&(name.clone(), epoch)) {
+                    continue;
+                }
+                if let Some(mux) = self.muxes.lock_safe().get_mut(&topic) {
+                    let _ = mux.remove_member(&name, epoch);
+                }
+                if let Some(sub) = self.subscriptions.lock_safe().remove(&name) {
+                    sub.stop();
                 }
             }
         }
@@ -1206,6 +1231,20 @@ mod tests {
         );
         // Not attached to any local mux (we don't host that topic).
         assert_eq!(node.topic_member_count("remote.topic"), None);
+    }
+
+    #[test]
+    fn tombstoned_member_is_detached_from_the_mux() {
+        let node = Node::new(config(1, temp_dir("detach")));
+        node.create_topic("agg", ChannelOptions::default()).unwrap();
+        node.publish_to_topic("agg", "mem.a", ChannelOptions::default())
+            .unwrap();
+        assert_eq!(node.topic_member_count("agg"), Some(1));
+
+        // The member's owner deregisters it; the sync loop drains + closes and detaches it.
+        assert!(node.deregister("mem.a").unwrap());
+        node.attach_pending_members();
+        assert_eq!(node.topic_member_count("agg"), Some(0));
     }
 
     #[test]
