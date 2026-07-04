@@ -253,8 +253,10 @@ xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
   poll-items in the daemon's shared forwarding loop as §4.1 specifies (same engine/invariants,
   different scheduling); the promotion path is therefore unwired.
 - Recovery is correct but scans from genesis — not the bounded §5.2 scan (needs reverse reads).
-- Reconstruct covers **topics**; general origin re-registration for non-topic channels, and
-  **empty** topics (no slot table), are not re-hosted. Remote members refresh when peers return.
+- Reconstruct covers **topics + non-topic origins** (the latter recovering geometry via xchannel
+  4.2.0 `Reader::region_size()`/`mtu()`). Not re-hosted: **empty** topics (no slot table). A
+  reconstructed member's `member_of` reconciles via peers; remote members refresh when peers return.
+  Dep is now `xchannel = "4.2.0"` (dev `[patch.crates-io]` → sibling repo until published).
 - Mux poll holds the `muxes` lock during IO (§4.3 promotion path is the eventual remedy).
 - Reserved control `msg_type` range is fixed (not per-`TopicOptions` as §4.2 muses).
 - §9 open questions remain open **by design**: hierarchical topics (gated on registry cycle

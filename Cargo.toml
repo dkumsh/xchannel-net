@@ -16,9 +16,16 @@ authors = ["Dmitriy Kumshayev <dq@mail.com>"]
 
 [workspace.dependencies]
 # The log/IPC substrate this project replicates over the network. 4.1.0 adds
-# `Reader::head_record_index()`, used to advertise the true head in `SubscribeAck`.
-xchannel = { version = "4.1.0" }
+# `Reader::head_record_index()` (true `SubscribeAck.head`); 4.2.0 adds `Reader::region_size()`
+# + `mtu()`, used to recover geometry when re-registering origins on restart (§5.2).
+xchannel = { version = "4.2.0" }
 
 # Internal crates referencing each other. `version` is required for crates.io publishing
 # (the registry rejects a bare path dep); the `path` still wins for local/workspace builds.
 xchannel-net-core = { path = "xchannel-net-core", version = "0.0.1" }
+
+# DEV ONLY: xchannel 4.2.0 is not yet published to crates.io — source it from the sibling repo
+# so restart origin re-registration can use the geometry accessors. Remove this patch (and
+# confirm `xchannel = "4.2.0"` resolves from the registry) before publishing/releasing.
+[patch.crates-io]
+xchannel = { path = "../xchannel" }

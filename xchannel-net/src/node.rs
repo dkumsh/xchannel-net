@@ -588,10 +588,38 @@ impl Node {
                 continue;
             }
             let path = self.config.data_dir.join(name);
-            if let Ok(Some(cfg)) = mux::topic_config(&path) {
-                let _ = self.rehost_topic(name, &cfg);
+            match mux::topic_config(&path) {
+                Ok(Some(cfg)) => {
+                    let _ = self.rehost_topic(name, &cfg);
+                }
+                // A plain origin (or a topic member): re-register it so it's discoverable and
+                // subscribable again (§5.2). `Err`/`Ok(None)` from a non-channel file is ignored.
+                Ok(None) => {
+                    let _ = self.reregister_origin(name);
+                }
+                Err(_) => {}
             }
         }
+    }
+
+    /// Re-register a non-topic origin channel found on disk (helper for
+    /// [`reconstruct_from_disk`]): recover its geometry from the channel header via
+    /// `xchannel::Reader` and re-register + announce it under this node's ownership. `member_of`
+    /// is not recoverable from disk (it was registry state); on a mesh, peer anti-entropy
+    /// restores it, and a local topic re-attaches its members from its own slot table regardless.
+    /// Rolling/retention policy is likewise not persisted, so replicas of a reconstructed origin
+    /// fall back to no rolling (same as an in-process `host_channel`).
+    fn reregister_origin(&self, name: &str) -> io::Result<()> {
+        if self.hosted.lock_safe().contains_key(name) {
+            return Ok(());
+        }
+        let path = self.channel_path(name)?;
+        let reader = xchannel::ReaderBuilder::new(&path).late_join().build()?;
+        let region_size = reader.region_size() as u32;
+        let mtu = reader.mtu();
+        drop(reader);
+        let identity = self.claim_name(name, region_size, mtu, None)?;
+        self.announce_hosted(&identity, path, 0, 0)
     }
 
     /// Re-host one topic from disk (helper for [`reconstruct_from_disk`]): re-register the topic

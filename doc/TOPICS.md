@@ -77,10 +77,11 @@ every hole in the LWW map in production.
 >   (shared-loop → thread → process) is therefore not wired.
 > - **Recovery cost (§5.2):** correct, but scans from genesis rather than the bounded
 >   last-slot-table scan (a correct bound needs reverse reads, an xchannel feature).
-> - **Reconstruct scope:** topics re-host on restart; general **origin re-registration** for
->   *non-topic* channels is still the broader §5.2 item. **Empty** topics (no member ever ⇒ no
->   slot table) aren't re-hosted (a reconnecting client re-creates them); remote members resume
->   from their on-disk replica and refresh when their owner is reachable again.
+> - **Reconstruct scope:** both topics and **non-topic origins** re-register on restart (the
+>   latter recovering geometry via xchannel 4.2.0's `Reader::region_size()`/`mtu()`). **Empty**
+>   topics (no member ever ⇒ no slot table) aren't re-hosted (a reconnecting client re-creates
+>   them); a reconstructed member's `member_of` reconciles via peers on a mesh; remote members
+>   resume from their on-disk replica and refresh when their owner is reachable again.
 > - Mux poll holds the `muxes` lock across IO; reserved `msg_type` range is fixed (not
 >   per-`TopicOptions`); `deregister_topic`/`topic_status` are Node APIs (no client RPC yet).
 > - The §9 open questions remain open **by design**.
