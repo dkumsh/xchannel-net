@@ -1,9 +1,9 @@
 # xchannel-net — Topics (multi-producer fan-in) — Design
 
-Status: **proposed, not implemented.** Targets a post-v1 release; depends on
-prerequisites listed in §1 that are themselves not yet implemented (see `DESIGN.md` §0).
-Section numbering here is local to this document; cross-references of the form
-`DESIGN.md §N` refer to the main design document.
+Status: **implemented on the `topics` branch** (with documented deviations — see the
+implementation-status note after §1). This document is the design; the §1 prerequisites it
+depended on have since landed. Section numbering here is local to this document;
+cross-references of the form `DESIGN.md §N` refer to the main design document.
 
 ---
 

@@ -41,6 +41,9 @@ pub const MSG_TYPE_TOPIC_GAP: u16 = 0xFFFE;
 pub const MSG_TYPE_MEMBER_CLOSED: u16 = 0xFFFD;
 /// Terminal marker: the topic was retired; the mux drained all members and stopped (§4.1).
 pub const MSG_TYPE_TERMINAL: u16 = 0xFFFC;
+/// `MemberRegressed` control record: a member's recovered cursor was past its source head — the
+/// member reset/respawned under the same `(name, epoch)` (an upstream §3.2 violation).
+pub const MSG_TYPE_MEMBER_REGRESSED: u16 = 0xFFFB;
 
 /// Whether `msg_type` is a mux control record (vs a member data record).
 #[inline]
@@ -133,6 +136,44 @@ impl TopicGap {
             member_ref: u16::from_le_bytes(b[0..2].try_into().unwrap()),
             from: u64::from_le_bytes(b[2..10].try_into().unwrap()),
             resumed_at: u64::from_le_bytes(b[10..18].try_into().unwrap()),
+        })
+    }
+}
+
+/// Body of a [`MSG_TYPE_MEMBER_REGRESSED`] control record: on resume the recovered cursor
+/// (`expected`) was **past** member `member_ref`'s current source head (`head`) — the member's
+/// log went backwards (reset/respawn under the same `(name, epoch)`, an upstream §3.2 anti-splice
+/// violation). The mux resumed at `head` rather than skipping past it. Distinct from
+/// [`TopicGap`] (whose `[from, resumed_at)` is a forward hole); here `expected > head`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemberRegressed {
+    pub member_ref: u16,
+    pub expected: u64,
+    pub head: u64,
+}
+
+impl MemberRegressed {
+    /// Serialize to the 18-byte control-record payload (`u16 member_ref, u64 expected, u64 head`).
+    pub fn to_payload(&self) -> [u8; 18] {
+        let mut b = [0u8; 18];
+        b[0..2].copy_from_slice(&self.member_ref.to_le_bytes());
+        b[2..10].copy_from_slice(&self.expected.to_le_bytes());
+        b[10..18].copy_from_slice(&self.head.to_le_bytes());
+        b
+    }
+
+    /// Parse a `MemberRegressed` control-record payload.
+    pub fn decode(b: &[u8]) -> io::Result<MemberRegressed> {
+        if b.len() < 18 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MemberRegressed record too short",
+            ));
+        }
+        Ok(MemberRegressed {
+            member_ref: u16::from_le_bytes(b[0..2].try_into().unwrap()),
+            expected: u64::from_le_bytes(b[2..10].try_into().unwrap()),
+            head: u64::from_le_bytes(b[10..18].try_into().unwrap()),
         })
     }
 }
@@ -368,19 +409,28 @@ impl Mux {
         // hole or past the source head silently (§6.2) — every discontinuity is an attributed
         // `TopicGap`. `gap = Some((from, resumed_at))`.
         let want = recovered.map(|max| max + 1).unwrap_or(0);
-        let (start, gap) = if want < earliest.0 {
+        // What to record for a discontinuity, if any.
+        enum Mark {
+            None,
+            /// Forward hole `[from, resumed_at)` aged out (§6.2).
+            Gap(u64, u64),
+            /// Cursor `expected` past source `head` — the member's log regressed (§3.2 violation).
+            Regressed(u64, u64),
+        }
+        let (start, mark) = if want < earliest.0 {
             // Records `[want, earliest)` aged out of retention (or, for a fresh member, its
             // genesis was pruned before we ever saw it: `want = 0 < earliest`). Resume at
             // `earliest`, attributing the hole.
-            (earliest.0, Some((want, earliest.0)))
+            (earliest.0, Mark::Gap(want, earliest.0))
         } else if want > head {
             // Our cursor is past the source's head: the member reset/respawned under the same
             // `(name, epoch)` (an upstream §3.2 anti-splice violation). Never skip_to past
             // `head` — that would hang or strand the new incarnation's records. Resume at
-            // `head` and record the anomaly.
-            (head, Some((want, head)))
+            // `head` and record it as a distinct backwards-regression marker (not a `TopicGap`,
+            // whose interval is forward).
+            (head, Mark::Regressed(want, head))
         } else {
-            (want, None)
+            (want, Mark::None)
         };
 
         source.skip_to(RecordIndex(start))?;
@@ -392,8 +442,12 @@ impl Mux {
             cursor: start,
         });
         self.emit_slot_table()?;
-        if let Some((from, resumed_at)) = gap {
-            self.emit_topic_gap(member_ref, from, resumed_at)?;
+        match mark {
+            Mark::None => {}
+            Mark::Gap(from, resumed_at) => self.emit_topic_gap(member_ref, from, resumed_at)?,
+            Mark::Regressed(expected, head) => {
+                self.emit_member_regressed(member_ref, expected, head)?
+            }
         }
         Ok(())
     }
@@ -519,6 +573,26 @@ impl Mux {
         Ok(())
     }
 
+    /// Commit a [`MemberRegressed`] control record (source head went backwards on resume).
+    fn emit_member_regressed(
+        &mut self,
+        member_ref: u16,
+        expected: u64,
+        head: u64,
+    ) -> io::Result<()> {
+        let payload = MemberRegressed {
+            member_ref,
+            expected,
+            head,
+        }
+        .to_payload();
+        let buf = self.topic.try_reserve(payload.len())?;
+        buf.copy_from_slice(&payload);
+        self.topic
+            .commit(MSG_TYPE_MEMBER_REGRESSED, payload.len() as u32, 0)?;
+        Ok(())
+    }
+
     /// Commit an updated slot table so a `LateJoin` topic reader can decode every member_ref.
     fn emit_slot_table(&mut self) -> io::Result<()> {
         let entries: Vec<SlotEntry> = self
@@ -546,6 +620,16 @@ impl Mux {
 ///
 /// Phase 1 scans from genesis for simplicity; §5's bounded scan (stop at the last slot-table
 /// record once every current member is seen) is a later optimization.
+/// **Invariant: this scan MUST start at genesis (the earliest retained record) and see every
+/// record.** Recovery attributes a member's max index by resolving its ref through the slot
+/// table *in force at each record*, so it must observe both a member's data records and the
+/// slot table that maps its ref. §5.2 sketches a bounded scan ("stop at the last slot-table
+/// record once every current member is seen") — but a naive mid-log start is the **dual of the
+/// member_ref conflation bug**: a live-but-quiet member whose records sit before the start point
+/// resolves to `None` → treated as fresh → `want = 0` → its retained records are **silently
+/// re-merged (duplication)**. Any future bounding must prove it still recovers a quiet member
+/// whose records precede the bound; `recovery_quiet_member_far_behind_tail_is_not_duplicated`
+/// guards this.
 fn recover_cursors(path: &Path) -> io::Result<HashMap<(String, u64), u64>> {
     let mut reader = ReaderBuilder::new(path).late_join().build()?;
     // The ref → (name, epoch) mapping *in force at the current scan position*. `member_ref` is
@@ -822,6 +906,51 @@ mod tests {
     }
 
     #[test]
+    fn source_regression_records_member_regressed_not_a_gap() {
+        let dir = temp_dir("regress");
+        let (topic, m) = (dir.join("topic"), dir.join("m"));
+        append_records(&m, "m", 100); // indices 0..99
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            mux.add_member("m", 0, &m).unwrap();
+            assert_eq!(mux.poll().unwrap(), 100);
+        }
+
+        // The member respawns onto a fresh, shorter log under the SAME (name, epoch) — an
+        // upstream §3.2 violation (a proper respawn would bump the epoch).
+        xchannel::cleanup_channel_files(&m);
+        append_records(&m, "m", 5); // fresh indices 0..4
+        let head = ReplicationSource::open(&m).unwrap().0.head().unwrap().0;
+        assert_eq!(head, 5);
+
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            mux.add_member("m", 0, &m).unwrap();
+            assert_eq!(
+                mux.members()[0].2,
+                head,
+                "resumes at head, never skip_to past it"
+            );
+        }
+
+        // The anomaly is a MemberRegressed (expected > head), not a backwards TopicGap.
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        let (mut regressed, mut gaps) = (None, 0);
+        while let Some(msg) = r.try_read().unwrap() {
+            match msg.header().message_type {
+                MSG_TYPE_MEMBER_REGRESSED => {
+                    regressed = Some(MemberRegressed::decode(msg.payload()).unwrap())
+                }
+                MSG_TYPE_TOPIC_GAP => gaps += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(gaps, 0, "no backwards TopicGap emitted");
+        let reg = regressed.expect("a MemberRegressed marker");
+        assert_eq!((reg.expected, reg.head), (100, 5));
+    }
+
+    #[test]
     fn remove_member_drains_then_emits_member_closed() {
         let dir = temp_dir("close");
         let (topic, member) = (dir.join("topic"), dir.join("m"));
@@ -900,6 +1029,62 @@ mod tests {
         assert_eq!(gaps.len(), 1, "exactly one attributed gap");
         assert_eq!(gaps[0].from, 3);
         assert_eq!(gaps[0].resumed_at, earliest);
+    }
+
+    /// Guards the genesis-scan invariant on `recover_cursors` (see its doc): a live-but-quiet
+    /// member "a" whose records sit early in the log — far behind lots of later "b" activity —
+    /// must still have its cursor recovered, so it is NOT re-merged (duplicated) on resume. A
+    /// future bounded scan that started mid-log would resolve "a" to fresh and re-merge it; this
+    /// test would then fail.
+    #[test]
+    fn recovery_quiet_member_far_behind_tail_is_not_duplicated() {
+        let dir = temp_dir("quiet");
+        let (topic, a, b) = (dir.join("topic"), dir.join("a"), dir.join("b"));
+        append_records(&a, "a", 5); // a: indices 0..4, then quiet forever
+        append_records(&b, "b", 5);
+
+        // Session 1: both members merged.
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            mux.add_member("a", 0, &a).unwrap();
+            mux.add_member("b", 0, &b).unwrap();
+            assert_eq!(mux.poll().unwrap(), 10);
+        }
+        // "b" produces a long tail while "a" stays quiet.
+        append_records(&b, "b", 2000);
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            mux.add_member("a", 0, &a).unwrap();
+            mux.add_member("b", 0, &b).unwrap();
+            mux.poll().unwrap();
+        }
+        // Session 3: reopen. "a" (records far behind the tail) must resume at 5, not re-merge.
+        {
+            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            mux.add_member("a", 0, &a).unwrap();
+            assert_eq!(
+                mux.members()[0].2,
+                5,
+                "quiet member's cursor recovered, not reset"
+            );
+            mux.poll().unwrap();
+        }
+
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        let mut a_count = 0;
+        while let Some(m) = r.try_read().unwrap() {
+            if is_control(m.header().message_type) {
+                continue;
+            }
+            let (_, body) = Provenance::split(m.payload()).unwrap();
+            if body.starts_with(b"a") {
+                a_count += 1;
+            }
+        }
+        assert_eq!(
+            a_count, 5,
+            "quiet member's records appear exactly once (no duplication)"
+        );
     }
 
     #[test]
