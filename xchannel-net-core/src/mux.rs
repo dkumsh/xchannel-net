@@ -33,6 +33,13 @@ pub const PROVENANCE_LEN: usize = 2 + 8 + 8;
 /// make it configurable later — TOPICS §4.2.)
 pub const RESERVED_MSG_TYPE_MIN: u16 = 0xFFF0;
 
+/// The mux re-emits the slot table at least once per this many merged records, even without a
+/// membership change. This bounds how stale the retained slot table can get, so a rolled +
+/// pruned topic always keeps a recent one — needed both for a `LateJoin` consumer to decode
+/// provenance (§6.3) and for restart reconstruction to identify the topic + its members
+/// (`doc/RESTART.md`).
+pub const SLOT_TABLE_REFRESH: u64 = 4096;
+
 /// Slot-table record: `member_ref → (name, epoch)` for every current member (§6.3).
 pub const MSG_TYPE_SLOT_TABLE: u16 = 0xFFFF;
 /// `TopicGap` control record: a member fell behind retention; the hole is attributed (§6.2).
@@ -223,10 +230,23 @@ pub struct SlotEntry {
     pub epoch: u64,
 }
 
-/// Encode a slot table as a control-record payload: `u16 count`, then per entry
-/// `u16 member_ref, u64 epoch, u16 name_len, name`.
-pub fn encode_slot_table(entries: &[SlotEntry]) -> Vec<u8> {
+/// A decoded slot table: the topic channel's geometry (so restart reconstruction can reopen the
+/// topic writer without a persisted marker — `doc/RESTART.md`) plus its current members.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SlotTable {
+    pub region_size: u32,
+    pub mtu: u32,
+    pub members: Vec<SlotEntry>,
+}
+
+/// Encode a slot table as a control-record payload: `u32 region_size, u32 mtu, u16 count`, then
+/// per entry `u16 member_ref, u64 epoch, u16 name_len, name`. The geometry rides the slot table
+/// (which is periodically re-emitted, so a recent copy is always retained) so a topic
+/// self-describes how to reopen it.
+pub fn encode_slot_table(region_size: u32, mtu: u32, entries: &[SlotEntry]) -> Vec<u8> {
     let mut out = Vec::new();
+    out.extend_from_slice(&region_size.to_le_bytes());
+    out.extend_from_slice(&mtu.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
     for e in entries {
         out.extend_from_slice(&e.member_ref.to_le_bytes());
@@ -239,7 +259,7 @@ pub fn encode_slot_table(entries: &[SlotEntry]) -> Vec<u8> {
 }
 
 /// Decode a slot-table control-record payload produced by [`encode_slot_table`].
-pub fn decode_slot_table(mut b: &[u8]) -> io::Result<Vec<SlotEntry>> {
+pub fn decode_slot_table(mut b: &[u8]) -> io::Result<SlotTable> {
     fn take<'a>(b: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
         if b.len() < n {
             return Err(io::Error::new(
@@ -251,8 +271,10 @@ pub fn decode_slot_table(mut b: &[u8]) -> io::Result<Vec<SlotEntry>> {
         *b = rest;
         Ok(head)
     }
+    let region_size = u32::from_le_bytes(take(&mut b, 4)?.try_into().unwrap());
+    let mtu = u32::from_le_bytes(take(&mut b, 4)?.try_into().unwrap());
     let count = u16::from_le_bytes(take(&mut b, 2)?.try_into().unwrap()) as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut members = Vec::with_capacity(count);
     for _ in 0..count {
         let member_ref = u16::from_le_bytes(take(&mut b, 2)?.try_into().unwrap());
         let epoch = u64::from_le_bytes(take(&mut b, 8)?.try_into().unwrap());
@@ -260,13 +282,17 @@ pub fn decode_slot_table(mut b: &[u8]) -> io::Result<Vec<SlotEntry>> {
         let name = std::str::from_utf8(take(&mut b, name_len)?)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "slot name not UTF-8"))?
             .to_string();
-        out.push(SlotEntry {
+        members.push(SlotEntry {
             member_ref,
             name,
             epoch,
         });
     }
-    Ok(out)
+    Ok(SlotTable {
+        region_size,
+        mtu,
+        members,
+    })
 }
 
 // ---------------- the mux engine ----------------
@@ -291,6 +317,10 @@ struct Slot {
 /// scanning the topic's own tail (§5), since every record self-describes its origin.
 pub struct Mux {
     topic: Writer,
+    /// Topic channel geometry, embedded in every slot table so the topic self-describes how to
+    /// reopen it on restart (`doc/RESTART.md`).
+    region_size: u32,
+    mtu: u32,
     slots: Vec<Slot>,
     next_ref: u16,
     max_batch_per_member: usize,
@@ -301,6 +331,9 @@ pub struct Mux {
     gaps_emitted: u64,
     /// Count of slot-table emissions — bumps on every membership change (§8 slot-table version).
     slot_table_version: u64,
+    /// Records merged since the last slot-table emission; drives the [`SLOT_TABLE_REFRESH`]
+    /// periodic re-emit so a recent slot table stays within the retained window.
+    since_slot_table: u64,
 }
 
 /// Per-member merge status (§8): how far the mux has merged vs the member's head.
@@ -349,12 +382,15 @@ impl Mux {
             .build()?;
         Ok(Self {
             topic,
+            region_size,
+            mtu,
             slots: Vec::new(),
             next_ref: 0,
             max_batch_per_member: max_batch_per_member.max(1),
             recovered,
             gaps_emitted: 0,
             slot_table_version: 0,
+            since_slot_table: 0,
         })
     }
 
@@ -486,6 +522,12 @@ impl Mux {
         buf.copy_from_slice(&payload);
         self.topic.commit(frame.msg_type, payload.len() as u32, 0)?;
         self.slots[i].cursor = frame.index.0 + 1;
+        // Periodically refresh the slot table so a recent one is always retained (roll/prune
+        // safe) — see SLOT_TABLE_REFRESH.
+        self.since_slot_table += 1;
+        if self.since_slot_table >= SLOT_TABLE_REFRESH {
+            self.emit_slot_table()?;
+        }
         Ok(true)
     }
 
@@ -604,12 +646,13 @@ impl Mux {
                 epoch: s.epoch,
             })
             .collect();
-        let payload = encode_slot_table(&entries);
+        let payload = encode_slot_table(self.region_size, self.mtu, &entries);
         let buf = self.topic.try_reserve(payload.len())?;
         buf.copy_from_slice(&payload);
         self.topic
             .commit(MSG_TYPE_SLOT_TABLE, payload.len() as u32, 0)?;
         self.slot_table_version += 1;
+        self.since_slot_table = 0;
         Ok(())
     }
 }
@@ -620,6 +663,42 @@ impl Mux {
 ///
 /// Phase 1 scans from genesis for simplicity; §5's bounded scan (stop at the last slot-table
 /// record once every current member is seen) is a later optimization.
+/// The information restart reconstruction needs to re-host a topic: its channel geometry and its
+/// last-known members. `topic_config` returns `Some` iff the channel at `path` is a topic (its
+/// content carries a decodable `SlotTable` — the self-describing marker, no persisted flag).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TopicConfig {
+    pub region_size: u32,
+    pub mtu: u32,
+    /// `(name, epoch)` of every member in the most recent slot table (may be empty).
+    pub members: Vec<(String, u64)>,
+}
+
+/// Identify whether the channel at `path` is a **topic** and, if so, return its geometry + last
+/// membership (`doc/RESTART.md`, option (a) content-sniff). `Some` iff the channel carries a
+/// decodable `SlotTable` record; `None` for an ordinary channel or a topic that never had a
+/// member (no slot table). Used by restart reconstruction to re-host topics and re-attach members.
+pub fn topic_config(path: &Path) -> io::Result<Option<TopicConfig>> {
+    let mut reader = ReaderBuilder::new(path).late_join().build()?;
+    let mut cfg: Option<TopicConfig> = None;
+    while let Some(m) = reader.try_read()? {
+        if m.header().message_type == MSG_TYPE_SLOT_TABLE
+            && let Ok(table) = decode_slot_table(m.payload())
+        {
+            cfg = Some(TopicConfig {
+                region_size: table.region_size,
+                mtu: table.mtu,
+                members: table
+                    .members
+                    .into_iter()
+                    .map(|e| (e.name, e.epoch))
+                    .collect(),
+            });
+        }
+    }
+    Ok(cfg)
+}
+
 /// **Invariant: this scan MUST start at genesis (the earliest retained record) and see every
 /// record.** Recovery attributes a member's max index by resolving its ref through the slot
 /// table *in force at each record*, so it must observe both a member's data records and the
@@ -644,6 +723,7 @@ fn recover_cursors(path: &Path) -> io::Result<HashMap<(String, u64), u64>> {
         let mt = m.header().message_type;
         if mt == MSG_TYPE_SLOT_TABLE {
             active = decode_slot_table(m.payload())?
+                .members
                 .into_iter()
                 .map(|e| (e.member_ref, (e.name, e.epoch)))
                 .collect();
@@ -711,10 +791,11 @@ mod tests {
                 epoch: 3,
             },
         ];
-        assert_eq!(
-            decode_slot_table(&encode_slot_table(&entries)).unwrap(),
-            entries
-        );
+        let encoded = encode_slot_table(1 << 20, 7, &entries);
+        let table = decode_slot_table(&encoded).unwrap();
+        assert_eq!(table.region_size, 1 << 20);
+        assert_eq!(table.mtu, 7);
+        assert_eq!(table.members, entries);
     }
 
     #[test]

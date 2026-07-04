@@ -107,6 +107,85 @@ fn client_replicates_through_a_spawned_daemon() {
 }
 
 #[test]
+fn topic_rehosts_and_resumes_after_daemon_restart() {
+    let data_dir = temp_dir("restart");
+    let opts = ChannelOptions::default();
+
+    // A member Writer the *test* process holds across the daemon restart (no-custody: the writer
+    // writes the mmap directly, independent of the daemon).
+    let mut writer;
+
+    // --- Session 1: create topic + member, write 5, confirm all merged, then kill the daemon.
+    {
+        let (daemon1, client_path) = spawn_daemon(&data_dir);
+        let mut client = connect_with_retry(&client_path);
+        client
+            .create_topic("agg", &TopicOptions::default())
+            .unwrap();
+        writer = client.publish_to_topic("agg", "mem.a", &opts).unwrap();
+        for i in 0..5u64 {
+            let p = format!("m{i}").into_bytes();
+            let buf = writer.try_reserve(p.len()).unwrap();
+            buf.copy_from_slice(&p);
+            writer.commit(1, p.len() as u32, i).unwrap();
+        }
+        // Wait until all 5 have merged into the topic channel (so they're durable on disk).
+        let mut reader = client
+            .subscribe("agg", SubscribeMode::LateJoin, Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut seen = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen < 5 && Instant::now() < deadline {
+            if let Some(m) = reader
+                .read_blocking(Some(Duration::from_millis(200)))
+                .unwrap()
+                && !is_control(m.header().message_type)
+            {
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 5, "session 1 merged all 5 records");
+        drop(daemon1); // kill; the test keeps `writer`
+    }
+
+    // --- Session 2: respawn on the SAME data_dir. No create_topic is re-issued.
+    let (_daemon2, client_path) = spawn_daemon(&data_dir);
+    let mut client = connect_with_retry(&client_path);
+
+    // Producer resumes through the same member Writer; the re-hosted mux must merge the new
+    // records, contiguous with the pre-restart ones.
+    for i in 5..10u64 {
+        let p = format!("m{i}").into_bytes();
+        let buf = writer.try_reserve(p.len()).unwrap();
+        buf.copy_from_slice(&p);
+        writer.commit(1, p.len() as u32, i).unwrap();
+    }
+
+    let mut reader = client
+        .subscribe("agg", SubscribeMode::LateJoin, Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut bodies = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while bodies.len() < 10 && Instant::now() < deadline {
+        if let Some(m) = reader
+            .read_blocking(Some(Duration::from_millis(200)))
+            .unwrap()
+        {
+            if is_control(m.header().message_type) {
+                continue;
+            }
+            let (_prov, body) = Provenance::split(m.payload()).unwrap();
+            bodies.push(body.to_vec());
+        }
+    }
+    let expected: Vec<Vec<u8>> = (0..10).map(|i| format!("m{i}").into_bytes()).collect();
+    assert_eq!(
+        bodies, expected,
+        "topic re-hosted on restart and resumed merging without re-issuing create_topic"
+    );
+}
+
+#[test]
 fn topic_merges_local_members_end_to_end() {
     let data_dir = temp_dir("topic");
     let (_daemon, client_path) = spawn_daemon(&data_dir);
