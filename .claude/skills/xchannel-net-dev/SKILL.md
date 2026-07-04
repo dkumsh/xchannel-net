@@ -170,6 +170,30 @@ _As of 2026-06-22:_
     retries the replica open (async creation race).
 - ~28 tests across unit + two-node + client-RPC + cross-process; clippy clean; release builds.
 
+### Topics (multi-producer fan-in) — in progress (`doc/TOPICS.md`)
+
+Building the full topic stack (Phases 0→2). **Phase 0 (the §1 prerequisites) — 4 of 5 landed**,
+each its own commit, all `just check`-green (37 tests):
+- **`RegisterRejected`**: `claim_name` reserves the name before file creation and fails
+  `AlreadyExists` on a lost collision (`de6f558`).
+- **True `SubscribeAck.head`**: via `xchannel::Reader::head_record_index()` — dep bumped to
+  **`xchannel = "4.1.0"`** (published; the head method is `2873410` in the xchannel repo)
+  (`2c69805`).
+- **Liveness-gated resolution**: `resolve` → `HostUnreachable` (owner not live) vs `TimedOut`
+  (unknown) (`0398f44`).
+- **Tombstones**: registry merge carries `(epoch, deleted)`; deregister, anti-resurrection,
+  reclaim at `epoch+1`; permutation-convergence test (`add9994`).
+- **Incarnation (5th prereq) — DECISION: `incarnation == the tombstone epoch`** (my best
+  judgment while the user was away; revisitable). `member_id = (name, epoch)`. Respawn =
+  deregister→reclaim (bumps epoch); crash = liveness→member-reaper tombstones→reclaim. No
+  standalone code — reuses the epoch; the crash bridge (reaper) is Phase 2 (§6.1). If we later
+  prefer a separate incarnation field (TOPICS §3.2 as literally written), revisit here.
+
+**Next: Phase 1 (local-only topics)** — `TopicIdentity`/`member_of` registry entries,
+`create_topic`/`publish_to_topic` client API, the mux as poll-items in the forwarding loop,
+provenance **option (b)** (18-byte prefix header + slot-table records, per TOPICS §4.2),
+recovery via forward-scan-from-slot-table. Paused here for review before building the subsystem.
+
 ## Security
 
 Trust model + threats + reporting are in `SECURITY.md` (TL;DR: unauthenticated plaintext,

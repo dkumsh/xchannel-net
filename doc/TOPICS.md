@@ -54,6 +54,15 @@ become correctness bugs under topics. **These must land first:**
 Building topics before these exists is explicitly rejected: member churn will exercise
 every hole in the LWW map in production.
 
+> **Implementation status (Phase 0).** Tombstones, `RegisterRejected` (create-time),
+> membership-liveness-in-resolution, and true `SubscribeAck.head` are **landed**. Tombstones
+> use an `(epoch, deleted)` generation in the merge (see `DESIGN.md` §5.4 / §0). **Incarnation
+> is realized as that `epoch`** rather than a separate field: `member_id = (name, epoch)`, a
+> respawn reclaims at `epoch+1` (a crashed producer is bridged by the member reaper, §6.1).
+> This resolves §3.2's `(name, incarnation)` onto the tombstone generation; if a distinct
+> incarnation field is later preferred, revisit §3.2. See the `xchannel-net-dev` skill's
+> Current-status for commit references.
+
 ---
 
 ## 2. Locked decisions
