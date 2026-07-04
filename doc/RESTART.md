@@ -70,8 +70,25 @@ required to honor §6.3.
   benefit is surviving *empty* topics (no data, no members — a reconnecting client re-creates
   them), which isn't worth pushing the topic concept into the substrate. Not planned.
 
-## Test
+## Remote members on restart
 
-A cross-process daemon-restart test: spawn `xchanneld`, create a topic + members, write records,
-**kill** the daemon, respawn on the same `data_dir`, and assert the topic re-hosts and resumes
-merging **without** any client re-issuing `create_topic`.
+A remote member re-attaches from its **stale on-disk replica**, so `attach_pending_members` must
+**(re)start its subscription even when it's already attached** — otherwise the replica never
+refreshes and the merge stalls after a restart. Peering is configured with `XCHANNELD_SEEDS`
+(comma-separated control `host:port`); the maintenance loop re-dials seeds, so a restarted owner
+that seeds to a live member re-learns it and resumes. (A restarted daemon rebinds a *new*
+ephemeral port unless a fixed one is configured, so peers that seed *to it* by address must be
+pointed at the new port — or have the restarted node seed *to them*.)
+
+## Performance note (follow-up, not correctness)
+
+Reconstruct is O(retained records): `topic_config` scans a channel to find its last slot table,
+then `Mux::open`'s `recover_cursors` scans it again for cursors — two full passes per topic — and
+each plain origin opens a reader for geometry. Fine for restart (infrequent), but worth folding
+into a single scan / bounding later.
+
+## Tests
+
+Cross-process daemon-restart tests: a plain channel re-registers; a topic (1 member and 2
+members) re-hosts and resumes without re-issuing `create_topic`; and two real daemons merge a
+remote member and **resume across a restart** of the topic-owning node.

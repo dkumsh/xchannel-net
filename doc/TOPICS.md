@@ -229,6 +229,18 @@ loop **is** the topic order (locked, §2). Fairness knob: `max_batch_per_member`
 how long one hot member can monopolize the interleave; beyond that, no fairness is
 promised or attempted.
 
+**Ordering contract (what the total order does and does not mean).** The topic is a
+*totally-ordered* log only in the trivial sense that its records have positions. That order
+is **arrival order at this one merge loop** — biased by replication lag, network topology,
+and scheduling — and carries **no cross-producer semantics**: it is **not** causal, **not**
+wall-clock, and **not reproducible** (a replay with different timing yields a different
+interleave). The only guarantee is **per-member**: records from a single member appear in
+that member's own order, contiguously, with gaps/regressions attributed (§6.2). Consumers
+that need any real (causal, timestamped, or cross-producer) ordering **must** derive it from
+the per-record provenance (`member_id`, `member_index`, and the member's own `user_meta` /
+payload), not from topic position. The topic order is "written down so it's replayable *as
+observed*," not "meaningful across producers."
+
 Backpressure posture is inherited and honest: the mux is a reader of its members
 (cannot slow them — no-custody holds) and the single writer of the topic (cannot be
 slowed by topic consumers). The mux itself must be provisioned to sustain the **sum**
