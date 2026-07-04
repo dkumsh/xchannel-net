@@ -305,6 +305,9 @@ struct Slot {
     epoch: u64,
     source: ReplicationSource,
     cursor: u64,
+    /// Member records dropped for using a reserved control `msg_type` (contract violation —
+    /// see `merge_one`). Surfaced in [`MemberStat`] for observability.
+    rejected: u64,
 }
 
 /// A **mux**: the single writer of one topic channel, merging N member channels into it in
@@ -347,6 +350,8 @@ pub struct MemberStat {
     pub head: u64,
     /// `head - merged` — how far behind the merge is for this member.
     pub lag: u64,
+    /// Records dropped for using a reserved control `msg_type` (contract violations).
+    pub rejected: u64,
 }
 
 /// A snapshot of a mux's merge health (§8 "minimum bar to ship"). Combine with owner liveness
@@ -406,6 +411,7 @@ impl Mux {
                 merged: s.cursor,
                 head,
                 lag: head.saturating_sub(s.cursor),
+                rejected: s.rejected,
             });
         }
         Ok(MuxStatus {
@@ -476,6 +482,7 @@ impl Mux {
             epoch,
             source,
             cursor: start,
+            rejected: 0,
         });
         self.emit_slot_table()?;
         match mark {
@@ -507,28 +514,43 @@ impl Mux {
     }
 
     /// Merge the next ready record from slot `i` into the topic with provenance. Returns
-    /// whether a record was merged (`false` = the member is currently caught up).
+    /// whether a record was merged (`false` = the member is currently caught up). Skips (drops,
+    /// counting) any member record whose `msg_type` is in the reserved control range.
     fn merge_one(&mut self, i: usize) -> io::Result<bool> {
-        let Some(frame) = self.slots[i].source.try_next_frame()? else {
-            return Ok(false);
-        };
-        let prov = Provenance {
-            member_ref: self.slots[i].member_ref,
-            member_index: frame.index.0,
-            orig_user_meta: frame.user_meta,
-        };
-        let payload = frame_data(prov, &frame.payload);
-        let buf = self.topic.try_reserve(payload.len())?;
-        buf.copy_from_slice(&payload);
-        self.topic.commit(frame.msg_type, payload.len() as u32, 0)?;
-        self.slots[i].cursor = frame.index.0 + 1;
-        // Periodically refresh the slot table so a recent one is always retained (roll/prune
-        // safe) — see SLOT_TABLE_REFRESH.
-        self.since_slot_table += 1;
-        if self.since_slot_table >= SLOT_TABLE_REFRESH {
-            self.emit_slot_table()?;
+        loop {
+            let Some(frame) = self.slots[i].source.try_next_frame()? else {
+                return Ok(false);
+            };
+            self.slots[i].cursor = frame.index.0 + 1;
+
+            // **Contract enforcement (never trust the member's `msg_type`).** A member data
+            // record must use a `msg_type` below `RESERVED_MSG_TYPE_MIN`. Committing a member
+            // frame whose type is in the reserved range verbatim would **forge a mux control
+            // record** (e.g. a slot table) into the authoritative topic log — poisoning recovery
+            // and even rewriting the topic geometry on the next restart. Reject it: drop the
+            // record (leaving a visible member-index gap) and count it, rather than merge it.
+            if is_control(frame.msg_type) {
+                self.slots[i].rejected += 1;
+                continue;
+            }
+
+            let prov = Provenance {
+                member_ref: self.slots[i].member_ref,
+                member_index: frame.index.0,
+                orig_user_meta: frame.user_meta,
+            };
+            let payload = frame_data(prov, &frame.payload);
+            let buf = self.topic.try_reserve(payload.len())?;
+            buf.copy_from_slice(&payload);
+            self.topic.commit(frame.msg_type, payload.len() as u32, 0)?;
+            // Periodically refresh the slot table so a recent one is always retained (roll/prune
+            // safe) — see SLOT_TABLE_REFRESH.
+            self.since_slot_table += 1;
+            if self.since_slot_table >= SLOT_TABLE_REFRESH {
+                self.emit_slot_table()?;
+            }
+            return Ok(true);
         }
-        Ok(true)
     }
 
     /// Clean leave (§6.1): drain member `(name, epoch)` to its current head, commit a
@@ -933,6 +955,64 @@ mod tests {
     /// in session 2, because `next_ref` resets each open). Recovery must key cursors on
     /// (name, epoch) positionally — NOT max over the bare ref — or "b" inherits "a"'s far-ahead
     /// index and silently skips its own committed records. (Council-verified data-loss repro.)
+    /// A buggy/hostile member writing a record with a reserved control `msg_type` (e.g.
+    /// `MSG_TYPE_SLOT_TABLE`) must NOT forge a control record into the topic: the mux drops it
+    /// (counting it) and merges the member's valid records around it. Recovery/topic geometry
+    /// stay intact.
+    #[test]
+    fn member_reserved_msg_type_is_rejected_not_forged() {
+        let dir = temp_dir("forge");
+        let (topic, m) = (dir.join("topic"), dir.join("m"));
+
+        // A valid record, then a forged "slot table" (reserved type) with a slot-table-shaped
+        // payload, then another valid record.
+        let forged = encode_slot_table(1, 1, &[]);
+        {
+            let mut w = WriterBuilder::new(&m).region_size(REGION).build().unwrap();
+            for (mt, body) in [
+                (1u16, b"a".as_slice()),
+                (MSG_TYPE_SLOT_TABLE, forged.as_slice()),
+                (1u16, b"c".as_slice()),
+            ] {
+                let buf = w.try_reserve(body.len()).unwrap();
+                buf.copy_from_slice(body);
+                w.commit(mt, body.len() as u32, 0).unwrap();
+            }
+        }
+
+        let (region, mtu) = (REGION_U32, 4096u32);
+        let mut mux = Mux::open(&topic, region, mtu, 4096).unwrap();
+        mux.add_member("m", 0, &m).unwrap();
+        mux.poll().unwrap();
+        assert_eq!(
+            mux.status().unwrap().members[0].rejected,
+            1,
+            "the forged record was dropped"
+        );
+        drop(mux);
+
+        // The topic's geometry is the mux's own, NOT the forged slot table's (region/mtu 1) —
+        // the forgery never entered the log.
+        let cfg = topic_config(&topic).unwrap().expect("a topic");
+        assert_eq!(
+            (cfg.region_size, cfg.mtu),
+            (region, mtu),
+            "geometry not rewritten by forgery"
+        );
+
+        // Only the two valid records are present as data; no forged member_index gap-fill.
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        let mut data = Vec::new();
+        while let Some(msg) = r.try_read().unwrap() {
+            if is_control(msg.header().message_type) {
+                continue;
+            }
+            let (_, body) = Provenance::split(msg.payload()).unwrap();
+            data.push(body.to_vec());
+        }
+        assert_eq!(data, vec![b"a".to_vec(), b"c".to_vec()]);
+    }
+
     #[test]
     fn recovery_does_not_conflate_two_members_sharing_a_ref() {
         let dir = temp_dir("refswap");
