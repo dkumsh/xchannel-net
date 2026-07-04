@@ -54,18 +54,31 @@ become correctness bugs under topics. **These must land first:**
 Building topics before these exists is explicitly rejected: member churn will exercise
 every hole in the LWW map in production.
 
-> **Implementation status — the full design (§0–§8) is implemented** on the `topics` branch.
-> All §1 prerequisites landed (tombstones as an `(epoch, deleted)` generation; `RegisterRejected`
-> at create time; liveness-gated resolution; true `SubscribeAck.head`). **Incarnation is realized
-> as that `epoch`** rather than a separate field: `member_id = (name, epoch)`, respawn reclaims at
-> `epoch+1`, a crashed producer is bridged by the reaper (§6.1). The mux (record format,
-> provenance option (b), tail-scan recovery, fairness), local + remote members via `member_of`
-> discovery, `TopicGap` (§6.2), clean-leave drain → `MemberClosed` (§6.1), topic retirement +
-> terminal marker (§4.1), `TopicOptions` + the reaper (§6.1), and status/observability (§8) are
-> all built and tested. Honest remainders (not correctness gaps): recovery scans from genesis
-> rather than the bounded §5.2 scan (a correct bound needs reverse reads); the mux poll holds its
-> lock during IO; the reserved `msg_type` range is fixed; and the §9 open questions remain open by
-> design. See the `xchannel-net-dev` skill's Current-status for per-commit references.
+> **Implementation status** (on the `topics` branch). All §1 prerequisites landed (tombstones as
+> an `(epoch, deleted)` generation; `RegisterRejected` at create time; liveness-gated resolution;
+> true `SubscribeAck.head`). **Incarnation is realized as that `epoch`**: `member_id = (name,
+> epoch)`, respawn reclaims at `epoch+1`, a crashed producer is bridged by the reaper (§6.1).
+> Built and tested: the mux (record format, provenance option (b), fairness); **recovery keyed on
+> `(name, epoch)` resolved positionally through the slot table** (§5 — a council review caught and
+> fixed a data-loss bug where cursors keyed on the bare per-session `member_ref` conflated
+> incarnations across reopens); local + remote members via `member_of` discovery; `TopicGap` on
+> retention underrun / fresh-pruned-genesis / resume-overshoot (§6.2, never a silent splice);
+> clean-leave drain → `MemberClosed` (§6.1); topic retirement + terminal marker (§4.1);
+> `TopicOptions` + reaper (§6.1); status/observability (§8).
+>
+> **Known deviations / not-yet (honest):**
+> - **Execution model (§4.1):** the mux runs on its **own thread** (`Node::run_mux`, a poll+sleep
+>   loop), *not* as poll-items in the daemon's shared single-threaded forwarding loop as §4.1
+>   specifies. Same engine and invariants; different scheduling. The §4.1 promotion path
+>   (shared-loop → thread → process) is therefore not wired.
+> - **Recovery cost (§5.2):** correct, but scans from genesis rather than the bounded
+>   last-slot-table scan (a correct bound needs reverse reads, an xchannel feature).
+> - Mux poll holds the `muxes` lock across IO; reserved `msg_type` range is fixed (not
+>   per-`TopicOptions`); `deregister_topic`/`topic_status` are Node APIs (no client RPC yet).
+> - The §9 open questions remain open **by design**.
+>
+> Not independently re-verified beyond the test suite. See the `xchannel-net-dev` skill's
+> Current-status for per-commit references.
 
 ---
 

@@ -170,10 +170,11 @@ _As of 2026-06-22:_
     retries the replica open (async creation race).
 - ~28 tests across unit + two-node + client-RPC + cross-process; clippy clean; release builds.
 
-### Topics (multi-producer fan-in) — full design implemented (`doc/TOPICS.md`)
+### Topics (multi-producer fan-in) — design implemented, with documented deviations (`doc/TOPICS.md`)
 
-The complete TOPICS.md design (§0–§8) is built on the `topics` branch, ~53 tests green
-(`just check` clean). **Phase 0 (the §1 prerequisites):**
+The TOPICS.md design (§0–§8) is built on the `topics` branch, ~56 tests green (`just check`
+clean), with the deviations noted at the end of this section (chiefly the §4.1 execution model).
+**Phase 0 (the §1 prerequisites):**
 - **`RegisterRejected`**: `claim_name` reserves the name before file creation and fails
   `AlreadyExists` on a lost collision (`de6f558`).
 - **True `SubscribeAck.head`**: via `xchannel::Reader::head_record_index()` — dep bumped to
@@ -227,10 +228,22 @@ implemented:
 - **Observability** (`2f1c0be`): `Node::topic_status` → per-member `{merged, head, lag, state:
   Quiet|Active|Unreachable}`, topic head, gaps emitted, slot-table version (§8).
 
-**Honest remainders (not correctness gaps):**
-- Recovery `recover_cursors` scans from genesis — correct, but not the bounded scan §5.2
-  sketches; the bound needs reverse reads (an xchannel feature) to stay correct for quiet
-  members, so left as an O(topic) scan.
+**Recovery data-loss fix** (`a915d4d`, from a council review): `recover_cursors` originally keyed
+cursors on the bare `member_ref` (max over the whole log) with the *latest* slot table — but
+`member_ref` is a per-session counter reset each `Mux::open`, so two incarnations reusing a ref
+across reopens conflated → a member could resume past its own head and **silently skip committed
+records** (no `TopicGap`). Fixed by resolving each record's ref through the slot table **active at
+that scan position** and keying the cursor on the resulting `(name, epoch)`. Also (`dbb7961`):
+`next_ref` u16-exhaustion now errors instead of wrapping; the reaper dead-timer is keyed on
+`(name, epoch)`; `add_member` emits a `TopicGap` for a fresh member with a pruned genesis and for
+a resume that overshoots the source head (never `skip_to` past head). Failing repro landed first,
+then the fix.
+
+**Honest remainders / known deviations:**
+- **§4.1 execution model:** the mux runs on its **own thread** (`run_mux`, poll+sleep), not as
+  poll-items in the daemon's shared forwarding loop as §4.1 specifies (same engine/invariants,
+  different scheduling); the promotion path is therefore unwired.
+- Recovery is correct but scans from genesis — not the bounded §5.2 scan (needs reverse reads).
 - Mux poll holds the `muxes` lock during IO (§4.3 promotion path is the eventual remedy).
 - Reserved control `msg_type` range is fixed (not per-`TopicOptions` as §4.2 muses).
 - §9 open questions remain open **by design**: hierarchical topics (gated on registry cycle
