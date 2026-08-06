@@ -44,10 +44,14 @@ pub struct ChannelSource {
 // ---------------- origin side ----------------
 
 /// Origin-side handshake: read the `Subscribe`, resolve the channel via `resolve`, and
-/// reply with `SubscribeAck` (then stream via the returned server) or `Gap`.
+/// reply with `SubscribeAck` (then stream via the returned server), or refuse the resume
+/// position with `Gap` / `Diverged`.
 ///
-/// Errors after sending `Gap` if a resuming subscriber (`from > 0`) is older than the
-/// retained history; errors with `NotFound` if `resolve` doesn't know the channel.
+/// Both refusals are decided **before** seeking, because the seek is the dangerous step: it
+/// reads forward to `from` and blocks indefinitely on a position the channel has not reached.
+/// Errors after sending `Gap` if a resuming subscriber is older than the retained history, or
+/// `Diverged` if it is ahead of the head; errors with `NotFound` if `resolve` doesn't know the
+/// channel.
 pub fn accept_subscription<T: Transport>(
     mut transport: T,
     resolve: impl Fn(&str) -> Option<ChannelSource>,
@@ -61,6 +65,11 @@ pub fn accept_subscription<T: Transport>(
         io::Error::new(io::ErrorKind::NotFound, format!("unknown channel: {name}"))
     })?;
     let (mut source, earliest) = ReplicationSource::open(&src.path)?;
+    // The channel's true high-water index at accept time (read from the newest segment,
+    // independent of where we resume from). Lets the subscriber detect catch-up to the
+    // frontier; the record flow itself is unaffected. Read before the checks below, which
+    // need it to bound the acceptable resume range.
+    let head = source.head()?;
 
     // Retention gap: a non-zero `from` older than what we still retain can't be served
     // contiguously. (`from == 0` is a fresh subscriber and accepts truncated history.)
@@ -79,11 +88,31 @@ pub fn accept_subscription<T: Transport>(
         ));
     }
 
+    // Ahead of the head: this channel has never held a record at `from`, so the subscriber's
+    // replica cannot be a prefix of it — it was built from a different incarnation of the
+    // name (a deregistered name reclaimed by a new owner starts over at index 0). Refusing
+    // here is what stops `skip_to` from blocking forever waiting for records that will never
+    // be written; letting it through would also, once the new log eventually grew past
+    // `from`, splice two unrelated channels into one replica with the contiguity check none
+    // the wiser. `from == head` is not divergence — that is a subscriber that is simply
+    // caught up.
+    if from.0 > head.0 {
+        transport.send_frame(&encode_stream(&StreamMsg::Diverged {
+            name,
+            earliest,
+            head,
+        }))?;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "subscriber diverged: from {} is past head {} — replica is not a prefix of \
+                 this channel",
+                from.0, head.0
+            ),
+        ));
+    }
+
     let start = RecordIndex(from.0.max(earliest.0));
-    // The channel's true high-water index at accept time (read from the newest segment,
-    // independent of where we resume from). Lets the subscriber detect catch-up to the
-    // frontier; the record flow itself is unaffected.
-    let head = source.head()?;
     source.skip_to(start)?;
     transport.send_frame(&encode_stream(&StreamMsg::SubscribeAck {
         name,
@@ -184,7 +213,14 @@ pub fn subscribe<T: Transport>(
             io::ErrorKind::InvalidData,
             format!("gap: source's earliest retained index is {}", earliest.0),
         )),
-        _ => Err(invalid("expected SubscribeAck or Gap")),
+        StreamMsg::Diverged { earliest, head, .. } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "diverged: replica is not a prefix of this channel (source holds {}..{})",
+                earliest.0, head.0
+            ),
+        )),
+        _ => Err(invalid("expected SubscribeAck, Gap or Diverged")),
     }
 }
 
@@ -315,6 +351,85 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, n);
+    }
+
+    /// A resume position past the source's head means the replica was built from a different
+    /// incarnation of the name. The origin must refuse it *before* seeking: `skip_to` would
+    /// otherwise block forever on records that will never be written, wedging both sides with
+    /// no error anywhere — and if the new log ever did grow past that index, the sink would
+    /// splice two unrelated channels together with the contiguity check none the wiser.
+    #[test]
+    fn resume_past_head_is_refused_as_divergence() {
+        // A "reclaimed" origin: same name, brand-new log holding only 3 records.
+        let origin = temp_base("diverged-origin");
+        let replica = temp_base("diverged-replica");
+        write_records(&origin, 3);
+
+        let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let origin_path = origin.clone();
+        let server = std::thread::spawn(move || {
+            let conn = listener.accept().unwrap();
+            let resolve = |name: &str| {
+                (name == "md.aapl").then(|| ChannelSource {
+                    path: origin_path.clone(),
+                    region_size: REGION as u32,
+                    mtu: 0,
+                    file_roll_size: 0,
+                    keep_files: 0,
+                })
+            };
+            accept_subscription(conn, resolve).map(|_| ()).unwrap_err()
+        });
+
+        // The subscriber still holds 5000 records of the previous incarnation.
+        let conn = TcpTransport::connect(addr).unwrap();
+        let err = match subscribe(conn, "md.aapl", RecordIndex(5000), &replica) {
+            Ok(_) => panic!("expected divergence, not an ack"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("diverged"),
+            "subscriber must be able to tell divergence from a retention gap: {err}"
+        );
+
+        let server_err = server.join().unwrap();
+        assert_eq!(server_err.kind(), io::ErrorKind::InvalidData);
+        assert!(server_err.to_string().contains("past head"));
+    }
+
+    /// `from == head` is a caught-up subscriber, not divergence — the boundary the check
+    /// must not overshoot.
+    #[test]
+    fn resume_exactly_at_head_is_accepted() {
+        let origin = temp_base("at-head-origin");
+        let replica = temp_base("at-head-replica");
+        write_records(&origin, 4);
+
+        let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let origin_path = origin.clone();
+        let server = std::thread::spawn(move || {
+            let conn = listener.accept().unwrap();
+            let resolve = |name: &str| {
+                (name == "md.aapl").then(|| ChannelSource {
+                    path: origin_path.clone(),
+                    region_size: REGION as u32,
+                    mtu: 0,
+                    file_roll_size: 0,
+                    keep_files: 0,
+                })
+            };
+            accept_subscription(conn, resolve).map(|_| ()).unwrap()
+        });
+
+        let conn = TcpTransport::connect(addr).unwrap();
+        let client = subscribe(conn, "md.aapl", RecordIndex(4), &replica)
+            .expect("a caught-up resume must be accepted");
+        assert_eq!(client.expected_index(), RecordIndex(4));
+        drop(client);
+        drop(server.join().unwrap());
     }
 
     #[test]

@@ -45,9 +45,24 @@ channel — locally readable, network-replicable), without violating single-writ
 - **Observability**: `Node::topic_status` — per-member `merged`/`head`/`lag`/`state`/`rejected`,
   topic head, gaps emitted, slot-table version (§8).
 
+### Fixed
+- **A resume position past the source's head is refused** (`StreamMsg::Diverged`) instead of
+  hanging. After a deregistered name is reclaimed by a new owner, the new origin restarts at
+  index 0 while other nodes still hold replicas of the old incarnation; their self-healing
+  subscriptions then resumed at an index the new log had never reached. The only guard was
+  "behind retention", which such a resume passes by being *greater*, so the origin's `skip_to`
+  blocked forever waiting for records that would never be written — both ends wedged, nothing
+  reported, the replica still serving old-incarnation data to local clients. Worse, if the new
+  log ever grew past that index the sink would resume and splice two unrelated channels into
+  one replica, indices lining up and the contiguity check none the wiser. Both resume checks
+  now run before the seek. `from == head` (caught up) is unaffected.
+
 ### Changed
-- Bumped `xchannel` **4.0.0 → 4.3.0** (adds `Reader::head_record_index()`, `region_size()`,
-  `mtu()`, `file_sequence()` — generic, topic-agnostic accessors).
+- Bumped `xchannel` **4.0.0 → 5.0.0**: new generic, topic-agnostic accessors
+  (`Reader::head_record_index()`, `region_size()`, `mtu()`, `file_sequence()`),
+  `ChannelHeader.generation` (an opaque incarnation id, where the registry's reclaim epoch
+  will live), and `format_version = 3` widening `channel_name` from 20 to 48 bytes
+  (greenfield — v2 files are refused).
 - **Roll boundaries now replicate** (`RecordFrame::starts_segment`), amending the original rule
   that file geometry is purely local. The source detects a roll by sampling
   `Reader::file_sequence()` around each read and flags the record that follows it; the sink rolls

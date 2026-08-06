@@ -36,7 +36,9 @@ owner to read-only replicas on subscribing nodes.
 - Client↔daemon RPC (`create` / `subscribe`) and `connect_or_spawn` single-daemon bring-up.
 - Self-healing subscriptions: resume from the replica head, reconnect on drop,
   stop/unsubscribe (§5.1, `node.rs::run_subscription`).
-- Resume handshake (`Subscribe.from` / `SubscribeAck.start`) and `Gap` on retention underrun.
+- Resume handshake (`Subscribe.from` / `SubscribeAck.start`), `Gap` on retention underrun and
+  `Diverged` when the resume position is past the source's head — both decided before the
+  source seeks, so an out-of-range resume fails loudly instead of blocking forever (§4).
 - **True `SubscribeAck.head`** — the source advertises its real high-water index at accept
   time via `xchannel::Reader::head_record_index()` (§6.1), so a subscriber can detect when it
   has caught up to the frontier (`StreamClient::head`). Needs `xchannel ≥ 4.1.0`.
@@ -261,6 +263,16 @@ reads/writes a purely local xchannel (the master it owns, or a replica kept sync
 - If a resuming subscriber requests `from` older than the source retains, the source
   replies `Gap { earliest }` — an explicit, first-class error (cf. Kafka "offset out of
   range"), never a silent hole.
+- If it requests `from` *past* the source's head, the source replies `Diverged { earliest,
+  head }`: this channel has never held a record at that index, so the replica cannot be a
+  prefix of it — it was built from a **different incarnation** of the name (a deregistered
+  name reclaimed by a new owner restarts at index 0). `from == head` is not divergence; that
+  is a caught-up subscriber.
+- Both refusals are decided **before** the source seeks to `from`. The seek reads forward and
+  blocks until the channel reaches that index, so an unchecked out-of-range resume wedges both
+  ends with no error raised anywhere — and, should the new log later grow past the index, the
+  contiguity check would happily splice two unrelated channels into one replica. The recovery
+  for either refusal is the same: discard the replica and re-subscribe from `RecordIndex(0)`.
 
 ---
 
@@ -417,7 +429,8 @@ lookups from its local converged registry.)
 `Subscribed { replica_path }` | `Error`. The daemon owns placement and returns a local path
 the client opens (§7).
 
-**Stream plane** (`StreamMsg`, high volume): `Subscribe`, `SubscribeAck`, `Record`, `Gap`.
+**Stream plane** (`StreamMsg`, high volume): `Subscribe`, `SubscribeAck`, `Record`, `Gap`,
+`Diverged`.
 A source→subscriber connection is designed to be **multiplexed** — one link carrying any
 number of subscriptions, each keyed by a compact `StreamId` the source assigns, so the
 (string) channel name is *not* repeated on every record. **(Not yet — see §0:** `StreamId`

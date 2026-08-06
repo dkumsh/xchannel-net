@@ -130,6 +130,27 @@ pub enum StreamMsg {
         earliest: RecordIndex,
         head: RecordIndex,
     },
+
+    /// Source → subscriber, in place of `SubscribeAck`: the subscriber's replica is **not a
+    /// continuation of this channel**, so no resume position it offers can be valid. Distinct
+    /// from [`Gap`](StreamMsg::Gap), which means "your position is real but too old" — here the
+    /// position is meaningless, and the only recovery is to discard the replica and
+    /// re-subscribe from `RecordIndex(0)`.
+    ///
+    /// Raised when the subscriber's `from` exceeds the source's `head`: impossible for a
+    /// genuine resume of this log (`from == head` is simply caught up), so it means the replica
+    /// was built from a different incarnation of the name — the case that arises when a
+    /// deregistered name is reclaimed by a new owner and the new origin restarts at index 0.
+    /// Detecting it *before* the source seeks is what keeps that seek from blocking forever on
+    /// records that will never exist.
+    ///
+    /// `earliest`/`head` describe what the source actually holds, so the subscriber can report
+    /// the divergence rather than merely retrying.
+    Diverged {
+        name: ChannelName,
+        earliest: RecordIndex,
+        head: RecordIndex,
+    },
 }
 
 /// Channel geometry/retention a client requests when creating a channel. Unlike the

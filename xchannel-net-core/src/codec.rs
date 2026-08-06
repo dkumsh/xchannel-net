@@ -282,6 +282,7 @@ mod stream_tag {
     pub const SUBSCRIBE_ACK: u8 = 1;
     pub const RECORD: u8 = 2;
     pub const GAP: u8 = 3;
+    pub const DIVERGED: u8 = 4;
 }
 
 /// Encode a stream-plane message into `buf` (appended; caller clears for reuse).
@@ -333,6 +334,16 @@ pub fn encode_stream_into(buf: &mut Vec<u8>, m: &StreamMsg) {
             w.u64(earliest.0);
             w.u64(head.0);
         }
+        StreamMsg::Diverged {
+            name,
+            earliest,
+            head,
+        } => {
+            w.u8(stream_tag::DIVERGED);
+            w.str(name);
+            w.u64(earliest.0);
+            w.u64(head.0);
+        }
     }
 }
 
@@ -379,6 +390,11 @@ pub fn decode_stream(bytes: &[u8]) -> io::Result<StreamMsg> {
             }
         }
         stream_tag::GAP => StreamMsg::Gap {
+            name: r.str()?,
+            earliest: RecordIndex(r.u64()?),
+            head: RecordIndex(r.u64()?),
+        },
+        stream_tag::DIVERGED => StreamMsg::Diverged {
             name: r.str()?,
             earliest: RecordIndex(r.u64()?),
             head: RecordIndex(r.u64()?),
@@ -600,6 +616,11 @@ mod tests {
                     starts_segment: false,
                     payload: vec![], // empty payload round-trips
                 },
+            },
+            StreamMsg::Diverged {
+                name: "md.aapl".into(),
+                earliest: RecordIndex(0),
+                head: RecordIndex(10),
             },
             StreamMsg::Gap {
                 name: "md.aapl".into(),
