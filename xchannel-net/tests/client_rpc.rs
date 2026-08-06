@@ -11,6 +11,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use xchannel::{ReaderBuilder, ReaderMode};
 use xchannel_net::NodeConfig;
 use xchannel_net::node::Node;
 use xchannel_net_client::Client;
@@ -27,16 +28,6 @@ fn temp_dir(name: &str) -> PathBuf {
 
 fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
-}
-
-fn poll_until<R>(mut f: impl FnMut() -> Option<R>) -> R {
-    for _ in 0..3000 {
-        if let Some(r) = f() {
-            return r;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("condition not met within timeout");
 }
 
 #[test]
@@ -85,20 +76,33 @@ fn client_creates_and_subscribes_via_daemon() {
         }
     }
 
-    // Subscribe through the daemon: it resolves the self-owned channel, connects to its own
-    // stream plane, and builds a replica. We get the local replica path back.
-    let replica_path = client
+    // Subscribe through the daemon. The channel is hosted *here*, so the daemon hands back
+    // the origin itself rather than replicating the node to itself: no second copy on disk,
+    // no loopback stream, and the path is immediately readable and always current.
+    let path = client
         .subscribe_path("md.aapl", Some(Duration::from_secs(5)))
         .unwrap();
-
-    // The daemon builds the replica asynchronously and syncs all records into it. (The
-    // replica lives under data_dir/.replicas, distinct from the same-named origin.)
-    poll_until(|| (node.subscription_synced("md.aapl") == Some(n)).then_some(()));
-    assert_eq!(node.subscription_synced("md.aapl"), Some(n));
     assert!(
-        replica_path.exists() && replica_path.starts_with(node_data_dir.join(".replicas")),
-        "replica should exist under data_dir/.replicas"
+        !path.starts_with(node_data_dir.join(".replicas")),
+        "a locally hosted channel must not be replicated to itself: {path:?}"
     );
+    assert_eq!(
+        node.subscription_synced("md.aapl"),
+        None,
+        "and no subscription loop should have been started"
+    );
+
+    // Everything written through the client is readable at the returned path.
+    let mut r = ReaderBuilder::new(&path)
+        .mode(ReaderMode::LateJoin)
+        .build()
+        .unwrap();
+    let mut seen = 0u64;
+    while let Some(m) = r.try_read().unwrap() {
+        assert_eq!(m.payload(), format!("px-{seen}").as_bytes());
+        seen += 1;
+    }
+    assert_eq!(seen, n);
 }
 
 #[test]

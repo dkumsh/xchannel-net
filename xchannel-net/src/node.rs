@@ -1059,6 +1059,17 @@ impl Node {
                 created_or_error(self.create_for_client(&name, options))
             }
             ClientRequest::Subscribe { name, wait_ms } => {
+                // A channel this node **hosts** is already local: hand back the origin and do
+                // no replication at all. Otherwise every reader of a channel its own node owns
+                // — the normal case when an application consumes the stream it also produces —
+                // would pay for a second full copy on disk, streamed to itself over loopback
+                // TCP, pruned on its own schedule. The origin is the same records, is always
+                // ahead of any replica of it, and needs no subscription to stay current.
+                if let Some(src) = self.hosted.lock_safe().get(&name) {
+                    return ClientReply::Subscribed {
+                        replica_path: src.path.to_string_lossy().into_owned(),
+                    };
+                }
                 // Idempotent: reuse a live subscription for this channel.
                 if let Some(existing) = self.subscriptions.lock_safe().get(&name)
                     && existing.is_active()
@@ -1580,6 +1591,42 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, new_n, "old incarnation's records are gone");
+    }
+
+    /// Subscribing to a channel this node hosts must hand back the **origin**, not start a
+    /// replication loop against ourselves. An application that consumes the stream it also
+    /// produces is the normal case, and a self-replica would double its disk and stream every
+    /// record over loopback to arrive at a strictly staler copy of a local file.
+    #[test]
+    fn subscribing_to_a_locally_hosted_channel_returns_the_origin() {
+        let node = Node::new(config(71, temp_dir("self-subscribe")));
+        {
+            let mut w = node.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap();
+            let buf = w.try_reserve(4).unwrap();
+            buf.copy_from_slice(b"tick");
+            w.commit(0, 4, 0).unwrap();
+        }
+
+        let reply = node.handle_request(ClientRequest::Subscribe {
+            name: "md.aapl".into(),
+            wait_ms: 1000,
+        });
+        let ClientReply::Subscribed { replica_path } = reply else {
+            panic!("expected Subscribed, got {reply:?}");
+        };
+        assert_eq!(
+            Path::new(&replica_path),
+            node.channel_path("md.aapl").unwrap(),
+            "the client must be pointed at the origin"
+        );
+        assert!(
+            !node.replica_dir("md.aapl").unwrap().exists(),
+            "no replica of our own channel should exist"
+        );
+        assert!(
+            node.subscriptions.lock_safe().is_empty(),
+            "and no subscription loop should be running"
+        );
     }
 
     /// A subscriber that falls behind the source's retention must rebuild — and the rebuilt

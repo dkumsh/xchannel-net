@@ -46,6 +46,13 @@ channel — locally readable, network-replicable), without violating single-writ
   topic head, gaps emitted, slot-table version (§8).
 
 ### Fixed
+- **Subscribing to a locally hosted channel no longer replicates the node to itself.** The
+  daemon now hands back the origin path. Previously it resolved its own channel, connected to
+  its own stream plane over loopback, and built a second full copy under `.replicas` — pruned
+  on its own schedule and always strictly staler than the file next to it. An application that
+  consumes the stream it also produces is the normal case (a position service reading every
+  fills channel, its own included), so this doubled disk and stream traffic for every
+  self-owned channel on every node.
 - **Every channel now owns a directory** — origins at `data_dir/<name>/log`, replicas at
   `data_dir/.replicas/<name>/log`, with xchannel's segments (`log.1`, `log.2`, …) inside it.
   The flat layout put channel names and segment suffixes in one namespace, and channel names may

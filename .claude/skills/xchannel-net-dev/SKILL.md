@@ -177,6 +177,8 @@ _As of 2026-06-22:_
     a flat layout made `md.aapl.1` (a channel) indistinguishable from segment 1 of `md.aapl`, and
     made restart guess: retention unlinks segment 0, the unsuffixed file, so a rolled+pruned
     channel left nothing named after itself. Deletion is `remove_dir_all`, not a glob.
+  - **A `Subscribe` for a channel this node hosts returns the origin**, not a replica — no
+    self-replication over loopback, no second copy with its own retention.
   - **Cross-process test** spawns the real `xchanneld` and replicates via `Client` across
     processes (reads the replica — only possible cross-process). `Client::subscribe`
     retries the replica open (async creation race).
