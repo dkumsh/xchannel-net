@@ -149,6 +149,13 @@ channel — locally readable, network-replicable), without violating single-writ
   ignores it: a member's boundaries carry no meaning for a merged topic.
 
 ### Notes
+- **Application restart on an origin is pinned by tests**, since the position-service workload
+  restarts routinely and prunes aggressively: reopening a channel whose retention has already
+  removed genesis continues at the channel's absolute head rather than restarting at 0 (the
+  builder's `base_record_index(0)` is ignored on reopen — the on-disk base wins), and it does
+  **not** change the channel's generation. A changed generation would read as a reclaim to every
+  subscriber, making an ordinary restart trigger a network-wide discard and re-pull of full
+  history; a two-node test asserts subscribers extend their replicas instead.
 - Deliberate deviations from `doc/TOPICS.md`, all documented: the mux runs on its own thread
   (not §4.1's shared forwarding loop); recovery is correct but scans from genesis (not §5.2's
   bounded scan); empty topics aren't re-hosted on restart. The network planes remain

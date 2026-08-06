@@ -1837,6 +1837,134 @@ mod tests {
         assert_eq!(seen, new_n, "old incarnation's records are gone");
     }
 
+    /// An application restarting must reopen its own channel where it left off, even after
+    /// retention has pruned genesis. `create_origin` always passes `base_record_index(0)`, so
+    /// this pins the behavior that makes that harmless: on reopen the *on-disk* base wins, and
+    /// the writer continues at the channel's true absolute index rather than restarting at 0.
+    ///
+    /// It also pins that a restart does **not** change the channel's generation. If it did,
+    /// every subscriber would see a generation mismatch, conclude the name had been reclaimed,
+    /// and discard a perfectly good replica — an app restart would trigger a network-wide
+    /// re-pull of full history.
+    #[test]
+    fn an_origin_reopens_at_its_absolute_index_after_retention_pruned_genesis() {
+        let node = Node::new(config(121, temp_dir("reopen-pruned")));
+        let options = ChannelOptions {
+            region_size: 1 << 20,
+            mtu: 0,
+            file_roll_size: 0, // roll only when the application says so
+            keep_files: 2,
+        };
+        let path = node.create_for_client("md.aapl", options).unwrap();
+
+        // Four segments of two records; `keep_files(2)` prunes back to the last two, taking
+        // segment 0 — the file that carries genesis — with it.
+        let mut index = 0u64;
+        let mut write_two = |w: &mut Writer, index: &mut u64| {
+            for _ in 0..2 {
+                let buf = w.try_reserve(4).unwrap();
+                buf.copy_from_slice(b"tick");
+                w.commit(0, 4, *index).unwrap();
+                *index += 1;
+            }
+        };
+        {
+            let mut w = WriterBuilder::new(&path)
+                .region_size(options.region_size as usize)
+                .keep_files(options.keep_files as u64)
+                .build()
+                .unwrap();
+            write_two(&mut w, &mut index);
+            for _ in 0..3 {
+                w.roll_file().unwrap();
+                write_two(&mut w, &mut index);
+            }
+        }
+        let earliest = ReaderBuilder::new(&path)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap()
+            .base_record_index();
+        assert!(earliest > 0, "genesis must have been pruned");
+
+        // The application restarts and asks for its channel again, exactly as on first start.
+        let reopened = node.create_for_client("md.aapl", options).unwrap();
+        assert_eq!(reopened, path);
+
+        let mut w = WriterBuilder::new(&reopened)
+            .region_size(options.region_size as usize)
+            .keep_files(options.keep_files as u64)
+            .build()
+            .unwrap();
+        assert_eq!(
+            w.next_record_index(),
+            index,
+            "the writer must continue at the channel's absolute head, not restart at 0"
+        );
+        assert_eq!(
+            w.generation(),
+            0,
+            "a restart is the same incarnation — a changed generation would make every \
+             subscriber discard its replica"
+        );
+
+        // Appending continues the absolute numbering, and the pruned history stays pruned.
+        write_two(&mut w, &mut index);
+        assert_eq!(w.next_record_index(), index);
+        drop(w);
+        let r = ReaderBuilder::new(&path)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        assert_eq!(r.base_record_index(), earliest);
+        assert_eq!(r.head_record_index().unwrap(), index);
+    }
+
+    /// The network-facing consequence of the previous test: a subscriber must ride through an
+    /// application restart on the origin side. Applications restart routinely, and a restart
+    /// that looked like a reclaim would have every subscriber discard its replica and re-pull
+    /// the channel's full history — the exact opposite of what the incarnation check is for.
+    #[test]
+    fn an_application_restart_does_not_make_subscribers_rebuild() {
+        let (a, _a_stream, a_control) = start(131, "restart-sub-a");
+        let (b, _b_stream, _b_control) = start(132, "restart-sub-b");
+        let options = ChannelOptions::default();
+        let path = a.create_for_client("md.aapl", options).unwrap();
+
+        let mut index = 0u64;
+        let mut write_two = |index: &mut u64| {
+            let mut w = WriterBuilder::new(&path)
+                .region_size(options.region_size as usize)
+                .build()
+                .unwrap();
+            for _ in 0..2 {
+                let buf = w.try_reserve(4).unwrap();
+                buf.copy_from_slice(b"tick");
+                w.commit(0, 4, *index).unwrap();
+                *index += 1;
+            }
+        };
+        write_two(&mut index);
+
+        b.connect_control_peer(a_control).unwrap();
+        let sub = b
+            .subscribe("md.aapl", Some(Duration::from_secs(5)))
+            .unwrap();
+        poll_until(|| (sub.synced_index() == index).then_some(()));
+
+        // The application restarts: same daemon, same channel, a fresh `create` and writer.
+        assert_eq!(a.create_for_client("md.aapl", options).unwrap(), path);
+        write_two(&mut index);
+
+        poll_until(|| (sub.synced_index() == index).then_some(()));
+        assert_eq!(sub.rebuilds().gap(), 0);
+        assert_eq!(
+            sub.rebuilds().diverged(),
+            0,
+            "an application restart is not a reclaim — the replica must be extended, not rebuilt"
+        );
+    }
+
     /// The relocation story end to end: an application pinned to a host that dies must be
     /// able to come back under the same name elsewhere. That needs a reclaim, which needs a
     /// name held by a dead owner to be retired by someone who does not own it.
