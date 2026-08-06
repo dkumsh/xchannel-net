@@ -145,6 +145,12 @@ impl BroadcastDissemination {
             .live_addr_of(node, self.liveness_timeout)
     }
 
+    /// How long since `node` was last heard from; `None` if never. Used to judge whether an
+    /// owner is *gone* rather than momentarily silent.
+    pub fn silent_for(&self, node: NodeId) -> Option<std::time::Duration> {
+        self.membership.lock_safe().silent_for(node)
+    }
+
     /// Set the stream address advertised in heartbeats — used after binding the stream
     /// listener to an ephemeral port (`:0`), so peers learn the real address.
     pub fn set_self_addr(&mut self, addr: SocketAddr) {

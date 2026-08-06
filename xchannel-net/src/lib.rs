@@ -31,4 +31,16 @@ pub struct NodeConfig {
     pub client_path: std::path::PathBuf,
     /// Seed peers to exchange registry state with on startup.
     pub seeds: Vec<std::net::SocketAddr>,
+    /// Safety floor for [`Node::force_deregister`](node::Node::force_deregister): how long an
+    /// owner must have been unreachable before another node may retire its name so it can be
+    /// reclaimed elsewhere.
+    ///
+    /// This gates an **operator-invoked** action; nothing reclaims automatically. Owner death
+    /// freezing a channel is a locked design decision, and an automatic reclaim would be
+    /// failover by another name — worse, under a partition each side would see the other as
+    /// dead and could retire names whose owners are alive and still writing, with the
+    /// higher-epoch reclaim then winning the merge and destroying a live channel. Requiring a
+    /// human to assert "that host is gone" makes that an operator error rather than an
+    /// emergent behavior; this threshold is the guard against asserting it too soon.
+    pub reclaim_after: std::time::Duration,
 }

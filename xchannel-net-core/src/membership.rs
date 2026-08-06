@@ -56,6 +56,13 @@ impl Membership {
             .map(|m| m.addr)
     }
 
+    /// How long since `node` was last heard from, or `None` if it has never been heard from
+    /// at all. Callers deciding whether an owner is *gone* (rather than momentarily silent)
+    /// need the duration, not just the live/not-live verdict.
+    pub fn silent_for(&self, node: NodeId) -> Option<Duration> {
+        self.members.get(&node).map(|m| m.last_seen.elapsed())
+    }
+
     /// Nodes heard from within `timeout`.
     pub fn live_members(&self, timeout: Duration) -> Vec<NodeId> {
         let now = Instant::now();

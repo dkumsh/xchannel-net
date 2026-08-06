@@ -41,6 +41,7 @@ fn client_creates_and_subscribes_via_daemon() {
         stream_addr: loopback(),
         client_path: client_path.clone(),
         seeds: vec![],
+        reclaim_after: Duration::from_secs(300),
     });
 
     let stream_l = node.bind_stream().unwrap();
@@ -116,6 +117,7 @@ fn subscribe_to_unknown_channel_times_out() {
         stream_addr: loopback(),
         client_path: client_path.clone(),
         seeds: vec![],
+        reclaim_after: Duration::from_secs(300),
     });
     let stream_l = node.bind_stream().unwrap();
     let client_l = node.bind_client().unwrap();

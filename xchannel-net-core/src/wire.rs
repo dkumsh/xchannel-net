@@ -303,6 +303,12 @@ pub enum ClientRequest {
     /// delete its files. Only the owner may do this — a request for a name owned elsewhere
     /// reports `existed: false` rather than removing anything.
     Deregister { name: ChannelName },
+    /// Retire a channel owned by a node that is **gone**, so its name can be reclaimed here.
+    /// Refused unless the owner has been unreachable past the daemon's `reclaim_after` floor.
+    /// This is the deliberate exception to owner-only deregistration; see
+    /// [`Node::force_deregister`](../../xchannel_net/node/struct.Node.html#method.force_deregister)
+    /// for why it is operator-invoked rather than automatic.
+    ForceDeregister { name: ChannelName },
     /// Ask how a channel this node reads is doing — replication progress and whether the
     /// machinery behind it is healthy. Replies [`Status`](ClientReply::Status), or
     /// [`Error`](ClientReply::Error) if this node neither hosts nor subscribes to the name.

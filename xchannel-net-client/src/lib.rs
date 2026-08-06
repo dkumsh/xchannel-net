@@ -171,6 +171,27 @@ impl Client {
         }
     }
 
+    /// Retire a channel whose owning node is **gone**, freeing its name to be reclaimed here.
+    /// Returns whether a live channel of that name existed to retire.
+    ///
+    /// The daemon refuses unless the owner has been unreachable past its `reclaim_after`
+    /// floor. This is an operator action, not automatic recovery: owner death freezes a
+    /// channel by design, and a daemon retiring names on its own would be failover — across a
+    /// partition it could retire a channel whose owner is alive and still writing, with the
+    /// reclaim then winning the merge. Call it only when the host is genuinely gone.
+    ///
+    /// After it succeeds, `create_channel` under the same name produces a new incarnation;
+    /// subscribers holding replicas of the old one rebuild rather than splicing the two.
+    pub fn force_deregister(&mut self, name: &str) -> io::Result<bool> {
+        match self.request(&ClientRequest::ForceDeregister {
+            name: name.to_string(),
+        })? {
+            ClientReply::Deregistered { existed } => Ok(existed),
+            ClientReply::Error { message } => Err(rpc_error(message)),
+            _ => Err(unexpected()),
+        }
+    }
+
     /// Health of a channel this node reads — replication progress plus whether the machinery
     /// behind it is working. Errors if the local daemon neither hosts nor subscribes to `name`.
     ///

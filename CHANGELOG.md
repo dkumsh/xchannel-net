@@ -42,6 +42,19 @@ channel — locally readable, network-replicable), without violating single-writ
   retired name.
 - **`XCHANNELD_SEEDS`**: configure seed peers (comma-separated control `host:port`) for the
   daemon to form/re-form the mesh.
+- **`ForceDeregister` client RPC** (`Client::force_deregister`) — retire a channel whose
+  owning node is **gone**, so its name can be reclaimed and an application pinned to a dead host
+  can come back under the same name elsewhere. This is the deliberate exception to owner-only
+  deregistration, and it is **operator-invoked, never automatic**: owner death freezing a
+  channel is a locked design decision, and a daemon retiring names on its own would be failover
+  — across a partition each side sees the other as dead, and a reclaim at `epoch + 1` wins the
+  merge, so an automatic reaper could destroy a channel whose owner is alive and still writing.
+  Two independent guards: the owner must not be a live member, *and* it must have been silent
+  for at least `NodeConfig::reclaim_after` (`XCHANNELD_RECLAIM_AFTER_MS`, default 5 min). An
+  owner never heard from is judged against this node's own uptime, so a freshly started daemon
+  cannot declare every channel in the registry abandoned. Completes the relocation path opened
+  by incarnation-aware subscriptions: after a reclaim the name registers at `epoch + 1`, and
+  subscribers holding replicas of the old incarnation rebuild rather than splice.
 - **`Deregister` client RPC** (`Client::deregister`): withdraw a channel this node owns —
   tombstone it, disseminate that, delete its files. Returns whether a live channel of that name
   was actually owned here; "already gone" and "owned elsewhere" both report `false` rather than

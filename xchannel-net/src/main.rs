@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use xchannel_net::NodeConfig;
 use xchannel_net::node::Node;
 use xchannel_net_core::NodeId;
@@ -46,6 +47,15 @@ fn main() -> std::io::Result<()> {
         })
         .collect();
 
+    // Safety floor for reclaiming a dead owner's channel name (see
+    // `Node::force_deregister`). Deliberately generous by default — reclaiming too eagerly
+    // can destroy a live channel across a partition, while reclaiming late costs only a wait.
+    let reclaim_after = std::env::var("XCHANNELD_RECLAIM_AFTER_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(300));
+
     let config = NodeConfig {
         node_id: NodeId(node_id),
         data_dir,
@@ -53,6 +63,7 @@ fn main() -> std::io::Result<()> {
         stream_addr,
         client_path,
         seeds,
+        reclaim_after,
     };
     std::fs::create_dir_all(&config.data_dir)?;
     #[cfg(unix)]

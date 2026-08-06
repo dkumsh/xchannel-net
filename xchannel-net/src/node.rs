@@ -165,6 +165,10 @@ pub struct TopicStatus {
 #[derive(Clone)]
 pub struct Node {
     config: Arc<NodeConfig>,
+    /// When this node started. Bounds how long an owner can be *known* to have been silent:
+    /// a daemon that just came up has heard from nobody, and must not conclude every channel
+    /// in the registry is abandoned.
+    started_at: Instant,
     /// Channels this node hosts (is the origin for): name → where + geometry to serve.
     hosted: Arc<Mutex<HashMap<String, ChannelSource>>>,
     /// Network-wide channel directory (CRDT), converged via dissemination.
@@ -203,8 +207,83 @@ impl Node {
             topic_reap: Arc::new(Mutex::new(HashMap::new())),
             member_dead_since: Arc::new(Mutex::new(HashMap::new())),
             conns: Arc::new(AtomicUsize::new(0)),
+            started_at: Instant::now(),
             config: Arc::new(config),
         }
+    }
+
+    /// Retire a channel owned by a node that is **gone**, so its name can be reclaimed
+    /// elsewhere — the one path by which an application pinned to a dead host can be brought
+    /// up somewhere else under the same name.
+    ///
+    /// This is deliberately **operator-invoked**, never automatic. "Owner death freezes the
+    /// channel" is a locked decision, and a daemon that retired names on its own would be
+    /// performing failover: under a partition each side sees the other as dead, and a reclaim
+    /// at `epoch + 1` wins the merge — so an automatic reaper could destroy a channel whose
+    /// owner is alive and still writing on the far side. A human asserting "that host is gone"
+    /// turns that into an operator error rather than an emergent one.
+    ///
+    /// Refuses unless the owner has been unreachable for at least `config.reclaim_after`.
+    /// An owner never heard from is judged against this node's own uptime, so a freshly
+    /// started daemon — which has heard from nobody — cannot immediately declare every channel
+    /// in the registry abandoned.
+    ///
+    /// After this returns `Ok(true)` the name is free: registering it produces `epoch + 1`, a
+    /// distinct incarnation, and subscribers holding replicas of the old one are told they
+    /// diverged and rebuild.
+    pub fn force_deregister(&self, name: &str) -> io::Result<bool> {
+        let Some(id) = self.registry.lock_safe().get(name).cloned() else {
+            return Ok(false); // unknown or already tombstoned
+        };
+        if id.owner == self.config.node_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("channel '{name}' is owned by this node — use deregister"),
+            ));
+        }
+        // Two independent conditions, because the threshold alone is not a safety property:
+        // with a short (or zero) `reclaim_after`, elapsed silence would permit reclaiming a
+        // node we heard from moments ago.
+        if self
+            .dissemination
+            .lock_safe()
+            .live_addr_of(id.owner)
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!(
+                    "owner of '{name}' (node {}) is a live member — it has not gone anywhere",
+                    id.owner.0
+                ),
+            ));
+        }
+        // Silence we can actually vouch for: how long since we last heard from the owner, or
+        // how long we have been listening at all if we never have.
+        let unreachable_for = self
+            .dissemination
+            .lock_safe()
+            .silent_for(id.owner)
+            .unwrap_or_else(|| self.started_at.elapsed());
+        if unreachable_for < self.config.reclaim_after {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!(
+                    "owner of '{name}' (node {}) has been unreachable for {:?}, less than the \
+                     {:?} required to reclaim it",
+                    id.owner.0, unreachable_for, self.config.reclaim_after
+                ),
+            ));
+        }
+        let tombstone = self.registry.lock_safe().reap(name);
+        let Some(tombstone) = tombstone else {
+            return Ok(false);
+        };
+        self.dissemination
+            .lock_safe()
+            .announce(std::slice::from_ref(&tombstone))?;
+        self.retire_subscription(name);
+        Ok(true)
     }
 
     /// Acquire a connection slot, or `None` if at [`MAX_CONNECTIONS`].
@@ -1134,6 +1213,12 @@ impl Node {
                     message: e.to_string(),
                 },
             },
+            ClientRequest::ForceDeregister { name } => match self.force_deregister(&name) {
+                Ok(existed) => ClientReply::Deregistered { existed },
+                Err(e) => ClientReply::Error {
+                    message: e.to_string(),
+                },
+            },
             ClientRequest::SubscriptionStatus { name } => match self.subscription_status(&name) {
                 Some(status) => ClientReply::Status(status),
                 None => ClientReply::Error {
@@ -1599,6 +1684,9 @@ mod tests {
             stream_addr: "127.0.0.1:0".parse().unwrap(),
             client_path,
             seeds: vec![],
+            // Tests assert the guard's behavior explicitly; a long default would make every
+            // reclaim test sleep.
+            reclaim_after: Duration::from_millis(0),
         }
     }
 
@@ -1747,6 +1835,113 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, new_n, "old incarnation's records are gone");
+    }
+
+    /// The relocation story end to end: an application pinned to a host that dies must be
+    /// able to come back under the same name elsewhere. That needs a reclaim, which needs a
+    /// name held by a dead owner to be retired by someone who does not own it.
+    ///
+    /// The owner here is a node this one has never heard from — the state a survivor is left
+    /// in after the owning host is decommissioned.
+    #[test]
+    fn a_dead_owners_channel_can_be_reclaimed_elsewhere() {
+        let node = Node::new(config(101, temp_dir("reclaim-dead")));
+        node.registry.lock_safe().merge(ChannelIdentity {
+            name: "md.aapl".into(),
+            owner: NodeId(999),
+            region_size: 1 << 20,
+            mtu: 0,
+            earliest_index: RecordIndex(0),
+            registered_at_nanos: 1,
+            epoch: 0,
+            deleted: false,
+            member_of: None,
+        });
+
+        assert!(node.force_deregister("md.aapl").unwrap());
+        assert!(
+            node.registry.lock_safe().get("md.aapl").is_none(),
+            "the name must be free"
+        );
+
+        // The name is now hostable here — as a new incarnation, not a continuation.
+        {
+            let mut w = node.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap();
+            let buf = w.try_reserve(5).unwrap();
+            buf.copy_from_slice(b"moved");
+            w.commit(0, 5, 0).unwrap();
+        }
+        let reclaimed = node.registry.lock_safe().get("md.aapl").cloned().unwrap();
+        assert_eq!(reclaimed.owner, NodeId(101));
+        assert_eq!(
+            reclaimed.epoch, 1,
+            "a reclaim must be a new incarnation, so subscribers rebuild rather than splice"
+        );
+        // That incarnation is stamped into the log, which is what a subscriber's replica is
+        // later compared against.
+        let r = ReaderBuilder::new(node.channel_path("md.aapl").unwrap())
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        assert_eq!(r.generation(), reclaimed.epoch);
+    }
+
+    /// The guards on reclaiming. Taking a name from a node that is merely *quiet* would be
+    /// failover — and across a partition it would retire a channel whose owner is alive and
+    /// still writing, with the higher-epoch reclaim then winning the merge.
+    #[test]
+    fn force_deregister_refuses_live_owners_own_channels_and_fresh_daemons() {
+        let (a, _a_stream, a_control) = start(111, "reclaim-guard-a");
+        let (b, _b_stream, _b_control) = start(112, "reclaim-guard-b");
+        {
+            let mut w = a.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap();
+            let buf = w.try_reserve(1).unwrap();
+            buf.copy_from_slice(b"x");
+            w.commit(0, 1, 0).unwrap();
+        }
+        b.connect_control_peer(a_control).unwrap();
+        poll_until(|| {
+            (b.registry.lock_safe().get("md.aapl").is_some()
+                && b.dissemination
+                    .lock_safe()
+                    .live_addr_of(NodeId(111))
+                    .is_some())
+            .then_some(())
+        });
+
+        // A live owner is refused however long the configured floor is — B's `reclaim_after`
+        // is zero, so only the liveness check can be stopping this.
+        let err = b.force_deregister("md.aapl").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+        assert!(err.to_string().contains("live member"), "{err}");
+
+        // The owner must use the ordinary owner-only path for its own channels.
+        let err = a.force_deregister("md.aapl").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("use deregister"), "{err}");
+
+        // A daemon that just started has heard from nobody; it must not conclude on that basis
+        // that every channel in the registry is abandoned.
+        let mut cfg = config(113, temp_dir("reclaim-guard-c"));
+        cfg.reclaim_after = Duration::from_secs(3600);
+        let fresh = Node::new(cfg);
+        fresh.registry.lock_safe().merge(ChannelIdentity {
+            name: "theirs".into(),
+            owner: NodeId(999),
+            region_size: 1 << 20,
+            mtu: 0,
+            earliest_index: RecordIndex(0),
+            registered_at_nanos: 1,
+            epoch: 0,
+            deleted: false,
+            member_of: None,
+        });
+        let err = fresh.force_deregister("theirs").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+        assert!(err.to_string().contains("unreachable for"), "{err}");
+
+        // An unknown name is simply nothing to do.
+        assert!(!fresh.force_deregister("nope").unwrap());
     }
 
     /// When the owner withdraws a channel, a subscriber must learn that its source is *gone*

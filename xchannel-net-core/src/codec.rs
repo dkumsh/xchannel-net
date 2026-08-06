@@ -424,6 +424,7 @@ mod client_req_tag {
     pub const PUBLISH_TO_TOPIC: u8 = 3;
     pub const SUBSCRIPTION_STATUS: u8 = 4;
     pub const DEREGISTER: u8 = 5;
+    pub const FORCE_DEREGISTER: u8 = 6;
 }
 
 mod client_reply_tag {
@@ -531,6 +532,10 @@ pub fn encode_client_request(m: &ClientRequest) -> Vec<u8> {
             w.u8(client_req_tag::DEREGISTER);
             w.str(name);
         }
+        ClientRequest::ForceDeregister { name } => {
+            w.u8(client_req_tag::FORCE_DEREGISTER);
+            w.str(name);
+        }
     }
     buf
 }
@@ -557,6 +562,7 @@ pub fn decode_client_request(bytes: &[u8]) -> io::Result<ClientRequest> {
         },
         client_req_tag::SUBSCRIPTION_STATUS => ClientRequest::SubscriptionStatus { name: r.str()? },
         client_req_tag::DEREGISTER => ClientRequest::Deregister { name: r.str()? },
+        client_req_tag::FORCE_DEREGISTER => ClientRequest::ForceDeregister { name: r.str()? },
         _ => return Err(invalid("unknown ClientRequest tag")),
     };
     r.finish()?;
@@ -734,6 +740,9 @@ mod tests {
                 name: "md.aapl".into(),
             },
             ClientRequest::Deregister {
+                name: "md.aapl".into(),
+            },
+            ClientRequest::ForceDeregister {
                 name: "md.aapl".into(),
             },
         ];

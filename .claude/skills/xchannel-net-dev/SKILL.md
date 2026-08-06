@@ -62,7 +62,7 @@ orientation layer; when they disagree, DESIGN.md wins — and update both.
 
 | Area | Decision | Consequence |
 |---|---|---|
-| Owner death | Channel **freezes**, no failover | Same as a local writer stopping; *writer liveness* is an app concern, not ours. |
+| Owner death | Channel **freezes**, no failover | Same as a local writer stopping; *writer liveness* is an app concern, not ours. Reclaiming a dead owner's *name* is possible but **operator-invoked** (`force_deregister`, guarded on not-live + `reclaim_after`) — never automatic, since an automatic reaper is failover and would let a partitioned minority retire a live channel, its `epoch+1` reclaim then winning the merge. |
 | Discovery | **Decentralized CRDT registry** | Last-writer-wins map keyed by `(registered_at_nanos, NodeId)`. No SPOF, no central name server. |
 | Dissemination (v1) | **Eager broadcast + join-time anti-entropy + heartbeats** | NOT epidemic gossip / SWIM. Right for the expected **≤100 LAN nodes**. |
 | Namespace | **Flat global names**, first-registrant-wins | Identity = the name; collisions resolved by the CRDT merge, loser gets `RegisterRejected`. |
