@@ -19,7 +19,8 @@
 
 use crate::identity::ChannelIdentity;
 use crate::wire::{
-    ChannelOptions, ClientReply, ClientRequest, ControlMsg, RecordFrame, StreamMsg, TopicOptions,
+    ChannelOptions, ClientReply, ClientRequest, ControlMsg, RecordFrame, StreamMsg,
+    SubscriptionStatus, TopicOptions,
 };
 use crate::{NodeId, RecordIndex, StreamId};
 use std::io;
@@ -421,12 +422,44 @@ mod client_req_tag {
     pub const SUBSCRIBE: u8 = 1;
     pub const CREATE_TOPIC: u8 = 2;
     pub const PUBLISH_TO_TOPIC: u8 = 3;
+    pub const SUBSCRIPTION_STATUS: u8 = 4;
 }
 
 mod client_reply_tag {
     pub const CREATED: u8 = 0;
     pub const SUBSCRIBED: u8 = 1;
     pub const ERROR: u8 = 2;
+    pub const STATUS: u8 = 3;
+}
+
+fn put_status(w: &mut W, s: &SubscriptionStatus) {
+    w.u8(s.local as u8);
+    w.u8(s.active as u8);
+    w.u64(s.synced.0);
+    w.u64(s.head_at_connect.0);
+    w.u64(s.owner.0);
+    w.u8(s.owner_live as u8);
+    w.u64(s.generation);
+    w.u64(s.last_record_at_ms);
+    w.u64(s.rebuilds_gap);
+    w.u64(s.rebuilds_diverged);
+    w.u64(s.last_rebuild_at_ms);
+}
+
+fn get_status(r: &mut R) -> io::Result<SubscriptionStatus> {
+    Ok(SubscriptionStatus {
+        local: r.u8()? != 0,
+        active: r.u8()? != 0,
+        synced: RecordIndex(r.u64()?),
+        head_at_connect: RecordIndex(r.u64()?),
+        owner: NodeId(r.u64()?),
+        owner_live: r.u8()? != 0,
+        generation: r.u64()?,
+        last_record_at_ms: r.u64()?,
+        rebuilds_gap: r.u64()?,
+        rebuilds_diverged: r.u64()?,
+        last_rebuild_at_ms: r.u64()?,
+    })
 }
 
 fn put_options(w: &mut W, o: &ChannelOptions) {
@@ -488,6 +521,10 @@ pub fn encode_client_request(m: &ClientRequest) -> Vec<u8> {
             w.str(member);
             put_options(&mut w, options);
         }
+        ClientRequest::SubscriptionStatus { name } => {
+            w.u8(client_req_tag::SUBSCRIPTION_STATUS);
+            w.str(name);
+        }
     }
     buf
 }
@@ -512,6 +549,7 @@ pub fn decode_client_request(bytes: &[u8]) -> io::Result<ClientRequest> {
             member: r.str()?,
             options: get_options(&mut r)?,
         },
+        client_req_tag::SUBSCRIPTION_STATUS => ClientRequest::SubscriptionStatus { name: r.str()? },
         _ => return Err(invalid("unknown ClientRequest tag")),
     };
     r.finish()?;
@@ -534,6 +572,10 @@ pub fn encode_client_reply(m: &ClientReply) -> Vec<u8> {
             w.u8(client_reply_tag::ERROR);
             w.str(message);
         }
+        ClientReply::Status(status) => {
+            w.u8(client_reply_tag::STATUS);
+            put_status(&mut w, status);
+        }
     }
     buf
 }
@@ -546,6 +588,7 @@ pub fn decode_client_reply(bytes: &[u8]) -> io::Result<ClientReply> {
             replica_path: r.str()?,
         },
         client_reply_tag::ERROR => ClientReply::Error { message: r.str()? },
+        client_reply_tag::STATUS => ClientReply::Status(get_status(&mut r)?),
         _ => return Err(invalid("unknown ClientReply tag")),
     };
     r.finish()?;
@@ -673,6 +716,9 @@ mod tests {
                 name: "md.aapl".into(),
                 wait_ms: 0,
             },
+            ClientRequest::SubscriptionStatus {
+                name: "md.aapl".into(),
+            },
         ];
         for m in &requests {
             assert_eq!(
@@ -691,6 +737,19 @@ mod tests {
             ClientReply::Error {
                 message: "name taken".into(),
             },
+            ClientReply::Status(SubscriptionStatus {
+                local: false,
+                active: true,
+                synced: RecordIndex(1200),
+                head_at_connect: RecordIndex(1500),
+                owner: NodeId(7),
+                owner_live: true,
+                generation: 2,
+                last_record_at_ms: 1_760_000_000_123,
+                rebuilds_gap: 1,
+                rebuilds_diverged: 3,
+                last_rebuild_at_ms: 1_759_999_999_000,
+            }),
         ];
         for m in &replies {
             assert_eq!(&decode_client_reply(&encode_client_reply(m)).unwrap(), m);

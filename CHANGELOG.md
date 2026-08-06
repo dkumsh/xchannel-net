@@ -42,6 +42,15 @@ channel — locally readable, network-replicable), without violating single-writ
   retired name.
 - **`XCHANNELD_SEEDS`**: configure seed peers (comma-separated control `host:port`) for the
   daemon to form/re-form the mesh.
+- **`SubscriptionStatus` client RPC** (`Client::subscription_status`): per-channel replication
+  health — `synced`, `head_at_connect`, `owner`, `owner_live`, `generation`,
+  `last_record_at_ms`, and rebuild counts by cause. It reports progress and liveness
+  *separately* because `synced` alone cannot tell a quiet source from a broken one:
+  `owner_live` is membership liveness (the owner's manager is reachable, not that its
+  application is still writing), and `last_record_at_ms` is the live staleness signal, since
+  `head_at_connect` is a snapshot from the last `SubscribeAck` and goes stale as soon as the
+  source moves on. A channel hosted locally reports `local: true` and is caught up by
+  definition. An unknown channel is an error rather than a fabricated healthy-looking zero.
 - **Observability**: `Node::topic_status` — per-member `merged`/`head`/`lag`/`state`/`rejected`,
   topic head, gaps emitted, slot-table version (§8).
 

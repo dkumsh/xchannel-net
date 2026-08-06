@@ -36,7 +36,9 @@ use xchannel_net_core::stream::{self, ChannelSource, SubscribeError, accept_subs
 use xchannel_net_core::transport::{
     Listener, TcpListener, TcpTransport, Transport, UnixListener, UnixTransport,
 };
-use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest, TopicOptions};
+use xchannel_net_core::wire::{
+    ChannelOptions, ClientReply, ClientRequest, SubscriptionStatus, TopicOptions,
+};
 
 /// A node not heard from within this is dropped from the live set.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1098,7 +1100,80 @@ impl Node {
                 member,
                 options,
             } => created_or_error(self.publish_to_topic(&topic, &member, options)),
+            ClientRequest::SubscriptionStatus { name } => match self.subscription_status(&name) {
+                Some(status) => ClientReply::Status(status),
+                None => ClientReply::Error {
+                    message: format!("channel '{name}' is neither hosted nor subscribed here"),
+                },
+            },
         }
+    }
+
+    /// Health of a channel this node reads: replication progress plus whether the machinery
+    /// behind it is working. `None` if this node neither hosts nor subscribes to the name.
+    ///
+    /// Deliberately reports both halves, because a stalled number and a healthy quiet source
+    /// look identical from `synced` alone: `owner_live` is *membership* liveness (the owner's
+    /// manager is reachable — not that its application is still writing), and
+    /// `last_record_at_ms` is the live staleness signal, since `head_at_connect` is a snapshot
+    /// that goes stale as soon as the source moves on.
+    pub fn subscription_status(&self, name: &str) -> Option<SubscriptionStatus> {
+        // Hosted here ⇒ read from the origin; nothing to lag behind (see the `Subscribe`
+        // handler, which hands such a client the origin path).
+        if let Some(src) = self.hosted.lock_safe().get(name).cloned() {
+            let head = xchannel::ReaderBuilder::new(&src.path)
+                .late_join()
+                .build()
+                .ok()
+                .and_then(|r| r.head_record_index().ok())
+                .unwrap_or(0);
+            let generation = self
+                .registry
+                .lock_safe()
+                .get(name)
+                .map(|id| id.epoch)
+                .unwrap_or(0);
+            return Some(SubscriptionStatus {
+                local: true,
+                active: true,
+                synced: RecordIndex(head),
+                head_at_connect: RecordIndex(head),
+                owner: self.config.node_id,
+                owner_live: true,
+                generation,
+                last_record_at_ms: 0,
+                rebuilds_gap: 0,
+                rebuilds_diverged: 0,
+                last_rebuild_at_ms: 0,
+            });
+        }
+
+        let subs = self.subscriptions.lock_safe();
+        let sub = subs.get(name)?;
+        let (owner, generation) = self
+            .registry
+            .lock_safe()
+            .get(name)
+            .map(|id| (id.owner, id.epoch))
+            .unwrap_or((self.config.node_id, 0));
+        let owner_live = self
+            .dissemination
+            .lock_safe()
+            .live_members()
+            .contains(&owner);
+        Some(SubscriptionStatus {
+            local: false,
+            active: sub.is_active(),
+            synced: RecordIndex(sub.synced_index()),
+            head_at_connect: RecordIndex(sub.head_at_connect()),
+            owner,
+            owner_live,
+            generation,
+            last_record_at_ms: sub.last_record_at_ms().unwrap_or(0),
+            rebuilds_gap: sub.rebuilds().gap(),
+            rebuilds_diverged: sub.rebuilds().diverged(),
+            last_rebuild_at_ms: sub.rebuilds().last_at_ms().unwrap_or(0),
+        })
     }
 
     /// Sync progress of a subscription this node maintains (for clients), if any.
@@ -1134,25 +1209,33 @@ impl Node {
 
         let stopped = Arc::new(AtomicBool::new(false));
         let synced = Arc::new(AtomicU64::new(0));
+        let head_at_connect = Arc::new(AtomicU64::new(0));
+        let last_record_at_ms = Arc::new(AtomicU64::new(0));
         let rebuilds = Arc::new(RebuildStats::default());
         let shutdown: Arc<Mutex<Option<TcpTransport>>> = Arc::new(Mutex::new(None));
 
         let node = self.clone();
-        let (name_t, path_t, stopped_t, synced_t, rebuilds_t, shutdown_t) = (
+        let progress = SubscriptionProgress {
+            synced: Arc::clone(&synced),
+            head_at_connect: Arc::clone(&head_at_connect),
+            last_record_at_ms: Arc::clone(&last_record_at_ms),
+            rebuilds: Arc::clone(&rebuilds),
+        };
+        let (name_t, path_t, stopped_t, shutdown_t) = (
             name.to_string(),
             replica_path.clone(),
             Arc::clone(&stopped),
-            Arc::clone(&synced),
-            Arc::clone(&rebuilds),
             Arc::clone(&shutdown),
         );
         let handle = std::thread::spawn(move || {
-            node.run_subscription(name_t, path_t, stopped_t, synced_t, rebuilds_t, shutdown_t)
+            node.run_subscription(name_t, path_t, stopped_t, progress, shutdown_t)
         });
 
         Ok(Subscription {
             replica_path,
             synced,
+            head_at_connect,
+            last_record_at_ms,
             rebuilds,
             stopped,
             shutdown,
@@ -1168,10 +1251,15 @@ impl Node {
         name: String,
         replica_path: PathBuf,
         stopped: Arc<AtomicBool>,
-        synced: Arc<AtomicU64>,
-        rebuilds: Arc<RebuildStats>,
+        progress: SubscriptionProgress,
         shutdown: Arc<Mutex<Option<TcpTransport>>>,
     ) {
+        let SubscriptionProgress {
+            synced,
+            head_at_connect,
+            last_record_at_ms,
+            rebuilds,
+        } = progress;
         const BACKOFF: Duration = Duration::from_millis(100);
         while !stopped.load(Ordering::Relaxed) {
             // Re-resolve each attempt (owner address may have changed); short timeout so we
@@ -1218,6 +1306,7 @@ impl Node {
                     continue;
                 }
             };
+            head_at_connect.store(client.head().0, Ordering::Relaxed);
             *shutdown.lock_safe() = shutdown_handle;
 
             // Apply records until the connection drops or we're stopped.
@@ -1226,7 +1315,13 @@ impl Node {
                     return;
                 }
                 match client.recv_one() {
-                    Ok(()) => synced.store(client.expected_index().0, Ordering::Relaxed),
+                    Ok(()) => {
+                        synced.store(client.expected_index().0, Ordering::Relaxed);
+                        // One vDSO clock read per record, alongside a socket read and an mmap
+                        // write — negligible, and it is the only *live* staleness signal a
+                        // client has: `head_at_connect` goes stale the moment the source moves.
+                        last_record_at_ms.store(now_nanos() / 1_000_000, Ordering::Relaxed);
+                    }
                     Err(_) => break, // disconnected → reconnect (resuming from the new head)
                 }
             }
@@ -1365,11 +1460,25 @@ impl RebuildStats {
     }
 }
 
+/// The progress counters a subscription's background loop writes and its handle reads.
+/// Bundled so the loop takes one parameter rather than a growing list of `Arc`s.
+struct SubscriptionProgress {
+    synced: Arc<AtomicU64>,
+    head_at_connect: Arc<AtomicU64>,
+    last_record_at_ms: Arc<AtomicU64>,
+    rebuilds: Arc<RebuildStats>,
+}
+
 /// Handle to a self-healing subscription replicating a remote channel locally. Dropping it
 /// stops the background loop.
 pub struct Subscription {
     replica_path: PathBuf,
     synced: Arc<AtomicU64>,
+    /// The source's head as advertised in the last `SubscribeAck` — a snapshot at connect
+    /// time, not a live value; see [`SubscriptionStatus::head_at_connect`].
+    head_at_connect: Arc<AtomicU64>,
+    /// Unix-millis when a record was last applied; 0 = none yet.
+    last_record_at_ms: Arc<AtomicU64>,
     rebuilds: Arc<RebuildStats>,
     stopped: Arc<AtomicBool>,
     /// The currently-live connection (if any), so [`stop`](Self::stop) can interrupt a
@@ -1392,6 +1501,19 @@ impl Subscription {
     /// Replica rebuilds this subscription has performed, by cause — see [`RebuildStats`].
     pub fn rebuilds(&self) -> &RebuildStats {
         &self.rebuilds
+    }
+
+    /// The source's head as of the last successful (re)connect.
+    pub fn head_at_connect(&self) -> u64 {
+        self.head_at_connect.load(Ordering::Relaxed)
+    }
+
+    /// Unix-millis when a record was last applied, or `None` if none has been.
+    pub fn last_record_at_ms(&self) -> Option<u64> {
+        match self.last_record_at_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
     }
 
     /// Whether the background loop is still running (not stopped).
@@ -1591,6 +1713,57 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, new_n, "old incarnation's records are gone");
+    }
+
+    /// Status must distinguish a source that is merely quiet from one whose replication is
+    /// broken — the whole point of reporting liveness separately from progress.
+    #[test]
+    fn status_reports_progress_and_liveness_separately() {
+        let (a, _a_stream, a_control) = start(81, "status-a");
+        let (b, _b_stream, _b_control) = start(82, "status-b");
+        let n = 5u64;
+        {
+            let mut w = a.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap();
+            for i in 0..n {
+                let buf = w.try_reserve(4).unwrap();
+                buf.copy_from_slice(b"tick");
+                w.commit(0, 4, i).unwrap();
+            }
+        }
+
+        // A hosts it: local, caught up by definition, nothing to lag behind.
+        let local = a.subscription_status("md.aapl").unwrap();
+        assert!(local.local && local.active && local.owner_live);
+        assert_eq!(local.synced, RecordIndex(n));
+        assert_eq!(local.owner, a.config.node_id);
+
+        // B replicates it: not local, owner live, progress tracked, no rebuilds.
+        b.connect_control_peer(a_control).unwrap();
+        let sub = b
+            .subscribe("md.aapl", Some(Duration::from_secs(5)))
+            .unwrap();
+        poll_until(|| (sub.synced_index() == n).then_some(()));
+        b.subscriptions
+            .lock_safe()
+            .insert("md.aapl".to_string(), sub);
+
+        let remote = poll_until(|| {
+            let s = b.subscription_status("md.aapl")?;
+            (s.owner_live && s.synced == RecordIndex(n)).then_some(s)
+        });
+        assert!(!remote.local);
+        assert!(remote.active);
+        assert_eq!(remote.owner, a.config.node_id);
+        assert_eq!(remote.head_at_connect, RecordIndex(n));
+        assert_eq!(remote.rebuilds_gap, 0);
+        assert_eq!(remote.rebuilds_diverged, 0);
+        assert!(
+            remote.last_record_at_ms > 0,
+            "records arrived, so the live staleness signal must be set"
+        );
+
+        // An unknown channel is an error, not a fabricated healthy-looking zero status.
+        assert!(b.subscription_status("md.unknown").is_none());
     }
 
     /// Subscribing to a channel this node hosts must hand back the **origin**, not start a

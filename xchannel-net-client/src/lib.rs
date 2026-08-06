@@ -21,6 +21,7 @@ use xchannel_net_core::transport::{Transport, UnixTransport};
 use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest, TopicOptions};
 
 pub use xchannel_net_core::wire::ChannelOptions as Options;
+pub use xchannel_net_core::wire::SubscriptionStatus;
 
 /// Well-known default client-plane socket path for the implicit single local daemon. Mirrors
 /// the daemon's `XCHANNELD_CLIENT_PATH` default (under its `/tmp/xchanneld` data dir).
@@ -149,6 +150,23 @@ impl Client {
             wait_ms,
         })? {
             ClientReply::Subscribed { replica_path } => Ok(PathBuf::from(replica_path)),
+            ClientReply::Error { message } => Err(rpc_error(message)),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Health of a channel this node reads — replication progress plus whether the machinery
+    /// behind it is working. Errors if the local daemon neither hosts nor subscribes to `name`.
+    ///
+    /// Use it to tell a **quiet** source from a **broken** one, which `synced` alone cannot:
+    /// `owner_live` reports whether the owner's manager is reachable (not whether its
+    /// application is still writing — those are separate concerns), and `last_record_at_ms`
+    /// is the live staleness signal.
+    pub fn subscription_status(&mut self, name: &str) -> io::Result<SubscriptionStatus> {
+        match self.request(&ClientRequest::SubscriptionStatus {
+            name: name.to_string(),
+        })? {
+            ClientReply::Status(status) => Ok(status),
             ClientReply::Error { message } => Err(rpc_error(message)),
             _ => Err(unexpected()),
         }

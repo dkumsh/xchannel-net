@@ -227,6 +227,46 @@ impl Default for TopicOptions {
     }
 }
 
+/// Health of one channel this node reads, as reported to a local client.
+///
+/// The design insists that "no new records" and "replication is broken" must never look alike
+/// (DESIGN: writer liveness vs membership liveness), so this carries both halves: how far along
+/// we are, and whether the machinery behind that number is working.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SubscriptionStatus {
+    /// The channel is hosted by **this** node, so it is read from the origin directly and
+    /// there is no subscription: nothing can lag, and `owner_live` is trivially true.
+    pub local: bool,
+    /// The background replication loop is running (`false` once stopped, or when `local`).
+    pub active: bool,
+    /// Absolute index the local copy has reached.
+    pub synced: RecordIndex,
+    /// The source's head **as of the last successful (re)connect** — from `SubscribeAck`, which
+    /// is a snapshot, not a live value. `head_at_connect - synced` measures catch-up progress
+    /// after connecting; it says nothing about how far the source has run on since. Use
+    /// [`last_record_at_ms`](Self::last_record_at_ms) for live staleness.
+    pub head_at_connect: RecordIndex,
+    /// Node hosting the authoritative writer.
+    pub owner: NodeId,
+    /// Whether that owner is currently a **live member** (recent heartbeat). This is
+    /// *membership* liveness — it says the owner's manager is reachable, not that its
+    /// application is still writing.
+    pub owner_live: bool,
+    /// Incarnation of the channel being read. A change means the name was reclaimed and this
+    /// is a different log; a consumer holding per-channel state must reset it.
+    pub generation: u64,
+    /// Unix-millis when a record was last applied; `0` if none has been since the loop started.
+    /// This is the live signal: a source that is merely quiet still has a recent `synced`, while
+    /// a broken one goes stale here while `owner_live` may still read true.
+    pub last_record_at_ms: u64,
+    /// Replica rebuilds caused by falling behind the source's retention.
+    pub rebuilds_gap: u64,
+    /// Replica rebuilds caused by the name being reclaimed (a different incarnation).
+    pub rebuilds_diverged: u64,
+    /// Unix-millis of the most recent rebuild; `0` if there has never been one.
+    pub last_rebuild_at_ms: u64,
+}
+
 /// Client → local daemon request (the client↔manager control protocol). A client never
 /// talks to remote nodes; it asks its local daemon, which handles registration,
 /// discovery, and replication, and replies with a local path the client opens itself.
@@ -259,6 +299,10 @@ pub enum ClientRequest {
         member: ChannelName,
         options: ChannelOptions,
     },
+    /// Ask how a channel this node reads is doing — replication progress and whether the
+    /// machinery behind it is healthy. Replies [`Status`](ClientReply::Status), or
+    /// [`Error`](ClientReply::Error) if this node neither hosts nor subscribes to the name.
+    SubscriptionStatus { name: ChannelName },
 }
 
 /// Local daemon → client reply.
@@ -268,6 +312,9 @@ pub enum ClientReply {
     Created { path: String },
     /// Replica is being synced; open a `Reader` at this local path.
     Subscribed { replica_path: String },
+    /// Health of a channel this node reads (reply to
+    /// [`SubscriptionStatus`](ClientRequest::SubscriptionStatus)).
+    Status(SubscriptionStatus),
     /// The request failed (name taken by another owner, resolve timeout, IO error, …).
     Error { message: String },
 }

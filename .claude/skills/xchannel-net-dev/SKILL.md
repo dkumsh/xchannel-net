@@ -179,6 +179,10 @@ _As of 2026-06-22:_
     channel left nothing named after itself. Deletion is `remove_dir_all`, not a glob.
   - **A `Subscribe` for a channel this node hosts returns the origin**, not a replica — no
     self-replication over loopback, no second copy with its own retention.
+  - **`SubscriptionStatus` RPC** (`Client::subscription_status` / `Node::subscription_status`):
+    progress (`synced`, `head_at_connect`) reported separately from liveness (`owner_live`,
+    `last_record_at_ms`) plus rebuild counts by cause, so "quiet" and "broken" never look alike.
+    `head_at_connect` is a `SubscribeAck` snapshot — not a live head.
   - **Cross-process test** spawns the real `xchanneld` and replicates via `Client` across
     processes (reads the replica — only possible cross-process). `Client::subscribe`
     retries the replica open (async creation race).
