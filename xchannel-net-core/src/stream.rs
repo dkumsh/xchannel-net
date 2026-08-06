@@ -623,7 +623,7 @@ mod tests {
             .expect("a caught-up resume must be accepted");
         assert_eq!(client.expected_index(), RecordIndex(4));
         drop(client);
-        drop(server.join().unwrap());
+        server.join().unwrap();
     }
 
     #[test]

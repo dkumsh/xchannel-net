@@ -23,7 +23,12 @@ no muxes, so a pre-existing topic does not resume merging until a client re-issu
 Reconstruct topics from the data dir itself, with **no new persisted metadata** (keeps the
 layering clean: xchannel stays topic-agnostic; a topic is "just a channel"):
 
-1. **Scan** `data_dir` for channel base files (skip `.replicas/`, `.lock`, the client socket).
+1. **Scan** `data_dir` for channel **directories** (skip `.replicas/` and other dot-entries).
+   Each channel owns a directory holding its xchannel segments as `log`, `log.1`, … so the scan
+   needs no heuristic: it never has to guess whether `md.aapl.4` is a channel or a rolled
+   segment of `md.aapl`, and a channel whose segment 0 has been pruned by retention — the
+   *unsuffixed* file, so nothing on disk would otherwise bear its name — still announces itself
+   by its directory.
 2. **Identify** topics by content: a topic channel carries mux **control records**; a channel
    with a decodable `SlotTable` record is a topic. (A regular channel colliding on `msg_type
    0xFFFF` *and* decoding as a valid slot table is vanishingly unlikely, and re-host of such a
@@ -31,8 +36,8 @@ layering clean: xchannel stays topic-agnostic; a topic is "just a channel"):
 3. **Re-host**: `Mux::open` (recovers per-member cursors from the tail) → register the topic
    channel in the registry + announce it → insert into the mux map.
 4. **Re-attach members** named in the topic's most recent slot table: a **local** member by its
-   origin file (`data_dir/<name>`), a **remote** member by its on-disk replica
-   (`data_dir/.replicas/<name>`), re-registering it with `member_of = topic` so the normal
+   origin log (`data_dir/<name>/log`), a **remote** member by its on-disk replica
+   (`data_dir/.replicas/<name>/log`), re-registering it with `member_of = topic` so the normal
    discovery loop re-subscribes it once its owner is reachable.
 
 On a **mesh**, peer anti-entropy also restores `member_of`, so the same discovery loop

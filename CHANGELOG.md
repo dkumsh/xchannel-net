@@ -46,6 +46,19 @@ channel — locally readable, network-replicable), without violating single-writ
   topic head, gaps emitted, slot-table version (§8).
 
 ### Fixed
+- **Every channel now owns a directory** — origins at `data_dir/<name>/log`, replicas at
+  `data_dir/.replicas/<name>/log`, with xchannel's segments (`log.1`, `log.2`, …) inside it.
+  The flat layout put channel names and segment suffixes in one namespace, and channel names may
+  contain dots (the recommended separator), so the files of a channel named `md.aapl.1` were
+  indistinguishable from segment 1 of `md.aapl` — and `WriterBuilder::build` reopens an existing
+  path rather than failing, so the second registrant would have adopted the first's segment.
+  It also broke restart recovery: retention unlinks segment 0, which is the *unsuffixed* file, so
+  a channel that had rolled past its retention window left only `md.aapl.4`, `md.aapl.5` on disk
+  with nothing bearing its name. `reconstruct_from_disk` then registered phantom channels named
+  after the surviving segments and never re-hosted the real one — silent loss of every rolled
+  channel across a restart. The scan is now "one subdirectory, one channel", with no heuristic,
+  and channel deletion is an exact `remove_dir_all` instead of a filename glob.
+  **On-disk layout change**: pre-existing data directories are not migrated.
 - **A replica from a different incarnation of a name is never resumed onto.** `Subscribe` now
   carries the incarnation the subscriber's replica holds — xchannel's `ChannelHeader.generation`,
   which for our origins is the registry's reclaim `epoch` — and the source refuses the resume if

@@ -50,6 +50,23 @@ const MAX_CONNECTIONS: usize = 4096;
 /// (`doc/TOPICS.md` §4.3).
 const MAX_BATCH_PER_MEMBER: usize = 256;
 
+/// Filename of the log inside a channel's own directory.
+///
+/// **Every channel owns a directory** — `data_dir/<name>/` for an origin,
+/// `data_dir/.replicas/<name>/` for a replica — and xchannel's segments live inside it as
+/// `log`, `log.1`, `log.2`, …
+///
+/// The alternative (a channel's log directly at `data_dir/<name>`) put channel names and
+/// xchannel's segment suffixes in **one namespace**, and channel names may contain dots: the
+/// files of a channel named `md.aapl.1` are indistinguishable from segment 1 of `md.aapl`.
+/// That is not exotic — dots are the recommended separator. It also made restart recovery
+/// guess: retention unlinks segment 0, which is the *unsuffixed* file, so a rolled channel
+/// past its retention window left only `md.aapl.4`, `md.aapl.5` on disk, with nothing named
+/// `md.aapl` for a scan to key on. A directory per channel removes the ambiguity by
+/// construction — names live in the directory namespace, segment suffixes in the file
+/// namespace — and makes deletion exact (`remove_dir_all`) rather than glob-matched.
+const CHANNEL_LOG_FILE: &str = "log";
+
 /// Create a directory (and parents) and restrict it to the owner (`0700` on Unix), so
 /// other local users can't read channel files beneath it.
 fn ensure_private_dir(path: &Path) -> io::Result<()> {
@@ -80,41 +97,6 @@ fn validate_channel_name(name: &str) -> io::Result<()> {
             "channel name must be 1..=200 chars of [A-Za-z0-9._-] with no leading dot",
         ))
     }
-}
-
-/// Delete every segment of the channel based at `base` — `<name>`, its rolled `<name>.N`
-/// siblings, and any `.partial` left by an interrupted roll — so the next subscribe rebuilds
-/// the replica from scratch. Used when a source refuses to extend a replica (behind retention,
-/// or a different incarnation of the name).
-///
-/// Matches `<name>` and `<name>.<digits>` exactly, never a prefix, so a sibling channel called
-/// `<name>-other` is untouched. It cannot, however, distinguish a segment `foo.1` from a
-/// channel legitimately *named* `foo.1`, since channel names may contain dots and all replicas
-/// share one directory — a pre-existing ambiguity in the flat replica layout, tracked
-/// separately; the same collision already lets two such channels share files.
-fn remove_replica(base: &Path) -> io::Result<()> {
-    let (Some(dir), Some(stem)) = (base.parent(), base.file_name().and_then(|n| n.to_str())) else {
-        return Ok(());
-    };
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let is_segment = name == stem
-            || name
-                .strip_prefix(stem)
-                .and_then(|rest| rest.strip_prefix('.'))
-                .is_some_and(|rest| {
-                    let rest = rest.strip_suffix(".partial").unwrap_or(rest);
-                    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
-                })
-            || name == format!("{stem}.partial");
-        if is_segment {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
-    Ok(())
 }
 
 /// RAII token counting one live connection against [`MAX_CONNECTIONS`].
@@ -379,8 +361,8 @@ impl Node {
         // Delete the on-disk channel so a later restart's data-dir scan can't resurrect this
         // deregistered name (`reconstruct_from_disk` has no tombstone to consult on an isolated
         // restart — the registry is rebuilt from scratch). Deregistration is deliberate removal.
-        if let Ok(path) = self.channel_path(name) {
-            xchannel::cleanup_channel_files(&path);
+        if let Ok(dir) = self.channel_dir(name) {
+            let _ = std::fs::remove_dir_all(&dir);
         }
         Ok(true)
     }
@@ -633,29 +615,22 @@ impl Node {
         let Ok(rd) = std::fs::read_dir(&self.config.data_dir) else {
             return;
         };
+        // One subdirectory per channel, so the scan needs no heuristic: no guessing whether
+        // `md.aapl.4` is a channel or a rolled segment, and a channel whose segment 0 has been
+        // pruned still announces itself by its directory.
         let names: Vec<String> = rd
             .flatten()
-            .filter(|e| e.path().is_file())
+            .filter(|e| e.path().is_dir())
             .filter_map(|e| e.file_name().to_str().map(String::from))
+            .filter(|name| !name.starts_with('.')) // .replicas and other dot-entries
+            .filter(|name| validate_channel_name(name).is_ok())
             .collect();
-        let present: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
         let mut topics: Vec<(String, mux::TopicConfig)> = Vec::new();
         let mut origins: Vec<String> = Vec::new();
         for name in &names {
-            if name.starts_with('.') {
-                continue; // .lock and other dotfiles
-            }
-            // Skip a rolled segment "<base>.<n>" whose base channel is also present.
-            if let Some((base, suffix)) = name.rsplit_once('.')
-                && suffix.parse::<u64>().is_ok()
-                && present.contains(base)
-            {
+            let Ok(path) = self.channel_path(name) else {
                 continue;
-            }
-            if validate_channel_name(name).is_err() {
-                continue;
-            }
-            let path = self.config.data_dir.join(name);
+            };
             match mux::topic_config(&path) {
                 Ok(Some(cfg)) => topics.push((name.clone(), cfg)),
                 Ok(None) => origins.push(name.clone()),
@@ -835,8 +810,8 @@ impl Node {
         }
         // Delete the topic channel on disk so a later restart's data-dir scan can't re-host this
         // retired topic (the terminal marker above is best-effort for still-connected subscribers).
-        if let Ok(path) = self.channel_path(topic) {
-            xchannel::cleanup_channel_files(&path);
+        if let Ok(dir) = self.channel_dir(topic) {
+            let _ = std::fs::remove_dir_all(&dir);
         }
         Ok(true)
     }
@@ -868,18 +843,42 @@ impl Node {
         Ok(())
     }
 
-    /// Path of an **origin** channel this node hosts: `data_dir/<name>`.
-    fn channel_path(&self, name: &str) -> io::Result<PathBuf> {
+    // ---------------- on-disk layout ----------------
+    //
+    // **INVARIANT: every channel path is built by one of the four helpers below.** Nothing
+    // else may join a channel name onto `data_dir` — a stray `data_dir.join(name)` silently
+    // reintroduces the flat layout for that one call site, and with it the collision between
+    // channel names and xchannel's segment suffixes that [`CHANNEL_LOG_FILE`] describes.
+    // The directory-per-channel guarantee is a convention these helpers uphold, not something
+    // the type system or xchannel enforces: xchannel is handed a base path and appends `.1`,
+    // `.2`, … to it, knowing nothing about directories.
+    //
+    // The convention stops here. Clients receive a finished path in `ClientReply` and open it
+    // opaquely, so they never construct one and the layout can change again without touching
+    // them.
+
+    /// Directory holding an **origin** channel this node hosts: `data_dir/<name>`.
+    fn channel_dir(&self, name: &str) -> io::Result<PathBuf> {
         validate_channel_name(name)?;
         Ok(self.config.data_dir.join(name))
     }
 
-    /// Path of a **replica** this node maintains: `data_dir/.replicas/<name>`. Kept in a
-    /// separate subtree so a replica never collides with a same-named origin (notably for a
-    /// node subscribing to a channel it also hosts).
-    fn replica_path(&self, name: &str) -> io::Result<PathBuf> {
-        self.channel_path(name)?; // validate the name
+    /// Path of the log inside a channel's own directory.
+    fn channel_path(&self, name: &str) -> io::Result<PathBuf> {
+        Ok(self.channel_dir(name)?.join(CHANNEL_LOG_FILE))
+    }
+
+    /// Directory holding a **replica** this node maintains.
+    fn replica_dir(&self, name: &str) -> io::Result<PathBuf> {
+        validate_channel_name(name)?;
         Ok(self.config.data_dir.join(".replicas").join(name))
+    }
+
+    /// Path of the log inside a **replica**'s directory: `data_dir/.replicas/<name>/log`. The
+    /// separate `.replicas` subtree keeps a replica from colliding with a same-named origin
+    /// (notably when a node subscribes to a channel it also hosts).
+    fn replica_path(&self, name: &str) -> io::Result<PathBuf> {
+        Ok(self.replica_dir(name)?.join(CHANNEL_LOG_FILE))
     }
 
     // ---------------- stream plane (serve) ----------------
@@ -1188,7 +1187,12 @@ impl Node {
                     // and let the next attempt subscribe from scratch. Only ever taken for
                     // this classified failure: doing it on a transient error would throw away
                     // a whole channel's history over a dropped connection.
-                    let _ = remove_replica(&replica_path);
+                    if let Ok(dir) = self.replica_dir(&name) {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        // Recreate it: the next attempt's sink opens a writer *inside* this
+                        // directory and will not create it.
+                        let _ = ensure_private_dir(&dir);
+                    }
                     synced.store(0, Ordering::Relaxed);
                     std::thread::sleep(BACKOFF);
                     continue;
@@ -1521,44 +1525,78 @@ mod tests {
         assert_eq!(seen, new_n, "old incarnation's records are gone");
     }
 
-    /// `remove_replica` must take a channel's own segments and nothing else — replicas of
-    /// every channel share one flat directory, so an over-eager prefix match would delete a
-    /// neighbour's data.
+    /// Names that look like segment filenames must not collide. Channel names may contain
+    /// dots (they are the recommended separator), so `md.aapl.1` is both a plausible channel
+    /// name and what segment 1 of `md.aapl` used to be called. With a directory per channel the
+    /// two cannot meet.
     #[test]
-    fn remove_replica_takes_only_its_own_segments() {
-        let dir = temp_dir("remove-replica");
-        std::fs::create_dir_all(&dir).unwrap();
-        let base = dir.join("md.aapl");
-        for f in [
-            "md.aapl",         // the base segment
-            "md.aapl.1",       // a rolled segment
-            "md.aapl.2",       // another
-            "md.aapl.partial", // an interrupted roll
-            "md.aapl.3.partial",
-        ] {
-            std::fs::write(dir.join(f), b"x").unwrap();
+    fn a_channel_named_like_a_segment_does_not_collide() {
+        let node = Node::new(config(51, temp_dir("segment-name")));
+
+        // `md.aapl` rolls twice, so segments 1 and 2 exist.
+        {
+            let mut w = node.host_channel("md.aapl", 1 << 20, 0, |b| b).unwrap();
+            for i in 0..3u64 {
+                let buf = w.try_reserve(4).unwrap();
+                buf.copy_from_slice(b"base");
+                w.commit(0, 4, i).unwrap();
+                w.roll_file().unwrap();
+            }
         }
-        for f in [
-            "md.aapl-other", // a different channel sharing a prefix
-            "md.aaplX",
-            "md.aapl.snapshot", // dots are legal in names: a channel, not a segment
-        ] {
-            std::fs::write(dir.join(f), b"x").unwrap();
+        // A channel whose *name* is what a segment used to be called.
+        {
+            let mut w = node.host_channel("md.aapl.1", 1 << 20, 0, |b| b).unwrap();
+            let buf = w.try_reserve(5).unwrap();
+            buf.copy_from_slice(b"other");
+            w.commit(0, 5, 0).unwrap();
         }
 
-        remove_replica(&base).unwrap();
+        // Distinct directories, so neither adopted the other's files.
+        let mut r = ReaderBuilder::new(node.channel_path("md.aapl.1").unwrap())
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        let first = r.try_read().unwrap().unwrap().payload().to_vec();
+        assert_eq!(first, b"other", "md.aapl.1 must hold its own records");
+        assert!(r.try_read().unwrap().is_none(), "and only its own");
+    }
 
-        for f in [
-            "md.aapl",
-            "md.aapl.1",
-            "md.aapl.2",
-            "md.aapl.partial",
-            "md.aapl.3.partial",
-        ] {
-            assert!(!dir.join(f).exists(), "{f} should have been removed");
+    /// Retention unlinks segment 0 — the channel's *unsuffixed* file — so a rolled channel
+    /// past its retention window has no file bearing its name. Its directory still does, which
+    /// is what lets a restart re-host it instead of inventing channels named after the
+    /// surviving segments.
+    #[test]
+    fn a_rolled_and_pruned_channel_is_rehosted_after_restart() {
+        let dir = temp_dir("pruned-restart");
+        let node = Node::new(config(52, dir.clone()));
+        {
+            let mut w = node
+                .host_channel("md.aapl", 1 << 20, 0, |b| b.keep_files(2))
+                .unwrap();
+            for i in 0..4u64 {
+                let buf = w.try_reserve(4).unwrap();
+                buf.copy_from_slice(b"tick");
+                w.commit(0, 4, i).unwrap();
+                w.roll_file().unwrap();
+            }
         }
-        for f in ["md.aapl-other", "md.aaplX", "md.aapl.snapshot"] {
-            assert!(dir.join(f).exists(), "{f} must be left alone");
+        assert!(
+            !node.channel_path("md.aapl").unwrap().exists(),
+            "retention should have pruned segment 0, the unsuffixed file"
+        );
+
+        // A fresh daemon on the same data dir reconstructs from what is on disk.
+        let restarted = Node::new(config(52, dir));
+        restarted.reconstruct_from_disk();
+        assert!(
+            restarted.registry.lock_safe().get("md.aapl").is_some(),
+            "the channel must be re-hosted under its own name"
+        );
+        for phantom in ["md.aapl.1", "md.aapl.2", "md.aapl.3", "log", "log.1"] {
+            assert!(
+                restarted.registry.lock_safe().get(phantom).is_none(),
+                "a surviving segment must not be registered as a channel: {phantom}"
+            );
         }
     }
 

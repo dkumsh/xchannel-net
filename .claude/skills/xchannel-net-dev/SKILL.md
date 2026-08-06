@@ -170,8 +170,13 @@ _As of 2026-06-22:_
     socket shutdown to interrupt blocked reads). Idempotent `subscribe` RPC.
   - **Control-plane reconnection**: maintenance re-dials dropped seeds (tracked outbound
     peers, deduped, bounded `connect_timeout`).
-  - **Replicas live under `data_dir/.replicas/<name>`**, distinct from origins
-    (`data_dir/<name>`) — no collision when a node subscribes to a channel it also hosts.
+  - **Every channel owns a directory**: origins at `data_dir/<name>/log`, replicas at
+    `data_dir/.replicas/<name>/log` (+ `log.1`, `log.2` segments). The `.replicas` subtree keeps
+    a replica from colliding with a same-named origin. The per-channel directory keeps *channel
+    names* and *xchannel's segment suffixes* in separate namespaces — names may contain dots, so
+    a flat layout made `md.aapl.1` (a channel) indistinguishable from segment 1 of `md.aapl`, and
+    made restart guess: retention unlinks segment 0, the unsuffixed file, so a rolled+pruned
+    channel left nothing named after itself. Deletion is `remove_dir_all`, not a glob.
   - **Cross-process test** spawns the real `xchanneld` and replicates via `Client` across
     processes (reads the replica — only possible cross-process). `Client::subscribe`
     retries the replica open (async creation race).
