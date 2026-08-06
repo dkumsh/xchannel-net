@@ -299,6 +299,10 @@ pub enum ClientRequest {
         member: ChannelName,
         options: ChannelOptions,
     },
+    /// Withdraw a channel this node owns: tombstone it in the registry, disseminate that, and
+    /// delete its files. Only the owner may do this — a request for a name owned elsewhere
+    /// reports `existed: false` rather than removing anything.
+    Deregister { name: ChannelName },
     /// Ask how a channel this node reads is doing — replication progress and whether the
     /// machinery behind it is healthy. Replies [`Status`](ClientReply::Status), or
     /// [`Error`](ClientReply::Error) if this node neither hosts nor subscribes to the name.
@@ -312,6 +316,9 @@ pub enum ClientReply {
     Created { path: String },
     /// Replica is being synced; open a `Reader` at this local path.
     Subscribed { replica_path: String },
+    /// The channel was withdrawn; `existed` is false if this node did not own a live channel
+    /// by that name (already deregistered, never registered, or owned by another node).
+    Deregistered { existed: bool },
     /// Health of a channel this node reads (reply to
     /// [`SubscriptionStatus`](ClientRequest::SubscriptionStatus)).
     Status(SubscriptionStatus),

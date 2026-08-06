@@ -423,6 +423,7 @@ mod client_req_tag {
     pub const CREATE_TOPIC: u8 = 2;
     pub const PUBLISH_TO_TOPIC: u8 = 3;
     pub const SUBSCRIPTION_STATUS: u8 = 4;
+    pub const DEREGISTER: u8 = 5;
 }
 
 mod client_reply_tag {
@@ -430,6 +431,7 @@ mod client_reply_tag {
     pub const SUBSCRIBED: u8 = 1;
     pub const ERROR: u8 = 2;
     pub const STATUS: u8 = 3;
+    pub const DEREGISTERED: u8 = 4;
 }
 
 fn put_status(w: &mut W, s: &SubscriptionStatus) {
@@ -525,6 +527,10 @@ pub fn encode_client_request(m: &ClientRequest) -> Vec<u8> {
             w.u8(client_req_tag::SUBSCRIPTION_STATUS);
             w.str(name);
         }
+        ClientRequest::Deregister { name } => {
+            w.u8(client_req_tag::DEREGISTER);
+            w.str(name);
+        }
     }
     buf
 }
@@ -550,6 +556,7 @@ pub fn decode_client_request(bytes: &[u8]) -> io::Result<ClientRequest> {
             options: get_options(&mut r)?,
         },
         client_req_tag::SUBSCRIPTION_STATUS => ClientRequest::SubscriptionStatus { name: r.str()? },
+        client_req_tag::DEREGISTER => ClientRequest::Deregister { name: r.str()? },
         _ => return Err(invalid("unknown ClientRequest tag")),
     };
     r.finish()?;
@@ -576,6 +583,10 @@ pub fn encode_client_reply(m: &ClientReply) -> Vec<u8> {
             w.u8(client_reply_tag::STATUS);
             put_status(&mut w, status);
         }
+        ClientReply::Deregistered { existed } => {
+            w.u8(client_reply_tag::DEREGISTERED);
+            w.u8(*existed as u8);
+        }
     }
     buf
 }
@@ -589,6 +600,9 @@ pub fn decode_client_reply(bytes: &[u8]) -> io::Result<ClientReply> {
         },
         client_reply_tag::ERROR => ClientReply::Error { message: r.str()? },
         client_reply_tag::STATUS => ClientReply::Status(get_status(&mut r)?),
+        client_reply_tag::DEREGISTERED => ClientReply::Deregistered {
+            existed: r.u8()? != 0,
+        },
         _ => return Err(invalid("unknown ClientReply tag")),
     };
     r.finish()?;
@@ -719,6 +733,9 @@ mod tests {
             ClientRequest::SubscriptionStatus {
                 name: "md.aapl".into(),
             },
+            ClientRequest::Deregister {
+                name: "md.aapl".into(),
+            },
         ];
         for m in &requests {
             assert_eq!(
@@ -750,6 +767,7 @@ mod tests {
                 rebuilds_diverged: 3,
                 last_rebuild_at_ms: 1_759_999_999_000,
             }),
+            ClientReply::Deregistered { existed: true },
         ];
         for m in &replies {
             assert_eq!(&decode_client_reply(&encode_client_reply(m)).unwrap(), m);

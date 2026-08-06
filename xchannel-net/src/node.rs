@@ -977,9 +977,23 @@ impl Node {
                 d.pump()?
             };
             if !pumped.is_empty() {
-                let mut reg = self.registry.lock_safe();
-                for id in pumped {
-                    reg.merge(id);
+                let mut retired = Vec::new();
+                {
+                    let mut reg = self.registry.lock_safe();
+                    for id in pumped {
+                        let name = id.name.clone();
+                        if reg.merge(id).deleted {
+                            retired.push(name);
+                        }
+                    }
+                }
+                // A tombstone we just learned about retires any subscription we hold for that
+                // name. Without this the loop keeps re-resolving a channel the network has
+                // agreed is gone, and local readers keep being handed a replica that will
+                // never advance again — indistinguishable, from the outside, from a source
+                // that has merely gone quiet.
+                for name in retired {
+                    self.retire_subscription(&name);
                 }
             }
             // Retire members whose owner has been dead too long (opt-in), then react to
@@ -987,6 +1001,17 @@ impl Node {
             self.reap_dead_members();
             self.attach_pending_members();
             std::thread::sleep(interval);
+        }
+    }
+
+    /// Stop and forget a subscription for a name that has been tombstoned. Distinct from
+    /// [`unsubscribe`](Self::unsubscribe) only in intent: this is the network telling us the
+    /// channel is gone, not a client losing interest. The replica's files are left in place —
+    /// the records it already holds are still valid history, and discarding them is the
+    /// reader's call, not ours.
+    fn retire_subscription(&self, name: &str) {
+        if let Some(sub) = self.subscriptions.lock_safe().remove(name) {
+            sub.stop();
         }
     }
 
@@ -1100,6 +1125,15 @@ impl Node {
                 member,
                 options,
             } => created_or_error(self.publish_to_topic(&topic, &member, options)),
+            ClientRequest::Deregister { name } => match self.deregister(&name) {
+                Ok(existed) => {
+                    self.retire_subscription(&name);
+                    ClientReply::Deregistered { existed }
+                }
+                Err(e) => ClientReply::Error {
+                    message: e.to_string(),
+                },
+            },
             ClientRequest::SubscriptionStatus { name } => match self.subscription_status(&name) {
                 Some(status) => ClientReply::Status(status),
                 None => ClientReply::Error {
@@ -1713,6 +1747,72 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, new_n, "old incarnation's records are gone");
+    }
+
+    /// When the owner withdraws a channel, a subscriber must learn that its source is *gone*
+    /// rather than merely quiet: the tombstone converges, and the subscription is retired
+    /// instead of re-resolving a name the network has agreed no longer exists.
+    #[test]
+    fn a_tombstone_retires_a_subscriber() {
+        let (a, _a_stream, a_control) = start(91, "tombstone-a");
+        let (b, _b_stream, _b_control) = start(92, "tombstone-b");
+        let n = 4u64;
+        {
+            let mut w = a.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap();
+            for i in 0..n {
+                let buf = w.try_reserve(4).unwrap();
+                buf.copy_from_slice(b"tick");
+                w.commit(0, 4, i).unwrap();
+            }
+        }
+        b.connect_control_peer(a_control).unwrap();
+        let sub = b
+            .subscribe("md.aapl", Some(Duration::from_secs(5)))
+            .unwrap();
+        poll_until(|| (sub.synced_index() == n).then_some(()));
+        let replica = sub.replica_path().to_path_buf();
+        b.subscriptions
+            .lock_safe()
+            .insert("md.aapl".to_string(), sub);
+
+        // The owner withdraws it through the client RPC.
+        let reply = a.handle_request(ClientRequest::Deregister {
+            name: "md.aapl".into(),
+        });
+        assert_eq!(reply, ClientReply::Deregistered { existed: true });
+
+        // B converges on the tombstone and retires its subscription.
+        poll_until(|| {
+            b.subscriptions
+                .lock_safe()
+                .get("md.aapl")
+                .is_none()
+                .then_some(())
+        });
+        assert!(
+            b.subscription_status("md.aapl").is_none(),
+            "a retired subscription must not keep reporting as a live source"
+        );
+
+        // The replica's files stay: the records it holds are still valid history, and
+        // discarding them is the reader's decision, not ours.
+        let mut r = ReaderBuilder::new(&replica)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        let mut seen = 0u64;
+        while r.try_read().unwrap().is_some() {
+            seen += 1;
+        }
+        assert_eq!(seen, n, "history already replicated is not thrown away");
+
+        // Deregistering again is not an error — it simply reports nothing was there.
+        assert_eq!(
+            a.handle_request(ClientRequest::Deregister {
+                name: "md.aapl".into()
+            }),
+            ClientReply::Deregistered { existed: false }
+        );
     }
 
     /// Status must distinguish a source that is merely quiet from one whose replication is

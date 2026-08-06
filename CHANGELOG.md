@@ -42,6 +42,15 @@ channel — locally readable, network-replicable), without violating single-writ
   retired name.
 - **`XCHANNELD_SEEDS`**: configure seed peers (comma-separated control `host:port`) for the
   daemon to form/re-form the mesh.
+- **`Deregister` client RPC** (`Client::deregister`): withdraw a channel this node owns —
+  tombstone it, disseminate that, delete its files. Returns whether a live channel of that name
+  was actually owned here; "already gone" and "owned elsewhere" both report `false` rather than
+  erroring. The machinery existed but had no client-facing way to invoke it.
+- **A tombstone now retires subscribers proactively.** Merging a `deleted` identity stops any
+  subscription held for that name, instead of leaving the loop re-resolving a channel the
+  network has agreed is gone — which local readers could not distinguish from a source that had
+  merely gone quiet. The replica's files are left in place: the history it already holds is
+  still valid, and discarding it is the reader's call.
 - **`SubscriptionStatus` client RPC** (`Client::subscription_status`): per-channel replication
   health — `synced`, `head_at_connect`, `owner`, `owner_live`, `generation`,
   `last_record_at_ms`, and rebuild counts by cause. It reports progress and liveness

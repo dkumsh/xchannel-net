@@ -155,6 +155,22 @@ impl Client {
         }
     }
 
+    /// Withdraw a channel this node owns: tombstone it network-wide and delete its files.
+    /// Returns whether a live channel of that name was actually owned here — `false` covers
+    /// "already gone" and "owned by another node" alike, since neither is an error.
+    ///
+    /// Subscribers converge on the tombstone and retire their subscriptions; their replicas
+    /// keep the history they already hold, which stays valid, but will never advance again.
+    pub fn deregister(&mut self, name: &str) -> io::Result<bool> {
+        match self.request(&ClientRequest::Deregister {
+            name: name.to_string(),
+        })? {
+            ClientReply::Deregistered { existed } => Ok(existed),
+            ClientReply::Error { message } => Err(rpc_error(message)),
+            _ => Err(unexpected()),
+        }
+    }
+
     /// Health of a channel this node reads — replication progress plus whether the machinery
     /// behind it is working. Errors if the local daemon neither hosts nor subscribes to `name`.
     ///
