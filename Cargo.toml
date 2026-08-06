@@ -19,8 +19,11 @@ authors = ["Dmitriy Kumshayev <dq@mail.com>"]
 # `Reader::head_record_index()` (true `SubscribeAck.head`); 4.2.0 adds `Reader::region_size()`
 # + `mtu()`, used to recover geometry when re-registering origins on restart (§5.2); 4.3.0 adds
 # `Reader::file_sequence()`, which makes the origin's roll boundaries observable so replicas can
-# mirror its segmentation (and therefore its `keep_files` retention).
-xchannel = { version = "4.3.0" }
+# mirror its segmentation (and therefore its `keep_files` retention); 4.4.0 adds
+# `ChannelHeader.generation`, the incarnation id that lets a replica tell "this log continues"
+# from "this name was reclaimed by a new owner" (registry epoch goes here). 5.0.0 is
+# `format_version = 3` — `channel_name` widened 20 → 48 bytes; greenfield, v2 files are refused.
+xchannel = { version = "5.0.0" }
 
 # Internal crates referencing each other. `version` is required for crates.io publishing
 # (the registry rejects a bare path dep); the `path` still wins for local/workspace builds.
