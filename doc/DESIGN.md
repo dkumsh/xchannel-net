@@ -221,16 +221,31 @@ reads/writes a purely local xchannel (the master it owns, or a replica kept sync
 
 ### Owner side — `ReplicationSource`
 - Opens a **`LateJoin` reader from the earliest retained sequence** (full history).
-- Emits one `RecordFrame` per **`User`** record. `Roll`/`Skip` markers are local file
-  artifacts and are **consumed and skipped** — they never cross the network.
+- Emits one `RecordFrame` per **`User`** record. `Skip` markers are local region artifacts and
+  are **consumed and skipped** — they never cross the network.
+- **Roll boundaries do cross, as an advisory hint** (amends the original "geometry is purely
+  local" rule). xchannel consumes `Roll` markers transparently, so the source detects a roll by
+  sampling `Reader::file_sequence()` (xchannel 4.3.0) around each read and sets
+  `RecordFrame::starts_segment` on the record that follows one. **Why:** `keep_files` prunes by
+  *file count*, so a replica that rolls on its own schedule retains a different window than the
+  origin. An origin that rolls explicitly (`Writer::roll_file`, e.g. to begin every segment with
+  a snapshot) with no `file_roll_size` set would leave its replicas rolling **never** — one
+  unbounded file per channel per node. Mirroring the boundary makes `keep_files` mean the same
+  thing on both sides. The hint rides *on* the record it precedes, so there is no separate
+  signal to lose and a resuming subscriber re-derives it from the source's own segmentation.
+  It stays **advisory**: this is awareness of the origin's geometry, not custody of it — a sink
+  may ignore it (the mux does, since members' boundaries mean nothing to a merged topic).
 - Tails the log like any other reader, so the single authoritative `Writer` is **never
   blocked** by slow subscribers. A slow subscriber reads from the persisted log.
 
 ### Subscriber side — `ReplicationSink`
 - Builds a local replica `Writer` with **geometry compatible** with the source
   (`region_size`, `mtu` from the registry identity).
-- For each received frame: assert contiguous `index` (detect gaps/reorder),
-  `try_reserve(len)`, copy payload, `commit(msg_type, len, user_meta)`.
+- For each received frame: assert contiguous `index` (detect gaps/reorder), roll first if
+  `starts_segment` is set, `try_reserve(len)`, copy payload, `commit(msg_type, len, user_meta)`.
+  Rolling on the hint is unconditional: repeating a roll after a crash between one and the
+  first commit into the new segment costs one empty segment, while skipping it would misalign
+  the replica permanently.
 - The replica is record-identical; the manager hands local clients a plain
   `xchannel::Reader` over it (Live or LateJoin, the client's choice).
 

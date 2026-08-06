@@ -46,8 +46,18 @@ channel — locally readable, network-replicable), without violating single-writ
   topic head, gaps emitted, slot-table version (§8).
 
 ### Changed
-- Bumped `xchannel` **4.0.0 → 4.2.0** (adds `Reader::head_record_index()`, `region_size()`,
-  `mtu()` — generic, topic-agnostic accessors).
+- Bumped `xchannel` **4.0.0 → 4.3.0** (adds `Reader::head_record_index()`, `region_size()`,
+  `mtu()`, `file_sequence()` — generic, topic-agnostic accessors).
+- **Roll boundaries now replicate** (`RecordFrame::starts_segment`), amending the original rule
+  that file geometry is purely local. The source detects a roll by sampling
+  `Reader::file_sequence()` around each read and flags the record that follows it; the sink rolls
+  before applying that record, so a replica is segment-aligned with its origin and not merely
+  record-identical. **Why it matters:** `keep_files` prunes by file count, so an origin that rolls
+  explicitly (`Writer::roll_file`) with no `file_roll_size` — the shape a snapshot-per-segment
+  application wants — previously left its replicas rolling never, growing as one unbounded file
+  per channel per node. The hint rides on the record it precedes (nothing to desynchronize, and a
+  resuming subscriber re-derives it), stays advisory, and costs one byte per record. The mux
+  ignores it: a member's boundaries carry no meaning for a merged topic.
 
 ### Notes
 - Deliberate deviations from `doc/TOPICS.md`, all documented: the mux runs on its own thread

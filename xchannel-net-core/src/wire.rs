@@ -10,9 +10,9 @@ use std::net::SocketAddr;
 
 /// One self-describing log record as it travels on the data plane.
 ///
-/// This mirrors an xchannel `User` record exactly — `Roll`/`Skip` markers are local
-/// artifacts of the source's file geometry and never cross the network. The receiving
-/// side re-frames into its own replica `Writer`, making its own rolling decisions.
+/// The record fields mirror an xchannel `User` record exactly; `Skip` markers are local
+/// artifacts of the source's region geometry and never cross the network. `starts_segment`
+/// is the one exception to "file geometry is local" — see its docs.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RecordFrame {
     /// Logical position in the stream (counts only `User` records).
@@ -21,6 +21,19 @@ pub struct RecordFrame {
     pub msg_type: u16,
     /// Opaque per-message metadata (xchannel `user_meta_u64`).
     pub user_meta: u64,
+    /// The origin rolled to a new segment immediately before this record — i.e. this is the
+    /// first record of a new file at the source. An **advisory** hint the sink may ignore:
+    /// honoring it makes the replica's file boundaries mirror the origin's, which is what
+    /// makes `keep_files` retention mean the same thing on both sides. Without it a replica
+    /// rolls only when its own `file_roll_size` says so, and an origin that rolls explicitly
+    /// (`Writer::roll_file`, e.g. to start each segment with a snapshot) with no
+    /// `file_roll_size` set would leave its replicas growing as one unbounded file.
+    ///
+    /// The boundary travels *with* the record it precedes, so it cannot desynchronize: there
+    /// is no separate signal to lose, and a resuming subscriber gets the flag re-derived from
+    /// the source's own segmentation on reconnect. Never set on the first record a source
+    /// produces (nothing to roll away from). Carrying it costs one byte per record.
+    pub starts_segment: bool,
     /// Payload bytes.
     pub payload: Vec<u8>,
 }

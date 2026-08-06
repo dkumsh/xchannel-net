@@ -279,6 +279,7 @@ mod tests {
                 index: RecordIndex(101),
                 msg_type: 7,
                 user_meta: 0xDEAD_BEEF,
+                starts_segment: false,
                 payload: vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
             },
         };

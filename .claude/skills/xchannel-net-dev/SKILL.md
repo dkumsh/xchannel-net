@@ -28,8 +28,15 @@ orientation layer; when they disagree, DESIGN.md wins — and update both.
 - Records are self-describing (`msg_type: u16`, `length: u32`, `user_meta_u64`, payload).
   Replication = tail a `Reader` → ship each `User` record → `commit` into a `Writer` on
   the far side. Replicas are **record-identical, not byte-identical**.
-- **Only `User` records cross the network.** `Roll`/`Skip` markers are local file
-  artifacts of the source; the receiving `Writer` makes its own rolling decisions.
+- **Only `User` records cross the network** — plus one **advisory** geometry hint.
+  `Skip` markers are local region artifacts. `Roll` markers don't travel either, but *roll
+  boundaries* do: the source flags the record following a roll (`RecordFrame::starts_segment`,
+  detected via xchannel 4.3.0 `Reader::file_sequence()`) and the sink rolls before applying it,
+  so replicas are segment-aligned, not just record-identical. Without this, `keep_files` (which
+  prunes by file count) bounds the origin's disk but not the replica's — an origin that rolls
+  only explicitly (`roll_file`, no `file_roll_size`) leaves replicas as one unbounded file.
+  Advisory ⇒ a sink may ignore it; the mux does, since a member's boundaries mean nothing to a
+  merged topic. Amends DESIGN §4's "geometry is purely local".
 - **No-custody principle (DESIGN.md §5).** A node is a *forwarder + awareness service*,
   **never responsible for data** — unlike Kafka/NATS where `send()` transfers custody.
   The manager is **not in its own master's data path** (writer → mmap directly; manager

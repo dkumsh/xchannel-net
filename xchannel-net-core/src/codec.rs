@@ -320,6 +320,7 @@ pub fn encode_stream_into(buf: &mut Vec<u8>, m: &StreamMsg) {
             w.u64(frame.index.0);
             w.u16(frame.msg_type);
             w.u64(frame.user_meta);
+            w.u8(frame.starts_segment as u8);
             w.bytes(&frame.payload);
         }
         StreamMsg::Gap {
@@ -364,6 +365,7 @@ pub fn decode_stream(bytes: &[u8]) -> io::Result<StreamMsg> {
             let index = RecordIndex(r.u64()?);
             let msg_type = r.u16()?;
             let user_meta = r.u64()?;
+            let starts_segment = r.u8()? != 0;
             let payload = r.bytes()?.to_vec();
             StreamMsg::Record {
                 stream_id,
@@ -371,6 +373,7 @@ pub fn decode_stream(bytes: &[u8]) -> io::Result<StreamMsg> {
                     index,
                     msg_type,
                     user_meta,
+                    starts_segment,
                     payload,
                 },
             }
@@ -584,6 +587,7 @@ mod tests {
                     index: RecordIndex(101),
                     msg_type: 7,
                     user_meta: 0xDEAD_BEEF,
+                    starts_segment: true, // the roll-boundary hint round-trips
                     payload: vec![1, 2, 3, 4, 5],
                 },
             },
@@ -593,6 +597,7 @@ mod tests {
                     index: RecordIndex(102),
                     msg_type: 0,
                     user_meta: 0,
+                    starts_segment: false,
                     payload: vec![], // empty payload round-trips
                 },
             },

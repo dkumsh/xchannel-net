@@ -516,6 +516,10 @@ impl Mux {
     /// Merge the next ready record from slot `i` into the topic with provenance. Returns
     /// whether a record was merged (`false` = the member is currently caught up). Skips (drops,
     /// counting) any member record whose `msg_type` is in the reserved control range.
+    ///
+    /// A member's [`starts_segment`](crate::wire::RecordFrame::starts_segment) is deliberately
+    /// ignored: it is advisory, and members' file boundaries carry no meaning for a topic whose
+    /// records interleave many of them. The topic rolls on its own geometry.
     fn merge_one(&mut self, i: usize) -> io::Result<bool> {
         loop {
             let Some(frame) = self.slots[i].source.try_next_frame()? else {

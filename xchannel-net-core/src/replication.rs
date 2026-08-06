@@ -17,6 +17,13 @@
 //! running counter stays equal to the next file's base across rolls, with no per-record
 //! header read. The sink seeds the replica's `base_record_index` from the stream `start`
 //! so the replica's own headers carry absolute indices.
+//!
+//! Segmentation is mirrored too: the source reports a roll as
+//! [`RecordFrame::starts_segment`] on the record that follows it, and the sink rolls before
+//! applying that record. Replicas are therefore record-identical *and* segment-aligned, which
+//! is what makes the origin's `keep_files` retention mean the same thing on the replica — see
+//! [`RecordFrame::starts_segment`] for why the alternative (each side rolling on its own
+//! `file_roll_size`) does not bound a replica's disk at all when the origin rolls explicitly.
 
 use crate::RecordIndex;
 use crate::wire::RecordFrame;
@@ -62,17 +69,21 @@ impl ReplicationSource {
     }
 
     /// Block until the next `User` record is available and return it as a frame.
-    /// `Roll`/`Skip` markers are consumed by the reader and never surface here.
+    /// `Roll`/`Skip` markers are consumed by the reader and never surface here; a roll is
+    /// reported as [`RecordFrame::starts_segment`] on the record that follows it.
     pub fn next_frame(&mut self) -> io::Result<RecordFrame> {
         loop {
             let index = self.next_index;
+            let segment = self.reader.file_sequence();
             let frame = self.reader.read_blocking(None)?.map(|m| RecordFrame {
                 index: RecordIndex(index),
                 msg_type: m.header().message_type,
                 user_meta: m.header().user_meta_u64,
+                starts_segment: false, // filled in below, once the reader is not borrowed
                 payload: m.payload().to_vec(),
             });
-            if let Some(frame) = frame {
+            if let Some(mut frame) = frame {
+                frame.starts_segment = self.rolled_since(segment);
                 self.next_index += 1;
                 return Ok(frame);
             }
@@ -82,16 +93,35 @@ impl ReplicationSource {
     /// Non-blocking variant: the next frame if one is committed, else `None`.
     pub fn try_next_frame(&mut self) -> io::Result<Option<RecordFrame>> {
         let index = self.next_index;
+        let segment = self.reader.file_sequence();
         let frame = self.reader.try_read()?.map(|m| RecordFrame {
             index: RecordIndex(index),
             msg_type: m.header().message_type,
             user_meta: m.header().user_meta_u64,
+            starts_segment: false, // filled in below, once the reader is not borrowed
             payload: m.payload().to_vec(),
         });
-        if frame.is_some() {
-            self.next_index += 1;
-        }
-        Ok(frame)
+        let Some(mut frame) = frame else {
+            return Ok(None);
+        };
+        frame.starts_segment = self.rolled_since(segment);
+        self.next_index += 1;
+        Ok(Some(frame))
+    }
+
+    /// Did the reader follow a roll while producing the record just read? `segment` is the
+    /// segment ordinal sampled *before* the read; a change means the record that read
+    /// returned is the first of a new file at the origin (xchannel consumes the `Roll`
+    /// marker transparently, so this comparison is the only way to see it).
+    ///
+    /// This holds across a resume, which is the case that matters most: [`skip_to`](Self::skip_to)
+    /// stops *before* the record that crosses a roll, so the crossing lands on the first read
+    /// that produces a frame and the resuming subscriber is told to roll before applying it.
+    /// A source's very first frame reports `false` on its own — a `LateJoin` reader opens
+    /// positioned at the start of a segment's records, so that read crosses nothing.
+    #[inline]
+    fn rolled_since(&self, segment: u64) -> bool {
+        self.reader.file_sequence() != segment
     }
 
     /// Advance to absolute index `from` without materializing frames — used to serve a
@@ -156,6 +186,13 @@ impl ReplicationSink {
 
     /// Apply one received frame to the replica, after verifying it is the contiguous next
     /// index (detects loss/reordering before it corrupts the replica).
+    ///
+    /// [`RecordFrame::starts_segment`] rolls the replica first, so its file boundaries — and
+    /// therefore what `keep_files` prunes — mirror the origin's. Rolling is unconditional when
+    /// the flag is set: if this sink was reopened after a crash between a roll and the first
+    /// commit into the new segment, the roll repeats and leaves one empty segment behind,
+    /// which costs a retention slot until it ages out but cannot lose records. Skipping the
+    /// roll instead would silently misalign the replica for the rest of the channel's life.
     pub fn apply(&mut self, frame: &RecordFrame) -> io::Result<()> {
         if frame.index.0 != self.expected_index {
             return Err(io::Error::new(
@@ -165,6 +202,9 @@ impl ReplicationSink {
                     self.expected_index, frame.index.0
                 ),
             ));
+        }
+        if frame.starts_segment {
+            self.writer.roll_file()?;
         }
         let len = frame.payload.len();
         let buf = self.writer.try_reserve(len)?;
@@ -207,6 +247,146 @@ mod tests {
             w.commit((i % 7) as u16, payload.len() as u32, i * 1000)
                 .unwrap();
         }
+    }
+
+    /// Write `groups` of records, rolling between groups — the position-service pattern: no
+    /// `file_roll_size`, so every boundary is one the application chose.
+    fn write_segments(base: &Path, groups: &[u64], keep_files: u32) {
+        let mut builder = WriterBuilder::new(base).region_size(REGION);
+        if keep_files > 0 {
+            builder = builder.keep_files(keep_files as u64);
+        }
+        let mut w = builder.build().unwrap();
+        let mut index = 0u64;
+        for (g, &n) in groups.iter().enumerate() {
+            if g > 0 {
+                w.roll_file().unwrap();
+            }
+            for _ in 0..n {
+                let payload = format!("record-{index}").into_bytes();
+                let buf = w.try_reserve(payload.len()).unwrap();
+                buf.copy_from_slice(&payload);
+                w.commit(1, payload.len() as u32, index).unwrap();
+                index += 1;
+            }
+        }
+    }
+
+    /// Absolute indices at which the channel on disk begins a segment, discovered the way the
+    /// source discovers them: sampling `file_sequence()` around each read. The first entry is
+    /// the earliest retained index, so a pruned channel reports where it actually starts.
+    fn segment_starts(base: &Path) -> Vec<u64> {
+        let mut r = ReaderBuilder::new(base)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        let mut index = r.base_record_index();
+        let mut starts = vec![index];
+        loop {
+            let before = r.file_sequence();
+            if r.try_read().unwrap().is_none() {
+                return starts;
+            }
+            if r.file_sequence() != before {
+                starts.push(index);
+            }
+            index += 1;
+        }
+    }
+
+    /// The origin's segmentation must survive replication: a roll rides on the first record of
+    /// the new segment, and the sink reproduces the boundary. Without it, a replica whose
+    /// `file_roll_size` is 0 never rolls at all.
+    #[test]
+    fn roll_boundaries_replicate() {
+        let origin = temp_base("roll-origin");
+        let replica = temp_base("roll-replica");
+        write_segments(&origin, &[2, 2, 2], 0);
+
+        let (mut source, _) = ReplicationSource::open(&origin).unwrap();
+        let mut frames = Vec::new();
+        while let Some(f) = source.try_next_frame().unwrap() {
+            frames.push(f);
+        }
+        assert_eq!(frames.len(), 6);
+        let flagged: Vec<u64> = frames
+            .iter()
+            .filter(|f| f.starts_segment)
+            .map(|f| f.index.0)
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![2, 4],
+            "one hint per roll, on the record that follows it — never on the first record"
+        );
+
+        {
+            let mut sink =
+                ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, RecordIndex(0)).unwrap();
+            for f in &frames {
+                sink.apply(f).unwrap();
+            }
+        }
+        assert_eq!(segment_starts(&replica), vec![0, 2, 4]);
+        assert_eq!(segment_starts(&replica), segment_starts(&origin));
+    }
+
+    /// The payoff: with app-driven rolls, `keep_files` prunes the same window on both sides.
+    /// A replica that only rolled on its own `file_roll_size` (0 here — the origin sets none)
+    /// would keep every record in one ever-growing file.
+    #[test]
+    fn replica_retention_matches_the_origin_under_app_driven_rolls() {
+        let origin = temp_base("retain-origin");
+        let replica = temp_base("retain-replica");
+        write_segments(&origin, &[3, 3, 3, 3, 3], 2);
+
+        let (mut source, earliest) = ReplicationSource::open(&origin).unwrap();
+        assert!(
+            earliest.0 > 0,
+            "origin should have pruned its earliest segments"
+        );
+
+        {
+            let mut sink = ReplicationSink::open(&replica, REGION_U32, 0, 0, 2, earliest).unwrap();
+            while let Some(f) = source.try_next_frame().unwrap() {
+                sink.apply(&f).unwrap();
+            }
+        }
+
+        // Segment *ordinals* differ (the replica's files start at 0, the origin's survivors
+        // don't) — what must match is where the boundaries fall and how much is retained.
+        let o = ReaderBuilder::new(&origin)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        let rp = ReaderBuilder::new(&replica)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        assert_eq!(
+            rp.base_record_index(),
+            o.base_record_index(),
+            "replica must retain the same window as the origin"
+        );
+        assert_eq!(segment_starts(&replica), segment_starts(&origin));
+    }
+
+    /// A subscriber that reconnects exactly at a roll boundary must still be told to roll:
+    /// `skip_to` stops before the record that crosses the roll, so the crossing lands on the
+    /// first frame the resumed source produces.
+    #[test]
+    fn resume_at_a_boundary_still_reports_it() {
+        let origin = temp_base("resume-boundary");
+        write_segments(&origin, &[2, 2], 0);
+
+        let (mut source, _) = ReplicationSource::open(&origin).unwrap();
+        source.skip_to(RecordIndex(2)).unwrap();
+        let f = source.next_frame().unwrap();
+        assert_eq!(f.index, RecordIndex(2));
+        assert!(
+            f.starts_segment,
+            "record 2 opens a new segment; a resuming replica must roll before applying it"
+        );
     }
 
     #[test]
@@ -278,6 +458,7 @@ mod tests {
                     index: RecordIndex(i),
                     msg_type: 0,
                     user_meta: i,
+                    starts_segment: false,
                     payload: payload.clone(),
                 })
                 .unwrap();
@@ -306,6 +487,7 @@ mod tests {
             index: RecordIndex(0),
             msg_type: 1,
             user_meta: 0,
+            starts_segment: false,
             payload: vec![1, 2, 3],
         })
         .unwrap();
@@ -316,6 +498,7 @@ mod tests {
                 index: RecordIndex(2),
                 msg_type: 1,
                 user_meta: 0,
+                starts_segment: false,
                 payload: vec![4, 5, 6],
             })
             .unwrap_err();
