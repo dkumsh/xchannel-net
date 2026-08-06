@@ -565,7 +565,10 @@ registry untouched. Versions checked 2026-06:
 - **Transport**: TCP baseline; later a co-located shortcut (shared-mem / local IPC) under
   the same `Transport` trait.
 - **Backpressure & retention coupling**: how aggressively replicas persist vs. source
-  retention; what a subscriber does on `Gap`.
+  retention. *(What a subscriber does on `Gap` is **resolved** — auto-rebuild and report,
+  §4: discard the replica, re-subscribe from `RecordIndex(0)`, and count the event so a
+  rebuild is visible rather than silently absorbed. The rebuilt replica starts at the
+  source's `earliest`, so it is honest about the history that retention removed.)*
 - **Security / auth** of inter-node and client–manager connections.
 - **Multiple replicas of the same channel on one node** and dedup of replication streams.
 - **Registry tombstones** (§5.4): deregistration as a deleted-flag + timestamp inside the

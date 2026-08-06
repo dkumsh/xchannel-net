@@ -74,7 +74,14 @@ channel — locally readable, network-replicable), without violating single-writ
   `Diverged`) from transient transport failures; the subscription loop acts on it. Both cases
   previously retried the same unserviceable position at 10 Hz indefinitely. The distinction is
   load-bearing in both directions: retrying a rebuild case never converges, and rebuilding on a
-  dropped connection would discard a whole channel's history and re-pull it.
+  dropped connection would discard a whole channel's history and re-pull it. A replica rebuilt
+  after a retention `Gap` starts at the source's `earliest`, not at genesis — the "full
+  *retained* history" contract, so the replica's headers are honest about what retention removed.
+  This resolves the `Gap`-handling open question in DESIGN §8.
+- **Rebuilds are counted, not silently absorbed** (`Subscription::rebuilds()` →
+  `RebuildStats`): tallies by cause (retention `Gap` vs `Diverged`) plus the time of the last
+  one. A rebuild replaces the replica's contents under any local reader, so it must be
+  observable — the same reason the design refuses to let "quiet" and "broken" look alike.
 - **A resume position past the source's head is refused** (`StreamMsg::Diverged`) instead of
   hanging. After a deregistered name is reclaimed by a new owner, the new origin restarts at
   index 0 while other nodes still hold replicas of the old incarnation; their self-healing

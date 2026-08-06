@@ -32,7 +32,7 @@ use xchannel_net_core::codec::{decode_client_request, encode_client_reply};
 use xchannel_net_core::dissemination::Dissemination;
 use xchannel_net_core::identity::ChannelIdentity;
 use xchannel_net_core::mux::{self, Mux};
-use xchannel_net_core::stream::{self, ChannelSource, accept_subscription};
+use xchannel_net_core::stream::{self, ChannelSource, SubscribeError, accept_subscription};
 use xchannel_net_core::transport::{
     Listener, TcpListener, TcpTransport, Transport, UnixListener, UnixTransport,
 };
@@ -1123,23 +1123,26 @@ impl Node {
 
         let stopped = Arc::new(AtomicBool::new(false));
         let synced = Arc::new(AtomicU64::new(0));
+        let rebuilds = Arc::new(RebuildStats::default());
         let shutdown: Arc<Mutex<Option<TcpTransport>>> = Arc::new(Mutex::new(None));
 
         let node = self.clone();
-        let (name_t, path_t, stopped_t, synced_t, shutdown_t) = (
+        let (name_t, path_t, stopped_t, synced_t, rebuilds_t, shutdown_t) = (
             name.to_string(),
             replica_path.clone(),
             Arc::clone(&stopped),
             Arc::clone(&synced),
+            Arc::clone(&rebuilds),
             Arc::clone(&shutdown),
         );
         let handle = std::thread::spawn(move || {
-            node.run_subscription(name_t, path_t, stopped_t, synced_t, shutdown_t)
+            node.run_subscription(name_t, path_t, stopped_t, synced_t, rebuilds_t, shutdown_t)
         });
 
         Ok(Subscription {
             replica_path,
             synced,
+            rebuilds,
             stopped,
             shutdown,
             handle: Some(handle),
@@ -1155,6 +1158,7 @@ impl Node {
         replica_path: PathBuf,
         stopped: Arc<AtomicBool>,
         synced: Arc<AtomicU64>,
+        rebuilds: Arc<RebuildStats>,
         shutdown: Arc<Mutex<Option<TcpTransport>>>,
     ) {
         const BACKOFF: Duration = Duration::from_millis(100);
@@ -1180,7 +1184,7 @@ impl Node {
             let shutdown_handle = conn.try_clone().ok();
             let mut client = match stream::subscribe(conn, &name, from, generation, &replica_path) {
                 Ok(client) => client,
-                Err(e) if e.requires_rebuild() => {
+                Err(SubscribeError::Rebuild { diverged, .. }) => {
                     // The source cannot extend this replica — it is behind retention, or it
                     // belongs to a previous incarnation of the name. Retrying the same
                     // position would loop forever (the answer will not change), so discard it
@@ -1194,6 +1198,7 @@ impl Node {
                         let _ = ensure_private_dir(&dir);
                     }
                     synced.store(0, Ordering::Relaxed);
+                    rebuilds.record(diverged);
                     std::thread::sleep(BACKOFF);
                     continue;
                 }
@@ -1303,11 +1308,58 @@ impl Node {
     }
 }
 
+/// How often a subscription had to **discard its replica and re-pull the channel**, split by
+/// cause, plus when it last happened.
+///
+/// A rebuild is not a transient hiccup the loop can hide: the replica's contents are replaced,
+/// and a local reader that had caught up sees history it already read, or a start index that
+/// jumped forward. Recording it is what lets a consumer tell "quiet source" from "this source
+/// was rebuilt under me" — the same two-liveness-concepts distinction the design insists on
+/// elsewhere. Read via [`Subscription::rebuilds`].
+#[derive(Default, Debug)]
+pub struct RebuildStats {
+    gap: AtomicU64,
+    diverged: AtomicU64,
+    last_at_ms: AtomicU64,
+}
+
+impl RebuildStats {
+    /// Rebuilds caused by the replica falling behind the source's **retention** — the source
+    /// no longer holds the records needed to extend it contiguously (`StreamMsg::Gap`). The
+    /// rebuilt replica legitimately starts at the source's `earliest`, not at genesis.
+    pub fn gap(&self) -> u64 {
+        self.gap.load(Ordering::Relaxed)
+    }
+
+    /// Rebuilds caused by the replica belonging to a **different incarnation** of the name —
+    /// it was reclaimed by a new owner and the old replica is not a prefix of the new log
+    /// (`StreamMsg::Diverged`).
+    pub fn diverged(&self) -> u64 {
+        self.diverged.load(Ordering::Relaxed)
+    }
+
+    /// Unix-millis of the most recent rebuild, or `None` if there has never been one.
+    pub fn last_at_ms(&self) -> Option<u64> {
+        match self.last_at_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
+    fn record(&self, diverged: bool) {
+        let counter = if diverged { &self.diverged } else { &self.gap };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.last_at_ms
+            .store(now_nanos() / 1_000_000, Ordering::Relaxed);
+    }
+}
+
 /// Handle to a self-healing subscription replicating a remote channel locally. Dropping it
 /// stops the background loop.
 pub struct Subscription {
     replica_path: PathBuf,
     synced: Arc<AtomicU64>,
+    rebuilds: Arc<RebuildStats>,
     stopped: Arc<AtomicBool>,
     /// The currently-live connection (if any), so [`stop`](Self::stop) can interrupt a
     /// blocked read by shutting it down.
@@ -1324,6 +1376,11 @@ impl Subscription {
     /// Absolute index the replica has been synced to (the head). Grows as records arrive.
     pub fn synced_index(&self) -> u64 {
         self.synced.load(Ordering::Relaxed)
+    }
+
+    /// Replica rebuilds this subscription has performed, by cause — see [`RebuildStats`].
+    pub fn rebuilds(&self) -> &RebuildStats {
+        &self.rebuilds
     }
 
     /// Whether the background loop is still running (not stopped).
@@ -1523,6 +1580,90 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, new_n, "old incarnation's records are gone");
+    }
+
+    /// A subscriber that falls behind the source's retention must rebuild — and the rebuilt
+    /// replica starts at the source's `earliest`, **not** at genesis. That is the "full
+    /// *retained* history" contract: the records between genesis and `earliest` are gone, and
+    /// the replica's headers must say so rather than pretending to start at 0.
+    #[test]
+    fn a_subscriber_behind_retention_rebuilds_from_earliest() {
+        let (a, _a_stream, a_control) = start(61, "retention-a");
+        let (b, _b_stream, _b_control) = start(62, "retention-b");
+
+        // First, a short log that B replicates in full.
+        let first = 3u64;
+        {
+            let mut w = a
+                .host_channel("md.aapl", 1 << 20, 0, |x| x.keep_files(2))
+                .unwrap();
+            for i in 0..first {
+                let buf = w.try_reserve(4).unwrap();
+                buf.copy_from_slice(b"old!");
+                w.commit(0, 4, i).unwrap();
+            }
+        }
+        b.connect_control_peer(a_control).unwrap();
+        let sub = b
+            .subscribe("md.aapl", Some(Duration::from_secs(5)))
+            .unwrap();
+        poll_until(|| (sub.synced_index() == first).then_some(()));
+        drop(sub); // B stops here, holding records 0..3
+
+        // While B is away the origin rolls repeatedly. `keep_files(2)` prunes each older
+        // segment, so `earliest` climbs past the position B is holding.
+        let origin = a.channel_path("md.aapl").unwrap();
+        let mut index = first;
+        {
+            let mut w = WriterBuilder::new(&origin)
+                .region_size(1 << 20)
+                .keep_files(2)
+                .build()
+                .unwrap();
+            for _ in 0..3 {
+                w.roll_file().unwrap();
+                for _ in 0..2 {
+                    let buf = w.try_reserve(4).unwrap();
+                    buf.copy_from_slice(b"new!");
+                    w.commit(0, 4, index).unwrap();
+                    index += 1;
+                }
+            }
+        }
+        let earliest = ReaderBuilder::new(&origin)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap()
+            .base_record_index();
+        assert!(
+            earliest > first,
+            "retention must have pruned past B's position ({earliest} vs {first})"
+        );
+
+        // B comes back asking to resume at 3, which the origin no longer retains.
+        let sub = b
+            .subscribe("md.aapl", Some(Duration::from_secs(5)))
+            .unwrap();
+        poll_until(|| (sub.synced_index() == index).then_some(()));
+
+        assert_eq!(sub.rebuilds().gap(), 1, "one rebuild, caused by retention");
+        assert_eq!(
+            sub.rebuilds().diverged(),
+            0,
+            "the name was never reclaimed — this is not divergence"
+        );
+        assert!(sub.rebuilds().last_at_ms().is_some());
+
+        let replica = b.replica_path("md.aapl").unwrap();
+        let r = ReaderBuilder::new(&replica)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        assert_eq!(
+            r.base_record_index(),
+            earliest,
+            "the rebuilt replica must start at the source's earliest, not at genesis"
+        );
     }
 
     /// Names that look like segment filenames must not collide. Channel names may contain
