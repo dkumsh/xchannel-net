@@ -227,6 +227,62 @@ impl Default for TopicOptions {
     }
 }
 
+/// One channel as reported by discovery. Flattened rather than wrapping a `ChannelIdentity`,
+/// which already contains `name` and `owner` and would carry them twice.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ChannelInfo {
+    pub name: ChannelName,
+    pub owner: NodeId,
+    /// Incarnation of this **name**. A change means the name was reclaimed and this is a
+    /// different log: a consumer holding per-channel state must reset it, not extend it.
+    pub epoch: u64,
+    /// Whether `owner` is currently a live member. Discovery must report "known, owner
+    /// unreachable" distinctly from "known and live" (DESIGN §5) — otherwise a consumer
+    /// cannot tell a frozen channel from a healthy quiet one.
+    pub owner_live: bool,
+    /// `Some(topic)` if this is a **topic member**. Members are ordinary registered channels,
+    /// so a listing of `fills.prod.` returns the topic *and* every producer feeding it;
+    /// consumers wanting sources rather than plumbing filter on this.
+    pub member_of: Option<ChannelName>,
+    pub region_size: u32,
+    pub mtu: u32,
+    /// Earliest index still retained at the source — how much history a subscriber can expect.
+    pub earliest_index: RecordIndex,
+}
+
+/// A record in the **discovery log**: how one name changed.
+///
+/// Only two shapes, because a last-writer-wins map cannot honestly report more. There is no
+/// `Added` vs `Replaced` distinction: the winner for a name can change with no user action at
+/// all, when a later-arriving but earlier-registered identity wins the collision. A consumer
+/// applies each record to its own map and compares `epoch` to decide whether a name it
+/// already knows is the same log or a new incarnation.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ChannelChange {
+    /// The name gained an entry, or its entry changed.
+    Upserted(ChannelInfo),
+    /// The name was tombstoned.
+    Removed { name: ChannelName, epoch: u64 },
+}
+
+/// Where a client should start reading the discovery log, handed out with a listing snapshot.
+///
+/// The snapshot and `from` are taken under one registry lock, so there is no window between
+/// "what exists" and "what changed next" — the race that a separate list-then-watch pair has
+/// to close with revisions.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DiscoveryCursor {
+    /// Local path of the discovery log; the client opens it with plain xchannel.
+    pub log_path: String,
+    /// Incarnation of the log. A restarted daemon starts a fresh one, so a client resuming
+    /// with a stale cursor sees this change and knows to re-list rather than resume into an
+    /// unrelated log.
+    pub generation: u64,
+    /// Absolute index of the first record the client has not already accounted for in the
+    /// snapshot.
+    pub from: RecordIndex,
+}
+
 /// Health of one channel this node reads, as reported to a local client.
 ///
 /// The design insists that "no new records" and "replication is broken" must never look alike
@@ -303,6 +359,9 @@ pub enum ClientRequest {
     /// delete its files. Only the owner may do this — a request for a name owned elsewhere
     /// reports `existed: false` rather than removing anything.
     Deregister { name: ChannelName },
+    /// List channels whose name starts with `prefix` (empty matches all), and say where to
+    /// pick up the changes that follow. Replies [`Channels`](ClientReply::Channels).
+    ListChannels { prefix: String },
     /// Retire a channel owned by a node that is **gone**, so its name can be reclaimed here.
     /// Refused unless the owner has been unreachable past the daemon's `reclaim_after` floor.
     /// This is the deliberate exception to owner-only deregistration; see
@@ -322,6 +381,11 @@ pub enum ClientReply {
     Created { path: String },
     /// Replica is being synced; open a `Reader` at this local path.
     Subscribed { replica_path: String },
+    /// A discovery listing plus the cursor to continue from.
+    Channels {
+        channels: Vec<ChannelInfo>,
+        cursor: DiscoveryCursor,
+    },
     /// The channel was withdrawn; `existed` is false if this node did not own a live channel
     /// by that name (already deregistered, never registered, or owned by another node).
     Deregistered { existed: bool },

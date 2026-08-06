@@ -16,9 +16,12 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use xchannel::{Reader, ReaderBuilder, ReaderMode, Writer, WriterBuilder};
-use xchannel_net_core::codec::{decode_client_reply, encode_client_request};
+use xchannel_net_core::codec::{decode_change, decode_client_reply, encode_client_request};
 use xchannel_net_core::transport::{Transport, UnixTransport};
-use xchannel_net_core::wire::{ChannelOptions, ClientReply, ClientRequest, TopicOptions};
+use xchannel_net_core::wire::{
+    ChannelChange, ChannelInfo, ChannelOptions, ClientReply, ClientRequest, DiscoveryCursor,
+    TopicOptions,
+};
 
 pub use xchannel_net_core::wire::ChannelOptions as Options;
 pub use xchannel_net_core::wire::SubscriptionStatus;
@@ -171,6 +174,36 @@ impl Client {
         }
     }
 
+    /// List channels whose name starts with `prefix` (empty matches everything), and get the
+    /// cursor to follow what changes next.
+    ///
+    /// Both halves come from one registry lock in the daemon, so there is no window between
+    /// them: pass the cursor to [`watch_channels`](Self::watch_channels) and nothing that
+    /// happens in between is missed.
+    ///
+    /// The listing is what the **local** daemon has converged on, not a network-wide truth,
+    /// and it reports the current state of each name rather than the history of how it got
+    /// there — see `doc/DISCOVERY.md`.
+    pub fn list_channels(
+        &mut self,
+        prefix: &str,
+    ) -> io::Result<(Vec<ChannelInfo>, DiscoveryCursor)> {
+        match self.request(&ClientRequest::ListChannels {
+            prefix: prefix.to_string(),
+        })? {
+            ClientReply::Channels { channels, cursor } => Ok((channels, cursor)),
+            ClientReply::Error { message } => Err(rpc_error(message)),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Follow registry changes from `cursor`. The daemon is not involved: the discovery log is
+    /// an ordinary xchannel, so watchers cost it nothing and any number of them can read the
+    /// same log.
+    pub fn watch_channels(&mut self, cursor: &DiscoveryCursor) -> io::Result<ChannelWatch> {
+        ChannelWatch::open(cursor)
+    }
+
     /// Retire a channel whose owning node is **gone**, freeing its name to be reclaimed here.
     /// Returns whether a live channel of that name existed to retire.
     ///
@@ -230,6 +263,61 @@ impl Client {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+/// A reader over the daemon's discovery log, positioned at a [`DiscoveryCursor`].
+///
+/// Changes are delivered as [`ChannelChange`] records. Apply each to your own map and compare
+/// `epoch` to tell "same channel" from "this name was reclaimed and is now a different log".
+pub struct ChannelWatch {
+    reader: Reader,
+}
+
+impl ChannelWatch {
+    /// Open the discovery log at `cursor`. Errors if the log has been replaced (the daemon
+    /// restarted) or has already trimmed past the cursor — both mean "list again".
+    pub fn open(cursor: &DiscoveryCursor) -> io::Result<Self> {
+        let mut reader = ReaderBuilder::new(&cursor.log_path)
+            .mode(ReaderMode::LateJoin)
+            .build()?;
+        // A daemon restart wipes the log and starts a fresh one, so a cursor from a previous
+        // run points into a different log entirely — its indices mean nothing here.
+        if reader.generation() != cursor.generation {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "discovery log was replaced (the daemon restarted) — list again",
+            ));
+        }
+        let mut index = reader.base_record_index();
+        if index > cursor.from.0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "discovery log has advanced past this cursor (retains from {index}, \
+                     asked for {}) — list again",
+                    cursor.from.0
+                ),
+            ));
+        }
+        // xchannel has no seek-by-index; skip forward to the cursor.
+        while index < cursor.from.0 {
+            if reader.try_read()?.is_none() {
+                break; // caught up to a head that has since been trimmed of nothing
+            }
+            index += 1;
+        }
+        Ok(Self { reader })
+    }
+
+    /// The next change, or `None` if none is pending. Non-blocking.
+    pub fn try_next(&mut self) -> io::Result<Option<ChannelChange>> {
+        let Some(m) = self.reader.try_read()? else {
+            return Ok(None);
+        };
+        let msg_type = m.header().message_type;
+        let payload = m.payload().to_vec();
+        decode_change(msg_type, &payload).map(Some)
     }
 }
 

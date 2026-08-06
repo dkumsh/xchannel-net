@@ -6,12 +6,22 @@
 //! agrees on each name's winner with no coordination round — independent of how deltas
 //! travel. See DESIGN.md §2.1.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use xchannel_net_core::identity::{ChannelIdentity, ChannelName};
 
+/// What a [`merge`](Registry::merge) did to the map — whether the entry occupying the name
+/// actually changed, which is what discovery publishes on. Anti-entropy re-merges a peer's
+/// entire registry on every reconnect, so "merged" and "changed" are very different events.
+pub struct Merged {
+    pub winner: ChannelIdentity,
+    pub changed: bool,
+}
+
+/// A `BTreeMap` rather than a hash map: discovery matches on **name prefixes**, which is a
+/// range query here and a full scan otherwise, and ordered iteration makes listings stable.
 #[derive(Default)]
 pub struct Registry {
-    channels: HashMap<ChannelName, ChannelIdentity>,
+    channels: BTreeMap<ChannelName, ChannelIdentity>,
 }
 
 impl Registry {
@@ -24,12 +34,32 @@ impl Registry {
     /// are retained in the map (they must keep beating stale re-registrations and propagate via
     /// anti-entropy); [`get`](Self::get) hides them so a deregistered name reads as absent.
     pub fn merge(&mut self, incoming: ChannelIdentity) -> ChannelIdentity {
+        self.merge_tracked(incoming).winner
+    }
+
+    /// [`merge`](Self::merge), also reporting whether the map actually changed. Callers that
+    /// publish changes (discovery) need the distinction; callers that only want the winner
+    /// use `merge`.
+    pub fn merge_tracked(&mut self, incoming: ChannelIdentity) -> Merged {
         let winner = match self.channels.get(&incoming.name) {
             Some(existing) => ChannelIdentity::resolve_collision(existing, &incoming).clone(),
             None => incoming.clone(),
         };
+        let changed = self.channels.get(&winner.name) != Some(&winner);
         self.channels.insert(winner.name.clone(), winner.clone());
-        winner
+        Merged { winner, changed }
+    }
+
+    /// Live entries whose name starts with `prefix`, in name order. Tombstones are excluded,
+    /// as in [`get`](Self::get) — a deregistered name reads as absent everywhere.
+    ///
+    /// An empty prefix matches every channel.
+    pub fn with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a ChannelIdentity> {
+        self.channels
+            .range(prefix.to_string()..)
+            .take_while(move |(name, _)| name.starts_with(prefix))
+            .map(|(_, id)| id)
+            .filter(|id| !id.deleted)
     }
 
     /// The live identity for `name`, or `None` if unknown **or tombstoned**.

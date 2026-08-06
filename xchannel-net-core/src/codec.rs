@@ -19,8 +19,8 @@
 
 use crate::identity::ChannelIdentity;
 use crate::wire::{
-    ChannelOptions, ClientReply, ClientRequest, ControlMsg, RecordFrame, StreamMsg,
-    SubscriptionStatus, TopicOptions,
+    ChannelChange, ChannelInfo, ChannelOptions, ClientReply, ClientRequest, ControlMsg,
+    DiscoveryCursor, RecordFrame, StreamMsg, SubscriptionStatus, TopicOptions,
 };
 use crate::{NodeId, RecordIndex, StreamId};
 use std::io;
@@ -425,6 +425,7 @@ mod client_req_tag {
     pub const SUBSCRIPTION_STATUS: u8 = 4;
     pub const DEREGISTER: u8 = 5;
     pub const FORCE_DEREGISTER: u8 = 6;
+    pub const LIST_CHANNELS: u8 = 7;
 }
 
 mod client_reply_tag {
@@ -433,6 +434,78 @@ mod client_reply_tag {
     pub const ERROR: u8 = 2;
     pub const STATUS: u8 = 3;
     pub const DEREGISTERED: u8 = 4;
+    pub const CHANNELS: u8 = 5;
+}
+
+/// Discovery-log record types (`MessageHeader::message_type`). A consumer reads the log with
+/// plain xchannel, so these are part of the contract, not an internal detail.
+pub mod discovery_msg_type {
+    pub const UPSERTED: u16 = 1;
+    pub const REMOVED: u16 = 2;
+}
+
+fn put_info(w: &mut W, c: &ChannelInfo) {
+    w.str(&c.name);
+    w.u64(c.owner.0);
+    w.u64(c.epoch);
+    w.u8(c.owner_live as u8);
+    match &c.member_of {
+        Some(t) => {
+            w.u8(1);
+            w.str(t);
+        }
+        None => w.u8(0),
+    }
+    w.u32(c.region_size);
+    w.u32(c.mtu);
+    w.u64(c.earliest_index.0);
+}
+
+fn get_info(r: &mut R) -> io::Result<ChannelInfo> {
+    Ok(ChannelInfo {
+        name: r.str()?,
+        owner: NodeId(r.u64()?),
+        epoch: r.u64()?,
+        owner_live: r.u8()? != 0,
+        member_of: if r.u8()? != 0 { Some(r.str()?) } else { None },
+        region_size: r.u32()?,
+        mtu: r.u32()?,
+        earliest_index: RecordIndex(r.u64()?),
+    })
+}
+
+/// Encode a discovery-log record's **payload**; the record's `msg_type` carries the variant
+/// (see [`discovery_msg_type`]), so the payload holds only the fields.
+pub fn encode_change(change: &ChannelChange) -> (u16, Vec<u8>) {
+    let mut buf = Vec::new();
+    let mut w = W::new(&mut buf);
+    let t = match change {
+        ChannelChange::Upserted(info) => {
+            put_info(&mut w, info);
+            discovery_msg_type::UPSERTED
+        }
+        ChannelChange::Removed { name, epoch } => {
+            w.str(name);
+            w.u64(*epoch);
+            discovery_msg_type::REMOVED
+        }
+    };
+    (t, buf)
+}
+
+/// Decode a discovery-log record from its `msg_type` and payload.
+pub fn decode_change(msg_type: u16, payload: &[u8]) -> io::Result<ChannelChange> {
+    let mut r = R::new(payload);
+    let change = match msg_type {
+        discovery_msg_type::UPSERTED => ChannelChange::Upserted(get_info(&mut r)?),
+        discovery_msg_type::REMOVED => ChannelChange::Removed {
+            name: r.str()?,
+            epoch: r.u64()?,
+        },
+        _ => return Err(invalid("unknown discovery record type")),
+    };
+    r.finish()?;
+    Ok(change)
 }
 
 fn put_status(w: &mut W, s: &SubscriptionStatus) {
@@ -536,6 +609,10 @@ pub fn encode_client_request(m: &ClientRequest) -> Vec<u8> {
             w.u8(client_req_tag::FORCE_DEREGISTER);
             w.str(name);
         }
+        ClientRequest::ListChannels { prefix } => {
+            w.u8(client_req_tag::LIST_CHANNELS);
+            w.str(prefix);
+        }
     }
     buf
 }
@@ -563,6 +640,7 @@ pub fn decode_client_request(bytes: &[u8]) -> io::Result<ClientRequest> {
         client_req_tag::SUBSCRIPTION_STATUS => ClientRequest::SubscriptionStatus { name: r.str()? },
         client_req_tag::DEREGISTER => ClientRequest::Deregister { name: r.str()? },
         client_req_tag::FORCE_DEREGISTER => ClientRequest::ForceDeregister { name: r.str()? },
+        client_req_tag::LIST_CHANNELS => ClientRequest::ListChannels { prefix: r.str()? },
         _ => return Err(invalid("unknown ClientRequest tag")),
     };
     r.finish()?;
@@ -593,6 +671,16 @@ pub fn encode_client_reply(m: &ClientReply) -> Vec<u8> {
             w.u8(client_reply_tag::DEREGISTERED);
             w.u8(*existed as u8);
         }
+        ClientReply::Channels { channels, cursor } => {
+            w.u8(client_reply_tag::CHANNELS);
+            w.u32(channels.len() as u32);
+            for c in channels {
+                put_info(&mut w, c);
+            }
+            w.str(&cursor.log_path);
+            w.u64(cursor.generation);
+            w.u64(cursor.from.0);
+        }
     }
     buf
 }
@@ -609,6 +697,23 @@ pub fn decode_client_reply(bytes: &[u8]) -> io::Result<ClientReply> {
         client_reply_tag::DEREGISTERED => ClientReply::Deregistered {
             existed: r.u8()? != 0,
         },
+        client_reply_tag::CHANNELS => {
+            let n = r.u32()? as usize;
+            // Don't pre-allocate `n` blindly — a corrupt count must not OOM us; the loop is
+            // bounded by the frame length via `take`.
+            let mut channels = Vec::new();
+            for _ in 0..n {
+                channels.push(get_info(&mut r)?);
+            }
+            ClientReply::Channels {
+                channels,
+                cursor: DiscoveryCursor {
+                    log_path: r.str()?,
+                    generation: r.u64()?,
+                    from: RecordIndex(r.u64()?),
+                },
+            }
+        }
         _ => return Err(invalid("unknown ClientReply tag")),
     };
     r.finish()?;

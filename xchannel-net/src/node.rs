@@ -27,8 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use xchannel::{Writer, WriterBuilder};
-use xchannel_net_core::RecordIndex;
-use xchannel_net_core::codec::{decode_client_request, encode_client_reply};
+use xchannel_net_core::codec::{self, decode_client_request, encode_client_reply};
 use xchannel_net_core::dissemination::Dissemination;
 use xchannel_net_core::identity::ChannelIdentity;
 use xchannel_net_core::mux::{self, Mux};
@@ -37,8 +36,10 @@ use xchannel_net_core::transport::{
     Listener, TcpListener, TcpTransport, Transport, UnixListener, UnixTransport,
 };
 use xchannel_net_core::wire::{
-    ChannelOptions, ClientReply, ClientRequest, SubscriptionStatus, TopicOptions,
+    ChannelChange, ChannelInfo, ChannelOptions, ClientReply, ClientRequest, DiscoveryCursor,
+    SubscriptionStatus, TopicOptions,
 };
+use xchannel_net_core::{NodeId, RecordIndex};
 
 /// A node not heard from within this is dropped from the live set.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,6 +52,23 @@ const MAX_CONNECTIONS: usize = 4096;
 /// monopolize the interleave or head-of-line-block other topics on the shared loop
 /// (`doc/TOPICS.md` §4.3).
 const MAX_BATCH_PER_MEMBER: usize = 256;
+
+/// Directory holding this node's **discovery log** — the record of registry changes clients
+/// read to follow the channel set. Dot-prefixed, so no channel name can ever collide with it.
+///
+/// The log is **node-local**: it describes what this daemon has converged on, not a
+/// network-wide fact, so it is never registered, replicated, or subscribable from a peer. It
+/// is derived state — a restarted daemon discards it and starts a fresh one with a new
+/// generation, which is how a client with a stale cursor learns to re-list instead of resuming
+/// into an unrelated log. That makes it compatible with DESIGN §5's "the only durable
+/// node-owned state is `NodeId` + config": nothing here is ever *restored*.
+const DISCOVERY_DIR: &str = ".discovery";
+
+/// Geometry of the discovery log. Registry changes are small and rare, so one page-ish region
+/// is ample; the retention bound is what turns "your cursor is too old" into an explicit
+/// answer rather than unbounded growth.
+const DISCOVERY_REGION_SIZE: usize = 1 << 20;
+const DISCOVERY_KEEP_FILES: u64 = 4;
 
 /// Filename of the log inside a channel's own directory.
 ///
@@ -165,6 +183,12 @@ pub struct TopicStatus {
 #[derive(Clone)]
 pub struct Node {
     config: Arc<NodeConfig>,
+    /// This daemon's discovery log: `None` until first use, then the writer plus the
+    /// generation stamped into it.
+    discovery: Arc<Mutex<Option<Writer>>>,
+    /// Incarnation of this daemon's discovery log — fresh per process, so a client's cursor
+    /// from a previous run is recognisably stale.
+    discovery_generation: u64,
     /// When this node started. Bounds how long an owner can be *known* to have been silent:
     /// a daemon that just came up has heard from nobody, and must not conclude every channel
     /// in the registry is abandoned.
@@ -207,6 +231,8 @@ impl Node {
             topic_reap: Arc::new(Mutex::new(HashMap::new())),
             member_dead_since: Arc::new(Mutex::new(HashMap::new())),
             conns: Arc::new(AtomicUsize::new(0)),
+            discovery: Arc::new(Mutex::new(None)),
+            discovery_generation: now_nanos(),
             started_at: Instant::now(),
             config: Arc::new(config),
         }
@@ -279,6 +305,7 @@ impl Node {
         let Some(tombstone) = tombstone else {
             return Ok(false);
         };
+        self.publish_change(&self.change_of(&tombstone));
         self.dissemination
             .lock_safe()
             .announce(std::slice::from_ref(&tombstone))?;
@@ -410,8 +437,12 @@ impl Node {
             deleted: false,
             member_of,
         };
-        let winner = reg.merge(identity.clone());
+        let merged = reg.merge_tracked(identity.clone());
         drop(reg);
+        if merged.changed {
+            self.publish_change(&self.change_of(&merged.winner));
+        }
+        let winner = merged.winner;
         if winner.owner != self.config.node_id || winner.deleted {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -435,6 +466,7 @@ impl Node {
         let Some(tombstone) = tombstone else {
             return Ok(false);
         };
+        self.publish_change(&self.change_of(&tombstone));
         self.hosted.lock_safe().remove(name);
         self.dissemination
             .lock_safe()
@@ -1057,13 +1089,10 @@ impl Node {
             };
             if !pumped.is_empty() {
                 let mut retired = Vec::new();
-                {
-                    let mut reg = self.registry.lock_safe();
-                    for id in pumped {
-                        let name = id.name.clone();
-                        if reg.merge(id).deleted {
-                            retired.push(name);
-                        }
+                for id in pumped {
+                    let name = id.name.clone();
+                    if self.merge_and_publish(id).deleted {
+                        retired.push(name);
                     }
                 }
                 // A tombstone we just learned about retires any subscription we hold for that
@@ -1081,6 +1110,125 @@ impl Node {
             self.attach_pending_members();
             std::thread::sleep(interval);
         }
+    }
+
+    // ---------------- discovery ----------------
+
+    /// Merge into the registry and publish the result to discovery **iff the map changed**.
+    /// Anti-entropy re-merges a peer's whole registry on every reconnect, so publishing per
+    /// merge rather than per change would turn each reconnect into a storm of no-ops.
+    fn merge_and_publish(&self, incoming: ChannelIdentity) -> ChannelIdentity {
+        let merged = self.registry.lock_safe().merge_tracked(incoming);
+        if merged.changed {
+            self.publish_change(&self.change_of(&merged.winner));
+        }
+        merged.winner
+    }
+
+    /// The discovery record describing an entry's current state.
+    fn change_of(&self, id: &ChannelIdentity) -> ChannelChange {
+        if id.deleted {
+            return ChannelChange::Removed {
+                name: id.name.clone(),
+                epoch: id.epoch,
+            };
+        }
+        let owner_live = id.owner == self.config.node_id
+            || self
+                .dissemination
+                .lock_safe()
+                .live_addr_of(id.owner)
+                .is_some();
+        ChannelChange::Upserted(ChannelInfo {
+            name: id.name.clone(),
+            owner: id.owner,
+            epoch: id.epoch,
+            owner_live,
+            member_of: id.member_of.clone(),
+            region_size: id.region_size,
+            mtu: id.mtu,
+            earliest_index: id.earliest_index,
+        })
+    }
+
+    /// Append one change to the discovery log, opening (and resetting) it on first use.
+    ///
+    /// Best-effort by construction: discovery is an *awareness* service, and a client that
+    /// misses a record recovers by re-listing. Failing a registration because a derived log
+    /// could not be written would be the tail wagging the dog, so errors are swallowed here
+    /// and the caller is never made to care.
+    fn publish_change(&self, change: &ChannelChange) {
+        let _ = self.with_discovery(|w| {
+            let (msg_type, payload) = codec::encode_change(change);
+            let buf = w.try_reserve(payload.len())?;
+            buf.copy_from_slice(&payload);
+            w.commit(msg_type, payload.len() as u32, 0)
+        });
+    }
+
+    /// Run `f` against the discovery log's writer, creating the log on first use. Creation
+    /// **wipes** any log left by a previous run: it is derived state, and resuming a client's
+    /// cursor into a rebuilt log would be meaningless — the fresh `generation` is what tells
+    /// a client that.
+    fn with_discovery<R>(&self, f: impl FnOnce(&mut Writer) -> io::Result<R>) -> io::Result<R> {
+        let mut slot = self.discovery.lock_safe();
+        if slot.is_none() {
+            let dir = self.config.data_dir.join(DISCOVERY_DIR);
+            let _ = std::fs::remove_dir_all(&dir);
+            ensure_private_dir(&dir)?;
+            *slot = Some(
+                WriterBuilder::new(dir.join(CHANNEL_LOG_FILE))
+                    .region_size(DISCOVERY_REGION_SIZE)
+                    .generation(self.discovery_generation)
+                    // Bounded: a client that falls this far behind is told to re-list, which
+                    // is cheaper than retaining changes nobody is reading.
+                    .file_roll_size((DISCOVERY_REGION_SIZE * 2) as u64)
+                    .keep_files(DISCOVERY_KEEP_FILES)
+                    .build()?,
+            );
+        }
+        f(slot.as_mut().expect("just initialized"))
+    }
+
+    /// Channels whose name starts with `prefix`, plus where to pick up the changes that follow.
+    ///
+    /// Both come from **one** registry lock, so there is no window between "what exists" and
+    /// "what changed next" — the race a separate list-then-watch pair has to close with
+    /// revisions.
+    pub fn list_channels(&self, prefix: &str) -> io::Result<(Vec<ChannelInfo>, DiscoveryCursor)> {
+        let live: Vec<NodeId> = self.dissemination.lock_safe().live_members();
+        let (channels, from) = {
+            let reg = self.registry.lock_safe();
+            let channels: Vec<ChannelInfo> = reg
+                .with_prefix(prefix)
+                .map(|id| ChannelInfo {
+                    name: id.name.clone(),
+                    owner: id.owner,
+                    epoch: id.epoch,
+                    owner_live: id.owner == self.config.node_id || live.contains(&id.owner),
+                    member_of: id.member_of.clone(),
+                    region_size: id.region_size,
+                    mtu: id.mtu,
+                    earliest_index: id.earliest_index,
+                })
+                .collect();
+            let from = self.with_discovery(|w| Ok(w.next_record_index()))?;
+            (channels, RecordIndex(from))
+        };
+        Ok((
+            channels,
+            DiscoveryCursor {
+                log_path: self
+                    .config
+                    .data_dir
+                    .join(DISCOVERY_DIR)
+                    .join(CHANNEL_LOG_FILE)
+                    .to_string_lossy()
+                    .into_owned(),
+                generation: self.discovery_generation,
+                from,
+            },
+        ))
     }
 
     /// Stop and forget a subscription for a name that has been tombstoned. Distinct from
@@ -1209,6 +1357,12 @@ impl Node {
                     self.retire_subscription(&name);
                     ClientReply::Deregistered { existed }
                 }
+                Err(e) => ClientReply::Error {
+                    message: e.to_string(),
+                },
+            },
+            ClientRequest::ListChannels { prefix } => match self.list_channels(&prefix) {
+                Ok((channels, cursor)) => ClientReply::Channels { channels, cursor },
                 Err(e) => ClientReply::Error {
                     message: e.to_string(),
                 },
@@ -1837,6 +1991,120 @@ mod tests {
         assert_eq!(seen, new_n, "old incarnation's records are gone");
     }
 
+    /// Read the discovery log from `cursor`, the way a client does — the client crate's
+    /// `ChannelWatch` wraps exactly this, and is exercised end-to-end in `tests/client_rpc.rs`.
+    fn drain_changes(cursor: &DiscoveryCursor) -> Vec<ChannelChange> {
+        let mut r = ReaderBuilder::new(&cursor.log_path)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        assert_eq!(r.generation(), cursor.generation, "same log incarnation");
+        let mut index = r.base_record_index();
+        while index < cursor.from.0 {
+            r.try_read().unwrap().expect("cursor is within the log");
+            index += 1;
+        }
+        let mut out = Vec::new();
+        while let Some(m) = r.try_read().unwrap() {
+            let (t, payload) = (m.header().message_type, m.payload().to_vec());
+            out.push(codec::decode_change(t, &payload).unwrap());
+        }
+        out
+    }
+
+    /// The listing and the cursor come from one registry lock, so a channel registered
+    /// *between* them cannot be missed — the race a separate list-then-watch pair needs
+    /// revisions to close.
+    #[test]
+    fn listing_and_watching_cover_the_channel_set_without_a_gap() {
+        let node = Node::new(config(141, temp_dir("discovery-list")));
+        for name in ["fills.prod.a", "fills.prod.b", "fills.test.c", "md.aapl"] {
+            drop(node.host_channel(name, 1 << 20, 0, |x| x).unwrap());
+        }
+
+        let (listed, cursor) = node.list_channels("fills.prod.").unwrap();
+        let names: Vec<&str> = listed.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["fills.prod.a", "fills.prod.b"],
+            "prefix matching is a range scan, in name order"
+        );
+        assert!(listed.iter().all(|c| c.owner == node.config.node_id));
+        assert!(
+            listed.iter().all(|c| c.owner_live),
+            "we own these, so their owner is trivially reachable"
+        );
+        assert!(listed.iter().all(|c| c.member_of.is_none()));
+
+        // Everything, and nothing, are both legal prefixes.
+        assert_eq!(node.list_channels("").unwrap().0.len(), 4);
+        assert!(node.list_channels("nothing.").unwrap().0.is_empty());
+
+        // Changes after the cursor are exactly what the log carries.
+        drop(
+            node.host_channel("fills.prod.d", 1 << 20, 0, |x| x)
+                .unwrap(),
+        );
+        assert!(node.deregister("fills.prod.a").unwrap());
+
+        let seen = drain_changes(&cursor);
+        assert_eq!(seen.len(), 2, "one upsert and one removal: {seen:?}");
+        assert!(matches!(
+            &seen[0],
+            ChannelChange::Upserted(c) if c.name == "fills.prod.d"
+        ));
+        assert!(matches!(
+            &seen[1],
+            ChannelChange::Removed { name, .. } if name == "fills.prod.a"
+        ));
+    }
+
+    /// Topic members are ordinary registered channels, so they appear in listings and must be
+    /// distinguishable — a consumer wanting sources should not subscribe to the plumbing.
+    #[test]
+    fn listings_mark_topic_members() {
+        let node = Node::new(config(142, temp_dir("discovery-members")));
+        node.create_topic("fills.prod.topic", TopicOptions::default())
+            .unwrap();
+        node.publish_to_topic(
+            "fills.prod.topic",
+            "fills.prod.member",
+            ChannelOptions::default(),
+        )
+        .unwrap();
+
+        let (listed, _) = node.list_channels("fills.prod.").unwrap();
+        let member = listed
+            .iter()
+            .find(|c| c.name == "fills.prod.member")
+            .expect("the member is a channel like any other");
+        assert_eq!(member.member_of.as_deref(), Some("fills.prod.topic"));
+        let topic = listed
+            .iter()
+            .find(|c| c.name == "fills.prod.topic")
+            .expect("and so is the topic");
+        assert!(topic.member_of.is_none());
+    }
+
+    /// Anti-entropy re-merges a peer's entire registry on every reconnect. Publishing per
+    /// *merge* rather than per *change* would make each reconnect a storm of no-ops.
+    #[test]
+    fn re_merging_unchanged_entries_publishes_nothing() {
+        let node = Node::new(config(143, temp_dir("discovery-idempotent")));
+        drop(node.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap());
+        let (_, cursor) = node.list_channels("").unwrap();
+
+        let identity = node.registry.lock_safe().get("md.aapl").cloned().unwrap();
+        for _ in 0..5 {
+            node.merge_and_publish(identity.clone());
+        }
+
+        assert!(
+            drain_changes(&cursor).is_empty(),
+            "re-merging an identical entry changes nothing, so it publishes nothing"
+        );
+    }
+
     /// An application restarting must reopen its own channel where it left off, even after
     /// retention has pruned genesis. `create_origin` always passes `base_record_index(0)`, so
     /// this pins the behavior that makes that harmless: on reopen the *on-disk* base wins, and
@@ -1860,7 +2128,7 @@ mod tests {
         // Four segments of two records; `keep_files(2)` prunes back to the last two, taking
         // segment 0 — the file that carries genesis — with it.
         let mut index = 0u64;
-        let mut write_two = |w: &mut Writer, index: &mut u64| {
+        let write_two = |w: &mut Writer, index: &mut u64| {
             for _ in 0..2 {
                 let buf = w.try_reserve(4).unwrap();
                 buf.copy_from_slice(b"tick");
@@ -1932,7 +2200,7 @@ mod tests {
         let path = a.create_for_client("md.aapl", options).unwrap();
 
         let mut index = 0u64;
-        let mut write_two = |index: &mut u64| {
+        let write_two = |index: &mut u64| {
             let mut w = WriterBuilder::new(&path)
                 .region_size(options.region_size as usize)
                 .build()

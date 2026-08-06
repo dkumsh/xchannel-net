@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed** (revised — the transport question below is now decided).
+**Implemented** (`ListChannels` + the discovery log; see the CHANGELOG).
 
 ---
 

@@ -179,6 +179,12 @@ _As of 2026-06-22:_
     channel left nothing named after itself. Deletion is `remove_dir_all`, not a glob.
   - **A `Subscribe` for a channel this node hosts returns the origin**, not a replica — no
     self-replication over loopback, no second copy with its own retention.
+  - **Discovery** (`doc/DISCOVERY.md`, implemented): `list_channels(prefix)` → snapshot +
+    cursor under one lock; `watch_channels(cursor)` reads a **node-local discovery log** that is
+    itself an xchannel (`data_dir/.discovery/log`), so watchers cost the daemon nothing and
+    resume/retention/invalidation reuse the log's own semantics (revision = `RecordIndex`;
+    restart = fresh `generation` ⇒ re-list). Records are `Upserted`/`Removed` only; publishing
+    is gated on the merge actually changing the map.
   - **`SubscriptionStatus` RPC** (`Client::subscription_status` / `Node::subscription_status`):
     progress (`synced`, `head_at_connect`) reported separately from liveness (`owner_live`,
     `last_record_at_ms`) plus rebuild counts by cause, so "quiet" and "broken" never look alike.

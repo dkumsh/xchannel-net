@@ -42,6 +42,23 @@ channel — locally readable, network-replicable), without violating single-writ
   retired name.
 - **`XCHANNELD_SEEDS`**: configure seed peers (comma-separated control `host:port`) for the
   daemon to form/re-form the mesh.
+- **Channel discovery** (`doc/DISCOVERY.md`): `Client::list_channels(prefix)` returns the
+  matching channels **and** a cursor, both taken under one registry lock so nothing can slip
+  between "what exists" and "what changes next"; `Client::watch_channels(cursor)` follows the
+  changes. Discovery is itself a channel — the daemon publishes registry changes into a
+  node-local xchannel that clients read with a plain `Reader`, so watchers cost the daemon
+  nothing (a push stream or long poll would park a thread and a connection slot each), and
+  resume, retention and invalidation are the log's existing semantics rather than new ones: the
+  revision *is* a `RecordIndex`, "too old" *is* the retained-history bound, and a restarted
+  daemon starts a fresh log whose `generation` tells a stale cursor to re-list. Records are
+  `Upserted`/`Removed` only — a last-writer-wins map cannot honestly report `Added` vs
+  `Replaced`, since the winner for a name can change with no user action when a later-arriving
+  but earlier-registered identity wins the collision. Only merges that *change* the map publish,
+  so anti-entropy reconnects do not storm. `ChannelInfo` carries `epoch` (a change means the
+  name was reclaimed and is a different log), `owner_live`, and `member_of` (topic members are
+  ordinary channels and would otherwise silently pollute every listing).
+- `Registry` is now a `BTreeMap`: prefix matching is a range scan rather than a full walk, and
+  listings are ordered.
 - **`ForceDeregister` client RPC** (`Client::force_deregister`) — retire a channel whose
   owning node is **gone**, so its name can be reclaimed and an application pinned to a dead host
   can come back under the same name elsewhere. This is the deliberate exception to owner-only

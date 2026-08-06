@@ -16,7 +16,7 @@ use xchannel_net::NodeConfig;
 use xchannel_net::node::Node;
 use xchannel_net_client::Client;
 use xchannel_net_core::NodeId;
-use xchannel_net_core::wire::ChannelOptions;
+use xchannel_net_core::wire::{ChannelChange, ChannelOptions};
 
 fn temp_dir(name: &str) -> PathBuf {
     let mut d = std::env::temp_dir();
@@ -104,6 +104,65 @@ fn client_creates_and_subscribes_via_daemon() {
         seen += 1;
     }
     assert_eq!(seen, n);
+}
+
+/// Discovery end to end through the client: list, then follow what changes next. The daemon
+/// is not involved in the second half — the discovery log is an ordinary xchannel.
+#[test]
+fn client_lists_and_watches_channels() {
+    let data_dir = temp_dir("discovery");
+    let client_path = data_dir.join("client.sock");
+    let node = Node::new(NodeConfig {
+        node_id: NodeId(3),
+        data_dir,
+        control_addr: loopback(),
+        stream_addr: loopback(),
+        client_path: client_path.clone(),
+        seeds: vec![],
+        reclaim_after: Duration::from_secs(300),
+    });
+    let client_l = node.bind_client().unwrap();
+    {
+        let n = node.clone();
+        std::thread::spawn(move || {
+            let _ = n.serve_client(client_l);
+        });
+    }
+
+    let mut client = Client::connect(&client_path).unwrap();
+    let opts = ChannelOptions::default();
+    drop(client.create_channel("fills.prod.a", &opts).unwrap());
+    drop(client.create_channel("md.aapl", &opts).unwrap());
+
+    let (listed, cursor) = client.list_channels("fills.prod.").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "fills.prod.a");
+    assert_eq!(listed[0].epoch, 0);
+    assert!(listed[0].owner_live);
+
+    // A watch opened at the cursor sees exactly what happens after the listing.
+    let mut watch = client.watch_channels(&cursor).unwrap();
+    assert!(
+        watch.try_next().unwrap().is_none(),
+        "nothing has changed yet"
+    );
+
+    drop(client.create_channel("fills.prod.b", &opts).unwrap());
+    assert!(client.deregister("fills.prod.a").unwrap());
+
+    let mut changes = Vec::new();
+    while let Some(c) = watch.try_next().unwrap() {
+        changes.push(c);
+    }
+    assert!(matches!(
+        &changes[0],
+        ChannelChange::Upserted(c) if c.name == "fills.prod.b"
+    ));
+    assert!(matches!(
+        &changes[1],
+        ChannelChange::Removed { name, .. } if name == "fills.prod.a"
+    ));
+    assert_eq!(changes.len(), 2, "and nothing else: {changes:?}");
 }
 
 #[test]
