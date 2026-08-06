@@ -83,6 +83,18 @@ pub enum StreamMsg {
     Subscribe {
         name: ChannelName,
         from: RecordIndex,
+        /// The incarnation the subscriber's replica holds — `xchannel`'s
+        /// `ChannelHeader.generation`, which for a channel created by this system is the
+        /// registry's reclaim `epoch`. `0` when the subscriber has no replica yet (`from ==
+        /// 0`), and also for any channel whose name has never been reclaimed, so the check
+        /// this feeds is inert on the common path.
+        ///
+        /// The source compares it against its own before seeking: a mismatch means the two
+        /// sides are looking at different logs that merely share a name, and no resume
+        /// position can be valid. Sent in `Subscribe` rather than checked against the ack
+        /// because the seek — which blocks indefinitely on an unreachable position — happens
+        /// before the ack is written.
+        generation: u64,
     },
 
     /// Source → subscriber: subscription accepted; records for it will carry `stream_id`.
@@ -110,6 +122,12 @@ pub enum StreamMsg {
         mtu: u32,
         file_roll_size: u64,
         keep_files: u32,
+        /// The source's incarnation, stamped into a freshly created replica so the replica's
+        /// own files record which log they were built from — and can say so on the next
+        /// resume without any node-owned metadata (DESIGN §5). Ignored when reopening an
+        /// existing replica: xchannel keeps the on-disk value, so a replica cannot be
+        /// relabelled by a source that claims otherwise.
+        generation: u64,
     },
 
     /// Source → subscriber: one replicated record on `stream_id`. The frame carries its
@@ -137,12 +155,20 @@ pub enum StreamMsg {
     /// position is meaningless, and the only recovery is to discard the replica and
     /// re-subscribe from `RecordIndex(0)`.
     ///
-    /// Raised when the subscriber's `from` exceeds the source's `head`: impossible for a
-    /// genuine resume of this log (`from == head` is simply caught up), so it means the replica
-    /// was built from a different incarnation of the name — the case that arises when a
-    /// deregistered name is reclaimed by a new owner and the new origin restarts at index 0.
-    /// Detecting it *before* the source seeks is what keeps that seek from blocking forever on
-    /// records that will never exist.
+    /// Two triggers, checked in this order:
+    ///
+    /// 1. **Generation mismatch** — the subscriber's replica carries a different
+    ///    `ChannelHeader.generation` than the source. Precise: it holds however far apart the
+    ///    two logs are, including when the new incarnation has already grown past the old
+    ///    one's length.
+    /// 2. **`from` past `head`** — the source has never held a record at that index, so the
+    ///    replica cannot be a prefix of it. Imprecise but independent of the generation
+    ///    plumbing, and it catches a subscriber too old to send one.
+    ///
+    /// The mismatch is checked first: a replica from another incarnation may *also* look
+    /// behind retention, and reporting that would name the wrong problem. Detecting either
+    /// *before* the source seeks is what keeps that seek from blocking forever on records that
+    /// will never exist.
     ///
     /// `earliest`/`head` describe what the source actually holds, so the subscriber can report
     /// the divergence rather than merely retrying.

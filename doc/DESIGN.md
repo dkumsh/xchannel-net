@@ -263,16 +263,37 @@ reads/writes a purely local xchannel (the master it owns, or a replica kept sync
 - If a resuming subscriber requests `from` older than the source retains, the source
   replies `Gap { earliest }` — an explicit, first-class error (cf. Kafka "offset out of
   range"), never a silent hole.
-- If it requests `from` *past* the source's head, the source replies `Diverged { earliest,
-  head }`: this channel has never held a record at that index, so the replica cannot be a
-  prefix of it — it was built from a **different incarnation** of the name (a deregistered
-  name reclaimed by a new owner restarts at index 0). `from == head` is not divergence; that
-  is a caught-up subscriber.
+- If the subscriber's replica belongs to a **different incarnation** of the name, the source
+  replies `Diverged { earliest, head }`. Two triggers, checked in that order:
+  1. **Generation mismatch** — `Subscribe` carries the incarnation the replica holds
+     (xchannel's `ChannelHeader.generation`, which for our origins *is* the registry's reclaim
+     `epoch`), and the source compares it with its own. Precise, and it is the only check that
+     fires when the new incarnation has already grown *past* the replica's length — the case
+     where a resume would silently splice two unrelated logs whose indices line up.
+  2. **`from` past `head`** — the channel has never held a record there. Imprecise, but
+     independent of the generation plumbing and it catches an older subscriber.
+  A mismatched replica can *also* look behind retention, so the generation check runs first;
+  reporting a `Gap` there would name the wrong problem. `from == head` is not divergence
+  (caught up), and `from == 0` is exempt — there is nothing to invalidate.
 - Both refusals are decided **before** the source seeks to `from`. The seek reads forward and
   blocks until the channel reaches that index, so an unchecked out-of-range resume wedges both
   ends with no error raised anywhere — and, should the new log later grow past the index, the
   contiguity check would happily splice two unrelated channels into one replica. The recovery
-  for either refusal is the same: discard the replica and re-subscribe from `RecordIndex(0)`.
+  for either refusal is the same — discard the replica and re-subscribe from `RecordIndex(0)`
+  — so `stream::subscribe` returns a typed `SubscribeError` that separates "rebuild" from
+  "transient": retrying a rebuild case loops forever, while discarding a replica over a
+  dropped connection would throw away a channel's history and re-pull it.
+
+### Incarnation: whose files say what
+
+The replica's *own header* records which incarnation it was built from — the source stamps its
+generation into a freshly created replica via `SubscribeAck`, and xchannel keeps the on-disk
+value when reopening, so a source cannot relabel an existing replica. This keeps the §5
+no-node-owned-metadata rule intact: nothing extra is persisted, and a restarted daemon
+rediscovers the incarnation by opening the files it already has. The origin likewise reports
+its generation by reading *the log it is about to serve* rather than its registry entry — the
+registry is eventually consistent and may be mid-convergence; the file is authoritative for
+what is actually being served.
 
 ---
 

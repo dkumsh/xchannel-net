@@ -289,10 +289,15 @@ mod stream_tag {
 pub fn encode_stream_into(buf: &mut Vec<u8>, m: &StreamMsg) {
     let mut w = W::new(buf);
     match m {
-        StreamMsg::Subscribe { name, from } => {
+        StreamMsg::Subscribe {
+            name,
+            from,
+            generation,
+        } => {
             w.u8(stream_tag::SUBSCRIBE);
             w.str(name);
             w.u64(from.0);
+            w.u64(*generation);
         }
         StreamMsg::SubscribeAck {
             name,
@@ -303,6 +308,7 @@ pub fn encode_stream_into(buf: &mut Vec<u8>, m: &StreamMsg) {
             mtu,
             file_roll_size,
             keep_files,
+            generation,
         } => {
             w.u8(stream_tag::SUBSCRIBE_ACK);
             w.str(name);
@@ -313,6 +319,7 @@ pub fn encode_stream_into(buf: &mut Vec<u8>, m: &StreamMsg) {
             w.u32(*mtu);
             w.u64(*file_roll_size);
             w.u32(*keep_files);
+            w.u64(*generation);
         }
         StreamMsg::Record { stream_id, frame } => {
             // Hot path: flat fixed header + payload, no per-field framing.
@@ -360,6 +367,7 @@ pub fn decode_stream(bytes: &[u8]) -> io::Result<StreamMsg> {
         stream_tag::SUBSCRIBE => StreamMsg::Subscribe {
             name: r.str()?,
             from: RecordIndex(r.u64()?),
+            generation: r.u64()?,
         },
         stream_tag::SUBSCRIBE_ACK => StreamMsg::SubscribeAck {
             name: r.str()?,
@@ -370,6 +378,7 @@ pub fn decode_stream(bytes: &[u8]) -> io::Result<StreamMsg> {
             mtu: r.u32()?,
             file_roll_size: r.u64()?,
             keep_files: r.u32()?,
+            generation: r.u64()?,
         },
         stream_tag::RECORD => {
             let stream_id = StreamId(r.u32()?);
@@ -586,6 +595,7 @@ mod tests {
             StreamMsg::Subscribe {
                 name: "md.aapl".into(),
                 from: RecordIndex(0),
+                generation: 0,
             },
             StreamMsg::SubscribeAck {
                 name: "md.aapl".into(),
@@ -596,6 +606,7 @@ mod tests {
                 mtu: 0,
                 file_roll_size: 1 << 30,
                 keep_files: 8,
+                generation: 3,
             },
             StreamMsg::Record {
                 stream_id: StreamId(3),

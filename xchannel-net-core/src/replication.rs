@@ -60,6 +60,14 @@ impl ReplicationSource {
         RecordIndex(self.next_index)
     }
 
+    /// The channel's incarnation id (`ChannelHeader.generation`), read from the log itself
+    /// rather than from any registry entry: the file is authoritative for what is actually
+    /// being served, while a registry is eventually consistent and may be mid-convergence.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.reader.generation()
+    }
+
     /// The channel's current head (high-water absolute index) at the time of call —
     /// independent of this source's read cursor. Used to advertise the true `head` in
     /// `SubscribeAck` so a subscriber can tell when it has caught up to the frontier.
@@ -154,6 +162,14 @@ impl ReplicationSink {
     /// send; it seeds the replica's `base_record_index` so the replica self-describes
     /// absolute indices. Reopening an existing replica ignores `start` (the on-disk base
     /// wins) and resumes from its head.
+    ///
+    /// `generation` is the source's incarnation, likewise stamped only on creation, so the
+    /// replica's own header records which log it was built from. Reopening an existing
+    /// replica whose generation differs is rejected: it means this replica belongs to a
+    /// previous incarnation of the name and cannot be extended. That normally cannot happen
+    /// — the origin rejects such a resume during the handshake — but an *empty* replica
+    /// resumes at index 0, which the origin's check deliberately waves through, so this is
+    /// the backstop for that case.
     pub fn open(
         path: &Path,
         region_size: u32,
@@ -161,16 +177,29 @@ impl ReplicationSink {
         file_roll_size: u64,
         keep_files: u32,
         start: RecordIndex,
+        generation: u64,
     ) -> io::Result<Self> {
         let mut builder = WriterBuilder::new(path)
             .region_size(region_size as usize)
             .mtu(mtu as u64)
             .file_roll_size(file_roll_size)
-            .base_record_index(start.0);
+            .base_record_index(start.0)
+            .generation(generation);
         if keep_files > 0 {
             builder = builder.keep_files(keep_files as u64);
         }
         let writer = builder.build()?;
+        if writer.generation() != generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replica generation {} != source generation {} — replica belongs to a \
+                     previous incarnation of this channel",
+                    writer.generation(),
+                    generation
+                ),
+            ));
+        }
         let expected_index = writer.next_record_index();
         Ok(Self {
             writer,
@@ -322,7 +351,7 @@ mod tests {
 
         {
             let mut sink =
-                ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, RecordIndex(0)).unwrap();
+                ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, RecordIndex(0), 0).unwrap();
             for f in &frames {
                 sink.apply(f).unwrap();
             }
@@ -347,7 +376,8 @@ mod tests {
         );
 
         {
-            let mut sink = ReplicationSink::open(&replica, REGION_U32, 0, 0, 2, earliest).unwrap();
+            let mut sink =
+                ReplicationSink::open(&replica, REGION_U32, 0, 0, 2, earliest, 0).unwrap();
             while let Some(f) = source.try_next_frame().unwrap() {
                 sink.apply(&f).unwrap();
             }
@@ -409,7 +439,8 @@ mod tests {
 
         // Apply into the replica.
         {
-            let mut sink = ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, earliest).unwrap();
+            let mut sink =
+                ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, earliest, 0).unwrap();
             for f in &frames {
                 sink.apply(f).unwrap();
             }
@@ -449,6 +480,7 @@ mod tests {
                 file_roll_size,
                 keep_files,
                 RecordIndex(0),
+                0,
             )
             .unwrap();
             // Enough ~1 KiB records to fill many files and force pruning past keep_files.
@@ -481,7 +513,7 @@ mod tests {
     fn sink_rejects_non_contiguous_frame() {
         let replica = temp_base("noncontig");
         let mut sink =
-            ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, RecordIndex(0)).unwrap();
+            ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, RecordIndex(0), 0).unwrap();
 
         sink.apply(&RecordFrame {
             index: RecordIndex(0),

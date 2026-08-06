@@ -82,6 +82,41 @@ fn validate_channel_name(name: &str) -> io::Result<()> {
     }
 }
 
+/// Delete every segment of the channel based at `base` — `<name>`, its rolled `<name>.N`
+/// siblings, and any `.partial` left by an interrupted roll — so the next subscribe rebuilds
+/// the replica from scratch. Used when a source refuses to extend a replica (behind retention,
+/// or a different incarnation of the name).
+///
+/// Matches `<name>` and `<name>.<digits>` exactly, never a prefix, so a sibling channel called
+/// `<name>-other` is untouched. It cannot, however, distinguish a segment `foo.1` from a
+/// channel legitimately *named* `foo.1`, since channel names may contain dots and all replicas
+/// share one directory — a pre-existing ambiguity in the flat replica layout, tracked
+/// separately; the same collision already lets two such channels share files.
+fn remove_replica(base: &Path) -> io::Result<()> {
+    let (Some(dir), Some(stem)) = (base.parent(), base.file_name().and_then(|n| n.to_str())) else {
+        return Ok(());
+    };
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let is_segment = name == stem
+            || name
+                .strip_prefix(stem)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|rest| {
+                    let rest = rest.strip_suffix(".partial").unwrap_or(rest);
+                    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                })
+            || name == format!("{stem}.partial");
+        if is_segment {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// RAII token counting one live connection against [`MAX_CONNECTIONS`].
 struct ConnGuard(Arc<AtomicUsize>);
 impl Drop for ConnGuard {
@@ -221,6 +256,7 @@ impl Node {
             .region_size(region_size as usize)
             .mtu(mtu as u64)
             .base_record_index(0)
+            .generation(identity.epoch)
             .build()?;
         // The `configure` closure is opaque, so any `file_roll_size`/`keep_files` it sets
         // can't be read back to advertise in the `SubscribeAck`. We therefore announce
@@ -259,7 +295,12 @@ impl Node {
             .region_size(options.region_size as usize)
             .mtu(options.mtu as u64)
             .file_roll_size(options.file_roll_size)
-            .base_record_index(0);
+            .base_record_index(0)
+            // The registry's reclaim epoch *is* this log's incarnation: stamping it here is
+            // what lets a subscriber's replica later say which incarnation it holds. Applied
+            // only on creation — reopening keeps the on-disk value, so a restart re-hosting
+            // this origin cannot relabel it.
+            .generation(identity.epoch);
         if options.keep_files > 0 {
             builder = builder.keep_files(options.keep_files as u64);
         }
@@ -1125,10 +1166,12 @@ impl Node {
                 std::thread::sleep(BACKOFF);
                 continue;
             };
-            // Resume from the replica's current head (0 if it doesn't exist yet).
-            let from = self
-                .replica_head(&replica_path, id.region_size)
-                .unwrap_or(RecordIndex(0));
+            // Resume from the replica's current head (0 if it doesn't exist yet), carrying
+            // the incarnation that replica holds so the source can refuse a resume across a
+            // reclaim instead of splicing two logs.
+            let (from, generation) = self
+                .replica_position(&replica_path, id.region_size)
+                .unwrap_or((RecordIndex(0), 0));
             synced.store(from.0, Ordering::Relaxed);
 
             let Ok(conn) = TcpTransport::connect(addr) else {
@@ -1136,9 +1179,24 @@ impl Node {
                 continue;
             };
             let shutdown_handle = conn.try_clone().ok();
-            let Ok(mut client) = stream::subscribe(conn, &name, from, &replica_path) else {
-                std::thread::sleep(BACKOFF);
-                continue;
+            let mut client = match stream::subscribe(conn, &name, from, generation, &replica_path) {
+                Ok(client) => client,
+                Err(e) if e.requires_rebuild() => {
+                    // The source cannot extend this replica — it is behind retention, or it
+                    // belongs to a previous incarnation of the name. Retrying the same
+                    // position would loop forever (the answer will not change), so discard it
+                    // and let the next attempt subscribe from scratch. Only ever taken for
+                    // this classified failure: doing it on a transient error would throw away
+                    // a whole channel's history over a dropped connection.
+                    let _ = remove_replica(&replica_path);
+                    synced.store(0, Ordering::Relaxed);
+                    std::thread::sleep(BACKOFF);
+                    continue;
+                }
+                Err(_) => {
+                    std::thread::sleep(BACKOFF);
+                    continue;
+                }
             };
             *shutdown.lock_safe() = shutdown_handle;
 
@@ -1160,17 +1218,23 @@ impl Node {
         }
     }
 
-    /// Absolute head index of an existing replica (so a subscription resumes from there),
-    /// or 0 if the replica doesn't exist yet. Reopens the channel briefly to read its head;
-    /// `region_size` must match the on-disk geometry (taken from the registry identity).
-    fn replica_head(&self, replica_path: &Path, region_size: u32) -> io::Result<RecordIndex> {
+    /// Where an existing replica stands: `(head index, generation)` — the resume position and
+    /// the incarnation of the channel that position refers to. `(0, 0)` if there is no replica
+    /// yet. Both come from the replica's own files, so nothing node-owned has to be persisted
+    /// to survive a restart (DESIGN §5). Reopens the channel briefly; `region_size` must match
+    /// the on-disk geometry (taken from the registry identity).
+    fn replica_position(
+        &self,
+        replica_path: &Path,
+        region_size: u32,
+    ) -> io::Result<(RecordIndex, u64)> {
         if !replica_path.exists() {
-            return Ok(RecordIndex(0));
+            return Ok((RecordIndex(0), 0));
         }
         let writer = WriterBuilder::new(replica_path)
             .region_size(region_size as usize)
             .build()?;
-        Ok(RecordIndex(writer.next_record_index()))
+        Ok((RecordIndex(writer.next_record_index()), writer.generation()))
     }
 
     /// Stop and forget a subscription this node maintains for a client. Returns whether one
@@ -1387,6 +1451,117 @@ mod tests {
         assert_eq!(sub.synced_index(), n);
     }
 
+    /// The relocation case end to end, arranged so only the generation check can catch it:
+    /// the new incarnation grows *past* the length of the replica the subscriber is holding,
+    /// so its resume position sits well inside `earliest..head` and the "past head" heuristic
+    /// sees nothing wrong. Resuming there would append the new log's records onto the old
+    /// log's — indices lining up perfectly, contiguity check satisfied, two unrelated channels
+    /// silently spliced into one replica. The subscription must discard and rebuild instead.
+    #[test]
+    fn a_reclaimed_channel_rebuilds_the_replica_instead_of_splicing() {
+        let (a, _a_stream, a_control) = start(41, "reclaim-a");
+        let (b, _b_stream, _b_control) = start(42, "reclaim-b");
+        let old_n = 3u64;
+
+        // First incarnation: a short log, fully replicated to B.
+        {
+            let mut w = a.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap();
+            for i in 0..old_n {
+                let p = format!("old-{i}").into_bytes();
+                let buf = w.try_reserve(p.len()).unwrap();
+                buf.copy_from_slice(&p);
+                w.commit(0, p.len() as u32, i).unwrap();
+            }
+        }
+        b.connect_control_peer(a_control).unwrap();
+        let sub = b
+            .subscribe("md.aapl", Some(Duration::from_secs(5)))
+            .unwrap();
+        poll_until(|| (sub.synced_index() == old_n).then_some(()));
+        drop(sub); // stops the loop and releases the replica writer
+
+        // The name is retired and reclaimed — same name, brand-new log at `epoch + 1`,
+        // holding far fewer records than the replica B is sitting on.
+        assert!(a.deregister("md.aapl").unwrap());
+        // Deliberately longer than the replica B holds, so `from` stays below the new head.
+        let new_n = 40u64;
+        {
+            let mut w = poll_until(|| a.host_channel("md.aapl", 1 << 20, 0, |x| x).ok());
+            for i in 0..new_n {
+                let p = format!("new-{i}").into_bytes();
+                let buf = w.try_reserve(p.len()).unwrap();
+                buf.copy_from_slice(&p);
+                w.commit(0, p.len() as u32, i).unwrap();
+            }
+        }
+
+        // B re-subscribes holding records of a log that no longer exists.
+        let sub = b
+            .subscribe("md.aapl", Some(Duration::from_secs(5)))
+            .unwrap();
+        poll_until(|| (sub.synced_index() == new_n).then_some(()));
+        drop(sub);
+
+        // The replica is the new log in full — not the old one, and not the two spliced.
+        let replica = b.replica_path("md.aapl").unwrap();
+        let mut r = ReaderBuilder::new(&replica)
+            .mode(ReaderMode::LateJoin)
+            .build()
+            .unwrap();
+        assert_eq!(r.base_record_index(), 0, "rebuilt from genesis");
+        let mut seen = 0u64;
+        while let Some(m) = r.try_read().unwrap() {
+            assert_eq!(
+                m.payload(),
+                format!("new-{seen}").as_bytes(),
+                "replica must hold only the new incarnation's records"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, new_n, "old incarnation's records are gone");
+    }
+
+    /// `remove_replica` must take a channel's own segments and nothing else — replicas of
+    /// every channel share one flat directory, so an over-eager prefix match would delete a
+    /// neighbour's data.
+    #[test]
+    fn remove_replica_takes_only_its_own_segments() {
+        let dir = temp_dir("remove-replica");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("md.aapl");
+        for f in [
+            "md.aapl",         // the base segment
+            "md.aapl.1",       // a rolled segment
+            "md.aapl.2",       // another
+            "md.aapl.partial", // an interrupted roll
+            "md.aapl.3.partial",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        for f in [
+            "md.aapl-other", // a different channel sharing a prefix
+            "md.aaplX",
+            "md.aapl.snapshot", // dots are legal in names: a channel, not a segment
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+
+        remove_replica(&base).unwrap();
+
+        for f in [
+            "md.aapl",
+            "md.aapl.1",
+            "md.aapl.2",
+            "md.aapl.partial",
+            "md.aapl.3.partial",
+        ] {
+            assert!(!dir.join(f).exists(), "{f} should have been removed");
+        }
+        for f in ["md.aapl-other", "md.aaplX", "md.aapl.snapshot"] {
+            assert!(dir.join(f).exists(), "{f} must be left alone");
+        }
+    }
+
     #[test]
     fn subscription_stops_cleanly() {
         let (a, _a_stream, a_control) = start(11, "stop-a");
@@ -1436,7 +1611,7 @@ mod tests {
 
         let replica = temp_dir("serve-replica").join("chan");
         let conn = TcpTransport::connect(addr).unwrap();
-        let mut client = stream::subscribe(conn, "md.aapl", RecordIndex(0), &replica).unwrap();
+        let mut client = stream::subscribe(conn, "md.aapl", RecordIndex(0), 0, &replica).unwrap();
         for _ in 0..n {
             client.recv_one().unwrap();
         }

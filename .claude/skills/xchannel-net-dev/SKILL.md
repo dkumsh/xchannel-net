@@ -268,7 +268,9 @@ xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
   (`WriterBuilder::generation` / `Reader::generation()` / `Writer::generation()`) — the registry
   reclaim epoch goes here, so a replica's own files say which incarnation they hold; **5.0.0**
   `format_version = 3`, `channel_name` widened 20 → 48 bytes (greenfield; v2 files refused).
-  `generation` is not consumed yet — that is the epoch-aware-subscription work.
+  `generation` carries the registry reclaim epoch on our origins, so a replica's own header says
+  which incarnation it holds; `Subscribe` carries it and the source refuses a cross-incarnation
+  resume (`StreamMsg::Diverged`).
 
 **Council whole-branch review — both blockers fixed:** (1) member records using a reserved control
 `msg_type` are now **rejected** at `merge_one` (never forge a control record into the topic —

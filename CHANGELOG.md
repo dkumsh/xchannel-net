@@ -46,6 +46,22 @@ channel — locally readable, network-replicable), without violating single-writ
   topic head, gaps emitted, slot-table version (§8).
 
 ### Fixed
+- **A replica from a different incarnation of a name is never resumed onto.** `Subscribe` now
+  carries the incarnation the subscriber's replica holds — xchannel's `ChannelHeader.generation`,
+  which for our origins is the registry's reclaim `epoch` — and the source refuses the resume if
+  it differs from its own. This is the check that matters once a reclaimed channel has grown
+  past the replica's length: the resume position then sits comfortably inside the source's
+  range, so nothing about it looks wrong, and the sink would append the new log's records onto
+  the old log's with the indices lining up and the contiguity check satisfied — two unrelated
+  channels silently spliced into one replica. The incarnation lives in the replica's own header
+  (stamped from `SubscribeAck` at creation, immutable on reopen), so no node-owned metadata is
+  persisted and a restarted daemon rediscovers it by opening the files it already has.
+- **A refused resume now rebuilds instead of retrying forever.** `stream::subscribe` returns a
+  typed `SubscribeError` separating "discard the replica and re-subscribe from 0" (`Gap` or
+  `Diverged`) from transient transport failures; the subscription loop acts on it. Both cases
+  previously retried the same unserviceable position at 10 Hz indefinitely. The distinction is
+  load-bearing in both directions: retrying a rebuild case never converges, and rebuilding on a
+  dropped connection would discard a whole channel's history and re-pull it.
 - **A resume position past the source's head is refused** (`StreamMsg::Diverged`) instead of
   hanging. After a deregistered name is reclaimed by a new owner, the new origin restarts at
   index 0 while other nodes still hold replicas of the old incarnation; their self-healing
