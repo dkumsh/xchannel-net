@@ -255,7 +255,9 @@ xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
 - Recovery is correct but scans from genesis — not the bounded §5.2 scan (needs reverse reads).
 - Reconstruct covers **topics + non-topic origins** (the latter recovering geometry via xchannel
   4.2.0 `Reader::region_size()`/`mtu()`). Not re-hosted: **empty** topics (no slot table). Dep is
-  `xchannel = "4.2.0"` (published; no patch).
+  `xchannel = "4.3.0"` (published; no patch) — 4.3.0 adds `Reader::file_sequence()`, which makes
+  the origin's roll boundaries observable so a replica can mirror its segmentation (and therefore
+  its `keep_files` retention). Not consumed yet; that is the roll-propagation work.
 
 **Council whole-branch review — both blockers fixed:** (1) member records using a reserved control
 `msg_type` are now **rejected** at `merge_one` (never forge a control record into the topic —

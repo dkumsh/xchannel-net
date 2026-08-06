@@ -17,8 +17,10 @@ authors = ["Dmitriy Kumshayev <dq@mail.com>"]
 [workspace.dependencies]
 # The log/IPC substrate this project replicates over the network. 4.1.0 adds
 # `Reader::head_record_index()` (true `SubscribeAck.head`); 4.2.0 adds `Reader::region_size()`
-# + `mtu()`, used to recover geometry when re-registering origins on restart (§5.2).
-xchannel = { version = "4.2.0" }
+# + `mtu()`, used to recover geometry when re-registering origins on restart (§5.2); 4.3.0 adds
+# `Reader::file_sequence()`, which makes the origin's roll boundaries observable so replicas can
+# mirror its segmentation (and therefore its `keep_files` retention).
+xchannel = { version = "4.3.0" }
 
 # Internal crates referencing each other. `version` is required for crates.io publishing
 # (the registry rejects a bare path dep); the `path` still wins for local/workspace builds.
