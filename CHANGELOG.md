@@ -4,7 +4,7 @@ All notable changes to xchannel-net are documented here. Versioning is pre-1.0 a
 experimental: the wire protocol and on-disk layout may change without notice (see
 `SECURITY.md`).
 
-## Unreleased
+## 0.1.0 (2026-08-07)
 
 **Topics — multi-producer fan-in** (`doc/TOPICS.md`): a set of single-writer member channels
 merged by a **mux** into one totally-ordered **topic channel** (itself an ordinary xchannel
