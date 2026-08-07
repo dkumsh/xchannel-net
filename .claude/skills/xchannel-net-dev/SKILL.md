@@ -284,7 +284,10 @@ xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
   `ChannelHeader.generation`, an opaque incarnation id stamped into every segment
   (`WriterBuilder::generation` / `Reader::generation()` / `Writer::generation()`) — the registry
   reclaim epoch goes here, so a replica's own files say which incarnation they hold; **5.0.0**
-  `format_version = 3`, `channel_name` widened 20 → 48 bytes (greenfield; v2 files refused).
+  `format_version = 3`, `channel_name` widened 20 → 48 bytes (greenfield; v2 files refused);
+  **5.1.0** a reader refuses a roll into a segment that breaks the absolute numbering, so a
+  replica rebuilt under a live client `Reader` fails loudly rather than splicing two histories
+  (an inode check would not do: retention unlinks files under live readers routinely).
   `generation` carries the registry reclaim epoch on our origins, so a replica's own header says
   which incarnation it holds; `Subscribe` carries it and the source refuses a cross-incarnation
   resume (`StreamMsg::Diverged`).

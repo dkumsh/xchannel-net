@@ -23,7 +23,9 @@ authors = ["Dmitriy Kumshayev <dq@mail.com>"]
 # `ChannelHeader.generation`, the incarnation id that lets a replica tell "this log continues"
 # from "this name was reclaimed by a new owner" (registry epoch goes here). 5.0.0 is
 # `format_version = 3` — `channel_name` widened 20 → 48 bytes; greenfield, v2 files are refused.
-xchannel = { version = "5.0.0" }
+# 5.1.0 makes a reader refuse a roll into a segment that breaks the absolute numbering, so a
+# replica rebuilt under a live client `Reader` fails loudly instead of splicing two histories.
+xchannel = { version = "5.1.0" }
 
 # Internal crates referencing each other. `version` is required for crates.io publishing
 # (the registry rejects a bare path dep); the `path` still wins for local/workspace builds.
