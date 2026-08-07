@@ -160,7 +160,7 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
 
 ## Current status (update this section as work lands)
 
-_As of 2026-06-22:_
+_As of 2026-08-07 (released **0.1.0** — all three crates on crates.io):_
 - Dep is published **`xchannel = "4.0.0"`**. `.justfile` present in every commit; every
   commit passes `just check` (cargo check + fmt --check + clippy --all-targets).
 - **v1 complete and hardened.** External client process → `Client` RPC → local `xchanneld`
