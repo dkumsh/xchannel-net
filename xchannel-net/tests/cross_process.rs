@@ -222,6 +222,79 @@ fn a_restarted_daemon_serves_nothing_until_it_has_rebuilt_from_disk() {
     }
 }
 
+/// Merge latency: how long after a producer commits to a member channel does the record appear in
+/// the topic. This is the number the mux loop's idle strategy decides, and it used to be decided
+/// badly — a flat 5 ms sleep after *every* poll, so a producer on a hot stream waited the full tick
+/// each time.
+///
+/// Measured across processes (the real path: this process writes the member, the daemon merges,
+/// this process reads the topic) and with a **tight `try_read` spin** rather than `read_blocking`,
+/// because xchannel's own blocking read has a 1 µs-doubling backoff that would otherwise be
+/// measured instead of the mux's.
+///
+/// Asserts the **median** over many samples, not a single one: a median is insensitive to the
+/// scheduler hiccups that make single-sample latency assertions flaky, while still being decisive
+/// here. Old loop: ~5 ms, every sample. New loop: microseconds. The 1 ms bound sits ~5× below the
+/// old behaviour and orders of magnitude above the new one, so it is neither flaky nor toothless.
+#[test]
+fn a_record_merges_into_its_topic_without_waiting_on_a_poll_tick() {
+    let data_dir = temp_dir("mux-latency");
+    let (_daemon, client_path) = spawn_daemon(&data_dir);
+    let mut client = connect_with_retry(&client_path);
+    client
+        .create_topic("agg", &TopicOptions::default())
+        .unwrap();
+    let mut w = client
+        .publish_to_topic("agg", "mem.a", &ChannelOptions::default())
+        .unwrap();
+    // Locally hosted ⇒ this reads the topic origin the daemon writes.
+    let mut reader = client
+        .subscribe("agg", SubscribeMode::LateJoin, Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Commit one record and spin until it surfaces in the topic; `None` if it never does.
+    let mut round_trip = |i: u64| -> Option<Duration> {
+        let payload = i.to_le_bytes();
+        let started = Instant::now();
+        let buf = w.try_reserve(payload.len()).unwrap();
+        buf.copy_from_slice(&payload);
+        w.commit(1, payload.len() as u32, i).unwrap();
+        let deadline = started + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match reader.try_read().unwrap() {
+                Some(m) if !is_control(m.header().message_type) => return Some(started.elapsed()),
+                Some(_) => {} // a slot table — keep looking
+                None => std::hint::spin_loop(),
+            }
+        }
+        None
+    };
+
+    // Warm up: the first records also pay mux attach and slot-table emission.
+    for i in 0..10 {
+        assert!(round_trip(i).is_some(), "warm-up record {i} never merged");
+    }
+    let mut samples: Vec<Duration> = (10..60)
+        .map(|i| round_trip(i).unwrap_or_else(|| panic!("record {i} never merged")))
+        .collect();
+    samples.sort_unstable();
+
+    let median = samples[samples.len() / 2];
+    let worst = *samples.last().unwrap();
+    assert!(
+        median < Duration::from_millis(1),
+        "median merge latency {median:?} (worst {worst:?}) — the mux loop is waiting on a clock \
+         instead of on records"
+    );
+    eprintln!(
+        "merge latency over {} samples: median {:?}, p90 {:?}, worst {:?}",
+        samples.len(),
+        median,
+        samples[samples.len() * 9 / 10],
+        worst
+    );
+}
+
 #[test]
 fn plain_channel_reregisters_after_daemon_restart() {
     let data_dir = temp_dir("reregister");

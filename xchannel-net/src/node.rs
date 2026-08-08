@@ -171,6 +171,91 @@ pub struct MemberInfo {
     pub state: MemberState,
 }
 
+/// How the mux loop waits when a poll finds nothing to merge.
+///
+/// The merge **must** be a poll loop: a member is an mmap'd log written by another process, with
+/// no notification to wait on, and there are N of them — so there is nothing to block on that
+/// wouldn't starve the other members. That makes "what to do when idle" the *only* lever on merge
+/// latency, and a flat sleep spends it badly. The original fixed 5 ms tick cost a record arriving
+/// just after a poll up to 5 ms before it was even written to the topic: broker-class latency on
+/// the one path that exists for aggregation, in a system whose whole premise is that the manager
+/// is never in the way.
+///
+/// So: escalating backoff, the shape xchannel's own `Reader::wait_for_message` already uses
+/// (1 µs doubling to 10 ms) and the shape Aeron calls an `IdleStrategy` — stay hot while records
+/// are flowing, decay toward a cheap park when they are not.
+///
+/// **The CPU trade, stated plainly.** A busy mux never sleeps, and a *quiet* one decays to the same
+/// 5 ms park the old loop took unconditionally — so neither extreme costs more than before. The
+/// cost lands in between: a **bursty** topic spends its gaps spinning and yielding rather than
+/// sleeping through them, which is latency bought with cycles. That is the intended trade for a
+/// merge path, and it is tunable in both directions — raise `min_park` or cut the spin/yield counts
+/// to give cycles back, or set `max_park` to zero to never park at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MuxIdle {
+    /// Consecutive idle rounds spent on [`spin_loop`](std::hint::spin_loop) before yielding.
+    pub max_spins: u32,
+    /// Idle rounds spent on [`yield_now`](std::thread::yield_now) after the spins, before parking.
+    pub max_yields: u32,
+    /// First park, doubled on each further idle round.
+    pub min_park: Duration,
+    /// Ceiling on the park. **Zero means never park** — keep yielding, for a core dedicated to a
+    /// latency-critical topic.
+    pub max_park: Duration,
+}
+
+impl Default for MuxIdle {
+    /// Tuned so a member producing faster than ~10 kHz keeps the loop inside the spin/yield phases
+    /// (merge latency in microseconds), while a topic idle for ~10 ms decays to the 5 ms park that
+    /// used to be the *unconditional* interval — so worst-case idle CPU is unchanged.
+    fn default() -> Self {
+        Self {
+            max_spins: 512,
+            max_yields: 128,
+            min_park: Duration::from_micros(50),
+            max_park: Duration::from_millis(5),
+        }
+    }
+}
+
+/// What [`MuxIdle`] prescribes for one idle round. Split out from the doing so the escalation is
+/// testable without measuring elapsed time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IdleAction {
+    Spin,
+    Yield,
+    Park(Duration),
+}
+
+impl MuxIdle {
+    /// What to do on consecutive idle round `round` (0-based; reset to 0 whenever a poll merges).
+    fn action(&self, round: u32) -> IdleAction {
+        if round < self.max_spins {
+            return IdleAction::Spin;
+        }
+        let after_spins = round - self.max_spins;
+        if after_spins < self.max_yields || self.max_park.is_zero() {
+            return IdleAction::Yield;
+        }
+        // Double from `min_park`, clamped — `1 << 20` already saturates any sane `max_park`, and
+        // the shift itself must not overflow on a loop that has been idle for hours.
+        let steps = (after_spins - self.max_yields).min(20);
+        IdleAction::Park(
+            self.min_park
+                .saturating_mul(1u32 << steps)
+                .min(self.max_park),
+        )
+    }
+
+    fn wait(&self, round: u32) {
+        match self.action(round) {
+            IdleAction::Spin => std::hint::spin_loop(),
+            IdleAction::Yield => std::thread::yield_now(),
+            IdleAction::Park(d) => std::thread::sleep(d),
+        }
+    }
+}
+
 /// What [`Node::reconstruct_from_disk`] rebuilt from the data dir at startup.
 ///
 /// `skipped` counts channels found on disk that could not be re-hosted — a channel whose name is
@@ -734,12 +819,23 @@ impl Node {
         Ok(total)
     }
 
-    /// Drive the muxes forever: poll all hosted topics every `interval`. (Phase 1 runs this on
-    /// its own thread; §4.1's shared-loop integration and per-topic promotion are later.)
-    pub fn run_mux(&self, interval: Duration) {
+    /// Drive the muxes forever: poll every hosted topic, backing off per `idle` only when there
+    /// was nothing to merge. (Runs on its own thread; §4.1's shared-loop integration and per-topic
+    /// promotion are later — see [`MuxIdle`] for why this is a poll loop at all.)
+    pub fn run_mux(&self, idle: MuxIdle) {
+        let mut round = 0u32;
         loop {
-            let _ = self.poll_muxes();
-            std::thread::sleep(interval);
+            match self.poll_muxes() {
+                // Merged something: go straight back round. A producing member therefore never
+                // waits on the clock — only on the merge itself.
+                Ok(n) if n > 0 => round = 0,
+                // Nothing to merge, or the poll failed. Back off either way: a persistent error
+                // (a member file that will not open) must not become a hot loop.
+                _ => {
+                    idle.wait(round);
+                    round = round.saturating_add(1);
+                }
+            }
         }
     }
 
@@ -3068,6 +3164,58 @@ mod tests {
         assert!(node.topic_status("nope").is_none());
     }
 
+    /// The idle escalation, asserted on the *decision* rather than on elapsed time so it is
+    /// deterministic. The load-bearing property is the first line: round 0 — the round immediately
+    /// after a poll came up empty — must be a spin, because that is the round a record arriving
+    /// microseconds later has to wait through. The old loop made every round a 5 ms sleep.
+    #[test]
+    fn mux_idle_escalates_from_spin_to_a_capped_park() {
+        let idle = MuxIdle {
+            max_spins: 2,
+            max_yields: 2,
+            min_park: Duration::from_micros(50),
+            max_park: Duration::from_micros(200),
+        };
+        assert_eq!(idle.action(0), IdleAction::Spin, "first idle round is hot");
+        assert_eq!(idle.action(1), IdleAction::Spin);
+        assert_eq!(idle.action(2), IdleAction::Yield);
+        assert_eq!(idle.action(3), IdleAction::Yield);
+        // Then park, doubling from min_park and clamped at max_park.
+        assert_eq!(idle.action(4), IdleAction::Park(Duration::from_micros(50)));
+        assert_eq!(idle.action(5), IdleAction::Park(Duration::from_micros(100)));
+        assert_eq!(idle.action(6), IdleAction::Park(Duration::from_micros(200)));
+        assert_eq!(
+            idle.action(7),
+            IdleAction::Park(Duration::from_micros(200)),
+            "clamped, not doubling forever"
+        );
+        // A loop idle for hours must not overflow the shift.
+        assert_eq!(
+            idle.action(u32::MAX),
+            IdleAction::Park(Duration::from_micros(200))
+        );
+    }
+
+    /// `max_park: 0` means never park — the loop stays on `yield_now` forever, for a core given
+    /// over to a latency-critical topic.
+    #[test]
+    fn mux_idle_with_no_park_ceiling_never_sleeps() {
+        let idle = MuxIdle {
+            max_spins: 1,
+            max_yields: 1,
+            max_park: Duration::ZERO,
+            ..MuxIdle::default()
+        };
+        assert_eq!(idle.action(0), IdleAction::Spin);
+        for round in [1, 2, 500, u32::MAX] {
+            assert_eq!(
+                idle.action(round),
+                IdleAction::Yield,
+                "round {round} must not park"
+            );
+        }
+    }
+
     #[test]
     fn reaper_tombstones_a_member_with_a_dead_owner() {
         let node = Node::new(config(1, temp_dir("reap")));
@@ -3160,7 +3308,7 @@ mod tests {
         let topic_path = a.create_topic("agg", TopicOptions::default()).unwrap();
         {
             let a = a.clone();
-            std::thread::spawn(move || a.run_mux(Duration::from_millis(2)));
+            std::thread::spawn(move || a.run_mux(MuxIdle::default()));
         }
 
         // B hosts a member of "agg" (B does not own the topic) and writes to it, dropping the

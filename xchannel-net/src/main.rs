@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use xchannel_net::NodeConfig;
-use xchannel_net::node::Node;
+use xchannel_net::node::{MuxIdle, Node};
 use xchannel_net_core::NodeId;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -161,8 +161,18 @@ fn main() -> std::io::Result<()> {
     }
     {
         // Drive topic muxes: merge member channels into their topic channels (doc/TOPICS.md).
+        // The loop backs off only when idle, so a producing member is never waiting on a clock.
+        // `XCHANNELD_MUX_MAX_PARK_US` caps how long an idle mux parks; `0` means never park (keep
+        // yielding), for a box where a topic's merge latency is worth a core.
+        let idle = MuxIdle {
+            max_park: std::env::var("XCHANNELD_MUX_MAX_PARK_US")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(MuxIdle::default().max_park, Duration::from_micros),
+            ..MuxIdle::default()
+        };
         let node = node.clone();
-        std::thread::spawn(move || node.run_mux(std::time::Duration::from_millis(5)));
+        std::thread::spawn(move || node.run_mux(idle));
     }
     node.serve_stream(stream_listener)
 }

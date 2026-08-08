@@ -72,10 +72,12 @@ every hole in the LWW map in production.
 > emitted at the head of every segment, so one is always inside the retained window (§6.3).
 >
 > **Known deviations / not-yet (honest):**
-> - **Execution model (§4.1):** the mux runs on its **own thread** (`Node::run_mux`, a poll+sleep
->   loop), *not* as poll-items in the daemon's shared single-threaded forwarding loop as §4.1
->   specifies. Same engine and invariants; different scheduling. The §4.1 promotion path
->   (shared-loop → thread → process) is therefore not wired.
+> - **Execution model (§4.1):** the mux runs on its **own thread** (`Node::run_mux`), *not* as
+>   poll-items in the daemon's shared single-threaded forwarding loop as §4.1 specifies. Same engine
+>   and invariants; different scheduling. The §4.1 promotion path (shared-loop → thread → process)
+>   is therefore not wired. The loop backs off only when a poll finds nothing (`MuxIdle`:
+>   spin → yield → park doubling to a 5 ms ceiling), so a producing member never waits on a clock
+>   — measured median merge latency ~1 µs, against ~5 ms when the loop slept a flat tick.
 > - **Recovery cost (§5.2):** correct, but scans from genesis rather than the bounded
 >   last-slot-table scan (a correct bound needs reverse reads, an xchannel feature).
 > - **Reconstruct scope:** both topics and **non-topic origins** re-register on restart (the
@@ -241,6 +243,17 @@ that need any real (causal, timestamped, or cross-producer) ordering **must** de
 the per-record provenance (`member_id`, `member_index`, and the member's own `user_meta` /
 payload), not from topic position. The topic order is "written down so it's replayable *as
 observed*," not "meaningful across producers."
+
+**Merge latency is set by the idle strategy, not by a tick.** The loop must poll — a member is an
+mmap'd log written by another process with nothing to wait on, and there are N of them, so blocking
+on one would starve the rest. That makes "what to do when a poll comes up empty" the only lever,
+and a flat sleep spends it badly: a fixed tick charges every record arriving just after a poll the
+whole interval before it is even *written* to the topic. `MuxIdle` instead escalates only while
+idle — spin, then yield, then a park doubling to a ceiling — and resets the moment anything merges,
+so a producing member never waits on a clock. Same shape as xchannel's own
+`Reader::wait_for_message` backoff and as Aeron's `IdleStrategy`. Measured median merge latency is
+~1 µs; the ceiling (default 5 ms) only bounds how long a *quiet* topic takes to notice its first
+new record, and costs no more idle CPU than a fixed tick did.
 
 Backpressure posture is inherited and honest: the mux is a reader of its members
 (cannot slow them — no-custody holds) and the single writer of the topic (cannot be

@@ -7,6 +7,18 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 ## Unreleased
 
 ### Fixed
+- **Merge latency no longer waits on a poll tick.** `run_mux` slept a flat 5 ms after *every* poll,
+  including ones that merged, so a producer on a hot stream paid the full tick on each record
+  before it was even written to the topic — broker-class latency on the one path built for
+  aggregation. The loop now backs off only when a poll finds nothing, via a `MuxIdle` strategy that
+  escalates spin → yield → park (doubling from 50 µs to a 5 ms ceiling) and resets the moment
+  anything merges. Same shape as xchannel's own `Reader::wait_for_message` backoff and Aeron's
+  `IdleStrategy`. Measured across processes: **median 5.06 ms → 1.3 µs** (worst 6 µs over 50
+  samples). A quiet topic parks exactly as long as it used to, so idle CPU is unchanged.
+  `XCHANNELD_MUX_MAX_PARK_US` caps the park; `0` means never park (keep yielding) for a box where a
+  topic's merge latency is worth a core. Polling is not a shortcut here: a member is an mmap'd log
+  written by another process with nothing to wait on, and blocking on one of N would starve the
+  rest — so the idle strategy *is* the latency contract.
 - **Every tombstone this node produces now reaches its own discovery log.** Retiring a topic
   (`deregister_topic`) and reaping a member whose owner had died both announced to peers but
   skipped the local publish, so a client watching discovery **on that node** never saw the

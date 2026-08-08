@@ -280,6 +280,15 @@ table is emitted at the **head of every segment**, so one is always inside the r
 Proven by a cross-process daemon-restart test. Chose option (a) content-sniff over (b) an
 xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
 
+**Mux merge latency** (post-0.1.0 fix): `run_mux` takes a `MuxIdle` strategy instead of a fixed
+interval. It used to `sleep(5ms)` after *every* poll, so merge latency was 0–5 ms for a hot
+producer; it now backs off **only when a poll merged nothing** (spin → yield → park doubling
+50 µs → 5 ms, reset on any work). Median merge latency measured cross-process: **5.06 ms → 1.3 µs**.
+The poll loop is not negotiable — a member is another process's mmap'd log with nothing to wait on,
+and blocking on one of N would starve the rest — so the idle strategy *is* the latency contract.
+`XCHANNELD_MUX_MAX_PARK_US` caps the park (`0` = never park). Note the counterpart: plain channel
+replication was always event-driven (`pump_one` → `read_blocking`) and never had this floor.
+
 **Startup ordering** (post-0.1.0 fix): `reconstruct_from_disk` runs after the listeners are
 **bound** but before any plane accepts on them, and before `connect_seeds`. It used to run after
 the serve threads spawned, so at startup the daemon could answer from an empty registry — a wrong
@@ -308,7 +317,7 @@ data records age out and it would otherwise recover as fresh and be re-merged. R
 **overwrites** from a table (never maxes) — `MemberRegressed` can legally move a cursor backwards.
 
 **Honest remainders / known deviations:**
-- **§4.1 execution model:** the mux runs on its **own thread** (`run_mux`, poll+sleep), not as
+- **§4.1 execution model:** the mux runs on its **own thread** (`run_mux`), not as
   poll-items in the daemon's shared forwarding loop as §4.1 specifies (same engine/invariants,
   different scheduling); the promotion path is therefore unwired.
 - Recovery is correct but scans from genesis — not the bounded §5.2 scan (needs reverse reads).
