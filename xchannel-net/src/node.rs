@@ -303,7 +303,17 @@ pub struct Node {
     subscriptions: Arc<Mutex<HashMap<String, Subscription>>>,
     /// Muxes for topics this node owns, keyed by topic name. Each merges its member channels
     /// into the topic channel; polled by the mux loop (`doc/TOPICS.md` §4).
-    muxes: Arc<Mutex<HashMap<String, Mux>>>,
+    /// Muxes for topics this node owns, keyed by topic name. **Each mux has its own lock**: the
+    /// map lock is taken only long enough to clone a handle out, never across mux IO. A merge is
+    /// the one thing in the daemon that does unbounded work while holding a lock, so a shared lock
+    /// would make every topic's poll a head-of-line block on every other topic — and on
+    /// `create_topic`, `topic_status`, and the maintenance loop's attach pass. The hotter the poll
+    /// loop, the worse that gets, and the poll loop is now as hot as records arriving.
+    ///
+    /// **Lock order: map → mux, never the reverse.** Nothing may take the map lock while holding a
+    /// mux lock. Go through [`mux_of`](Self::mux_of) / [`mux_handles`](Self::mux_handles) rather
+    /// than working under the map guard, and the rule holds by construction.
+    muxes: Arc<Mutex<HashMap<String, Arc<Mutex<Mux>>>>>,
     /// Per-topic member-reap threshold (§6.1), for topics that opted in (`member_reap_after`).
     /// Absent ⇒ never reap.
     topic_reap: Arc<Mutex<HashMap<String, Duration>>>,
@@ -616,7 +626,9 @@ impl Node {
         // but those live on the `Writer` xchannel drops there, so a mux opened with geometry alone
         // would leave the topic growing as one unbounded file.
         let mux = Mux::open(&path, &mux::TopicGeometry::from(&options.channel), batch)?;
-        self.muxes.lock_safe().insert(name.to_string(), mux);
+        self.muxes
+            .lock_safe()
+            .insert(name.to_string(), Arc::new(Mutex::new(mux)));
         if options.member_reap_after_ms != 0 {
             self.topic_reap.lock_safe().insert(
                 name.to_string(),
@@ -643,16 +655,14 @@ impl Node {
         // attach immediately; otherwise the owner attaches via `attach_pending_members` once
         // the `member_of` registration gossips to it. `add_member` is idempotent.
         let member_path = self.create_origin(member, options, Some(topic.to_string()))?;
-        if self.muxes.lock_safe().contains_key(topic) {
+        if let Some(mux) = self.mux_of(topic) {
             let epoch = self
                 .registry
                 .lock_safe()
                 .get_raw(member)
                 .map(|id| id.epoch)
                 .unwrap_or(0);
-            if let Some(mux) = self.muxes.lock_safe().get_mut(topic) {
-                mux.add_member(member, epoch, &member_path)?;
-            }
+            mux.lock_safe().add_member(member, epoch, &member_path)?;
         }
         Ok(member_path)
     }
@@ -664,8 +674,7 @@ impl Node {
     /// a member whose replica isn't ready yet is retried on the next call. Runs on the
     /// maintenance loop, so it reacts as `member_of` registrations gossip in.
     pub fn attach_pending_members(&self) {
-        let topics: Vec<String> = self.muxes.lock_safe().keys().cloned().collect();
-        for topic in topics {
+        for (topic, mux) in self.mux_handles() {
             // Members the registry says belong to this topic right now (live, non-tombstoned).
             let live: Vec<ChannelIdentity> = {
                 let reg = self.registry.lock_safe();
@@ -685,12 +694,7 @@ impl Node {
                     self.ensure_member_subscription(&m.name);
                 }
 
-                let already = self
-                    .muxes
-                    .lock_safe()
-                    .get(&topic)
-                    .is_none_or(|mx| mx.has_member(&m.name, m.epoch));
-                if already {
+                if mux.lock_safe().has_member(&m.name, m.epoch) {
                     continue;
                 }
                 // Resolve the path the mux reads: a local origin, or the remote member's
@@ -706,9 +710,7 @@ impl Node {
                         Err(_) => continue,
                     }
                 };
-                if let Some(mux) = self.muxes.lock_safe().get_mut(&topic) {
-                    let _ = mux.add_member(&m.name, m.epoch, &path);
-                }
+                let _ = mux.lock_safe().add_member(&m.name, m.epoch, &path);
             }
 
             // Detach members the registry says have **left**: clean-leave drain → MemberClosed,
@@ -719,12 +721,12 @@ impl Node {
             // a member that never left.
             let live_set: std::collections::HashSet<(String, u64)> =
                 live.iter().map(|m| (m.name.clone(), m.epoch)).collect();
-            let attached: Vec<(String, u64)> = self
-                .muxes
+            let attached: Vec<(String, u64)> = mux
                 .lock_safe()
-                .get(&topic)
-                .map(|mx| mx.members().into_iter().map(|(n, e, _)| (n, e)).collect())
-                .unwrap_or_default();
+                .members()
+                .into_iter()
+                .map(|(n, e, _)| (n, e))
+                .collect();
             for (name, epoch) in attached {
                 if live_set.contains(&(name.clone(), epoch)) {
                     continue;
@@ -735,9 +737,7 @@ impl Node {
                 if !left {
                     continue; // absent, not departed — keep merging
                 }
-                if let Some(mux) = self.muxes.lock_safe().get_mut(&topic) {
-                    let _ = mux.remove_member(&name, epoch);
-                }
+                let _ = mux.lock_safe().remove_member(&name, epoch);
                 if let Some(sub) = self.subscriptions.lock_safe().remove(&name) {
                     sub.stop();
                 }
@@ -811,12 +811,41 @@ impl Node {
 
     /// Merge whatever is ready across every hosted topic. Returns the total records merged.
     pub fn poll_muxes(&self) -> io::Result<usize> {
-        let mut muxes = self.muxes.lock_safe();
         let mut total = 0;
-        for mux in muxes.values_mut() {
-            total += mux.poll()?;
+        let mut failure = None;
+        // Handles first, map lock released — then each topic merges under its own lock, so a busy
+        // topic delays neither its neighbours nor anything else that needs the map.
+        for (_, mux) in self.mux_handles() {
+            match mux.lock_safe().poll() {
+                Ok(n) => total += n,
+                // One topic failing must not abandon the rest of the sweep: they are independent
+                // logs, and the old `?` let a single unopenable member stall every other topic.
+                Err(e) => {
+                    failure.get_or_insert(e);
+                }
+            }
         }
-        Ok(total)
+        match failure {
+            // Report only when nothing merged anywhere, which is the sole case where the caller
+            // behaves differently (back off rather than stay hot). Genuine per-topic error
+            // reporting waits on the daemon having any logging at all.
+            Some(e) if total == 0 => Err(e),
+            _ => Ok(total),
+        }
+    }
+
+    /// The mux for `topic`, if this node hosts it. Takes the map lock only to clone the handle.
+    fn mux_of(&self, topic: &str) -> Option<Arc<Mutex<Mux>>> {
+        self.muxes.lock_safe().get(topic).cloned()
+    }
+
+    /// A handle per hosted topic, with the map lock released before any of them is used.
+    fn mux_handles(&self) -> Vec<(String, Arc<Mutex<Mux>>)> {
+        self.muxes
+            .lock_safe()
+            .iter()
+            .map(|(name, mux)| (name.clone(), Arc::clone(mux)))
+            .collect()
     }
 
     /// Drive the muxes forever: poll every hosted topic, backing off per `idle` only when there
@@ -841,7 +870,7 @@ impl Node {
 
     /// Number of members currently attached to a hosted topic's mux (for tests/observability).
     pub fn topic_member_count(&self, topic: &str) -> Option<usize> {
-        self.muxes.lock_safe().get(topic).map(|m| m.members().len())
+        self.mux_of(topic).map(|m| m.lock_safe().members().len())
     }
 
     /// Restart reconstruction (`DESIGN.md` §5.2, `doc/RESTART.md`): scan `data_dir`, re-host every
@@ -945,8 +974,14 @@ impl Node {
             cfg.geometry.file_roll_size,
             cfg.geometry.keep_files,
         )?;
-        let mux = Mux::open(&path, &cfg.geometry, MAX_BATCH_PER_MEMBER)?;
-        self.muxes.lock_safe().insert(name.to_string(), mux);
+        let mux = Arc::new(Mutex::new(Mux::open(
+            &path,
+            &cfg.geometry,
+            MAX_BATCH_PER_MEMBER,
+        )?));
+        self.muxes
+            .lock_safe()
+            .insert(name.to_string(), Arc::clone(&mux));
         for (member, epoch) in &cfg.members {
             // A member with a **local origin** is one we own: re-register it with `member_of`
             // (recovering its geometry via the header accessor) so it's back in the topic's live
@@ -967,12 +1002,7 @@ impl Node {
                 .into_iter()
                 .flatten()
             {
-                let attached = self
-                    .muxes
-                    .lock_safe()
-                    .get_mut(name)
-                    .map(|mx| mx.add_member(member, *epoch, &cand).is_ok())
-                    .unwrap_or(false);
+                let attached = mux.lock_safe().add_member(member, *epoch, &cand).is_ok();
                 if attached {
                     break;
                 }
@@ -986,7 +1016,9 @@ impl Node {
     /// `Quiet` (caught up, owner live), or `Unreachable` (owner not a live member). `None` if
     /// this node doesn't host the topic.
     pub fn topic_status(&self, topic: &str) -> Option<io::Result<TopicStatus>> {
-        let mux_status = self.muxes.lock_safe().get(topic)?.status();
+        // Both guards are statement temporaries, so neither the map lock nor the mux lock is
+        // held while the closure below takes the registry and dissemination locks.
+        let mux_status = self.mux_of(topic)?.lock_safe().status();
         let status = mux_status.map(|s| {
             let members = s
                 .members
@@ -1038,10 +1070,13 @@ impl Node {
     /// their own channels; only the merge stops.
     pub fn deregister_topic(&self, topic: &str) -> io::Result<bool> {
         let mux = self.muxes.lock_safe().remove(topic);
-        let Some(mut mux) = mux else {
+        let Some(mux) = mux else {
             return Ok(false);
         };
-        mux.finish()?; // drain all members + terminal marker
+        // Removed from the map, but a concurrent poll may still hold a handle it sampled a moment
+        // ago. `finish` retires the engine itself, so that poll merges nothing past the terminal
+        // marker rather than racing us.
+        mux.lock_safe().finish()?; // drain all members + terminal marker
         drop(mux);
         self.topic_reap.lock_safe().remove(topic);
 
@@ -3126,6 +3161,97 @@ mod tests {
             (hosted.file_roll_size, hosted.keep_files),
             (1 << 21, 1),
             "re-hosted topic must advertise its retention to subscribers"
+        );
+    }
+
+    /// Merging one topic must not block anything else. Each mux has its own lock and the map lock
+    /// is taken only to clone a handle out, so pinning one mux — which is exactly what a long poll
+    /// does — leaves the map and every other topic usable.
+    ///
+    /// Pinning the lock directly is the deterministic way to assert this: no timing, no sleeps.
+    /// (Operations that legitimately touch *every* mux, `poll_muxes` and `attach_pending_members`,
+    /// will of course wait for the pinned one — that is per-topic serialisation working, not
+    /// head-of-line blocking.)
+    #[test]
+    fn a_busy_topic_blocks_neither_the_map_nor_its_neighbours() {
+        let node = Node::new(config(1, temp_dir("mux-lock")));
+        node.create_topic("agg.a", TopicOptions::default()).unwrap();
+        node.create_topic("agg.b", TopicOptions::default()).unwrap();
+        node.publish_to_topic("agg.b", "mem.b", ChannelOptions::default())
+            .unwrap();
+
+        // Pin agg.a as if it were mid-merge, for the whole block below.
+        let a = node.mux_of("agg.a").expect("agg.a is hosted here");
+        let busy = a.lock_safe();
+
+        // Reading another topic's status: used to queue behind agg.a's poll.
+        let status = node.topic_status("agg.b").expect("hosted").unwrap();
+        assert_eq!(status.members.len(), 1);
+        assert_eq!(node.topic_member_count("agg.b"), Some(1));
+        // Map mutations: creating and retiring topics.
+        node.create_topic("agg.c", TopicOptions::default()).unwrap();
+        assert!(node.deregister_topic("agg.b").unwrap());
+        // Attaching a member to another topic.
+        node.publish_to_topic("agg.c", "mem.c", ChannelOptions::default())
+            .unwrap();
+        assert_eq!(node.topic_member_count("agg.c"), Some(1));
+
+        drop(busy);
+    }
+
+    /// One topic's trouble must not abandon the sweep. Topics are independent logs; `poll_muxes`
+    /// used to propagate the first error with `?`, so one topic that could not merge stalled every
+    /// other topic on that node — a different set each round, since `HashMap` iteration order
+    /// varies. Here the problem topic's `mtu` cannot fit its member's records, so it rejects them
+    /// while its healthy neighbour must still merge in the same sweep.
+    #[test]
+    fn a_topic_that_cannot_merge_does_not_stall_the_others() {
+        let node = Node::new(config(1, temp_dir("mux-poll-isolation")));
+        // `agg.bad` cannot fit a 1 KiB member record: mtu is big enough for its own slot table
+        // (~50 B) and nothing else.
+        node.create_topic(
+            "agg.bad",
+            TopicOptions {
+                channel: ChannelOptions {
+                    mtu: 128,
+                    ..ChannelOptions::default()
+                },
+                ..TopicOptions::default()
+            },
+        )
+        .unwrap();
+        node.create_topic("agg.good", TopicOptions::default())
+            .unwrap();
+
+        for (topic, member, len) in [("agg.bad", "mem.bad", 1024), ("agg.good", "mem.good", 8)] {
+            let path = node
+                .publish_to_topic(topic, member, ChannelOptions::default())
+                .unwrap();
+            let mut w = WriterBuilder::new(&path)
+                .region_size(1 << 20)
+                .build()
+                .unwrap();
+            let payload = vec![0xEEu8; len];
+            let buf = w.try_reserve(payload.len()).unwrap();
+            buf.copy_from_slice(&payload);
+            w.commit(1, payload.len() as u32, 0).unwrap();
+        }
+
+        // The sweep visits both in unspecified order; the good topic must merge either way.
+        let _ = node.poll_muxes();
+        let good = node.topic_status("agg.good").expect("hosted").unwrap();
+        assert_eq!(
+            good.members[0].merged, 1,
+            "the healthy topic merged its record despite a broken neighbour"
+        );
+        let bad = node.topic_status("agg.bad").expect("hosted").unwrap();
+        assert_eq!(
+            bad.members[0].rejected, 1,
+            "the oversized record is rejected and counted, not silently dropped"
+        );
+        assert_eq!(
+            bad.topic_head, 1,
+            "and nothing but its slot table reached the broken topic's log"
         );
     }
 

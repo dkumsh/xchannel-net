@@ -85,8 +85,9 @@ every hole in the LWW map in production.
 >   topics (no member ever ⇒ no slot table) aren't re-hosted (a reconnecting client re-creates
 >   them); a reconstructed member's `member_of` reconciles via peers on a mesh; remote members
 >   resume from their on-disk replica and refresh when their owner is reachable again.
-> - Mux poll holds the `muxes` lock across IO; reserved `msg_type` range is fixed (not
->   per-`TopicOptions`); `deregister_topic`/`topic_status` are Node APIs (no client RPC yet).
+> - Reserved `msg_type` range is fixed (not per-`TopicOptions`); `deregister_topic`/`topic_status`
+>   are Node APIs (no client RPC yet). (The mux poll no longer holds a shared lock across IO —
+>   each mux is locked individually, §4.3.)
 > - The §9 open questions remain open **by design**.
 >
 > Not independently re-verified beyond the test suite. See the `xchannel-net-dev` skill's
@@ -220,7 +221,10 @@ decision deferred to implementation (open question §9):
   member's `user_meta`; costs 18 B/record.
 
 Option (b) is the default recommendation: topics are a convenience layer, and silently
-consuming the application's `user_meta` is a trap. `msg_type` is passed through
+consuming the application's `user_meta` is a trap. Its one cost is that the 18-byte prefix can
+push a member record that fitted its own channel over the *topic's* `mtu`; such a record is
+rejected and counted like a reserved-`msg_type` violation (§4.3), leaving a visible hole in the
+member's index sequence rather than wedging the topic. `msg_type` is passed through
 unchanged; mux-originated control records (slot table, gap marker, terminal marker) use
 a reserved `msg_type` range declared in `TopicOptions`.
 
@@ -254,6 +258,15 @@ so a producing member never waits on a clock. Same shape as xchannel's own
 `Reader::wait_for_message` backoff and as Aeron's `IdleStrategy`. Measured median merge latency is
 ~1 µs; the ceiling (default 5 ms) only bounds how long a *quiet* topic takes to notice its first
 new record, and costs no more idle CPU than a fixed tick did.
+
+**Topics are isolated from each other.** Each mux carries its own lock; the map of hosted topics
+is locked only long enough to clone a handle out, never across a merge. A merge is the one thing
+the daemon does that is unbounded while holding a lock, so sharing one would make every topic's
+poll a head-of-line block on every other topic — and on `create_topic`, `topic_status`, and the
+maintenance loop's attach pass. A poll that fails likewise does not abandon the sweep: the
+remaining topics still merge. Retirement is enforced by the engine rather than by the caller's
+locking — `finish` marks the mux inert, so a poll still holding a handle sampled just before
+`deregister_topic` cannot commit past the terminal marker.
 
 Backpressure posture is inherited and honest: the mux is a reader of its members
 (cannot slow them — no-custody holds) and the single writer of the topic (cannot be

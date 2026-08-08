@@ -425,6 +425,14 @@ pub struct Mux {
     /// a restart can reach ~2× `file_roll_size`. Bounded, and the alternative needs a byte-offset
     /// accessor xchannel does not expose.
     bytes_in_segment: u64,
+    /// Set once [`finish`](Self::finish) has written the terminal marker. A retired mux is
+    /// **inert** — it merges nothing more and accepts no members.
+    ///
+    /// This is what makes "nothing is committed after the terminal marker" an invariant of the mux
+    /// rather than of whoever happens to be holding it. It matters as soon as a mux can be shared:
+    /// a poll loop that sampled the topic set just before retirement still holds a handle, and
+    /// without this would merge records *past* the marker that says the topic ended.
+    finished: bool,
 }
 
 /// Per-member merge status (§8): how far the mux has merged vs the member's head.
@@ -496,6 +504,7 @@ impl Mux {
             slot_table_version: 0,
             since_slot_table: 0,
             bytes_in_segment: 0,
+            finished: false,
         })
     }
 
@@ -551,6 +560,12 @@ impl Mux {
     /// was merged before, else from genesis — late discovery loses nothing (§4.1). Re-emits
     /// the slot table so a topic reader can decode the new member's provenance (§6.3).
     pub fn add_member(&mut self, name: &str, epoch: u64, member_path: &Path) -> io::Result<()> {
+        if self.finished {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mux is retired (terminal marker written) — cannot attach a member",
+            ));
+        }
         // Idempotent: attaching an already-attached (name, epoch) is a no-op, so the publish
         // path and the discovery loop can both call it safely.
         if self.has_member(name, epoch) {
@@ -623,6 +638,9 @@ impl Mux {
     /// bounded to `max_batch_per_member` records per member per call so one hot member cannot
     /// monopolize the interleave (§4.3). Returns the number of records merged this call.
     pub fn poll(&mut self) -> io::Result<usize> {
+        if self.finished {
+            return Ok(0); // retired: never commit past the terminal marker
+        }
         let max_batch = self.max_batch_per_member;
         let mut merged = 0;
         for i in 0..self.slots.len() {
@@ -638,8 +656,17 @@ impl Mux {
     }
 
     /// Merge the next ready record from slot `i` into the topic with provenance. Returns
-    /// whether a record was merged (`false` = the member is currently caught up). Skips (drops,
-    /// counting) any member record whose `msg_type` is in the reserved control range.
+    /// whether a record was merged (`false` = the member is currently caught up).
+    ///
+    /// Two outcomes other than "merged", and the difference between them matters:
+    ///
+    /// * **Rejected** — the record can *never* be merged into this topic, so it is dropped, the
+    ///   `rejected` counter bumps, the cursor advances past it, and the topic keeps moving. The
+    ///   loss is visible: provenance makes the missing `member_index` a hole a consumer can see.
+    ///   Stalling the whole topic forever on one unacceptable record would be worse.
+    /// * **Errored** — the commit failed for a reason that may not repeat (mapping, disk). The
+    ///   cursor is **not** advanced, so the topic's own log stays the truth about what it holds
+    ///   and a restart re-reads from the right place.
     ///
     /// A member's [`starts_segment`](crate::wire::RecordFrame::starts_segment) is deliberately
     /// ignored: it is advisory, and members' file boundaries carry no meaning for a topic whose
@@ -649,16 +676,15 @@ impl Mux {
             let Some(frame) = self.slots[i].source.try_next_frame()? else {
                 return Ok(false);
             };
-            self.slots[i].cursor = frame.index.0 + 1;
 
             // **Contract enforcement (never trust the member's `msg_type`).** A member data
             // record must use a `msg_type` below `RESERVED_MSG_TYPE_MIN`. Committing a member
             // frame whose type is in the reserved range verbatim would **forge a mux control
             // record** (e.g. a slot table) into the authoritative topic log — poisoning recovery
-            // and even rewriting the topic geometry on the next restart. Reject it: drop the
-            // record (leaving a visible member-index gap) and count it, rather than merge it.
+            // and even rewriting the topic geometry on the next restart. Reject it.
             if is_control(frame.msg_type) {
                 self.slots[i].rejected += 1;
+                self.slots[i].cursor = frame.index.0 + 1;
                 continue;
             }
 
@@ -668,10 +694,28 @@ impl Mux {
                 orig_user_meta: frame.user_meta,
             };
             let payload = frame_data(prov, &frame.payload);
+
+            // A record that does not fit the topic's `mtu` is the same kind of permanent contract
+            // violation as a reserved `msg_type` — the provenance prefix pushes a member record
+            // that only just fitted its *own* channel over the topic's limit. Checked here rather
+            // than left to `try_reserve`, because an error would be indistinguishable from a
+            // transient one: the loop would retry forever, or (worse) advance past a different
+            // record each round and quietly shred the member's stream.
+            if self.geometry.mtu > 0 && payload.len() as u64 > self.geometry.mtu as u64 {
+                self.slots[i].rejected += 1;
+                self.slots[i].cursor = frame.index.0 + 1;
+                continue;
+            }
+
             // Roll *before* the record, so the slot table that opens the new segment precedes any
             // data in it and every retained window therefore contains one.
             self.roll_if_full()?;
             self.commit_record(frame.msg_type, &payload)?;
+            // Only once the record is durably in the topic. Advancing before the commit would let
+            // a failed commit consume a record the topic does not hold — the cursor claiming
+            // progress that no reader can see, which is the shape of the conflation bug in
+            // `recover_cursors`, arrived at from the other direction.
+            self.slots[i].cursor = frame.index.0 + 1;
             // Secondary staleness bound, for a topic that never rolls — see SLOT_TABLE_REFRESH.
             self.since_slot_table += 1;
             if self.since_slot_table >= SLOT_TABLE_REFRESH {
@@ -706,6 +750,9 @@ impl Mux {
     /// marker), then commit a terminal marker. The mux holds no members afterwards; the caller
     /// drops it and deregisters the topic channel.
     pub fn finish(&mut self) -> io::Result<()> {
+        if self.finished {
+            return Ok(()); // idempotent — one terminal marker, not one per caller
+        }
         let members: Vec<(String, u64)> = self
             .slots
             .iter()
@@ -714,7 +761,9 @@ impl Mux {
         for (name, epoch) in members {
             self.remove_member(&name, epoch)?;
         }
-        self.commit_record(MSG_TYPE_TERMINAL, &[])
+        self.commit_record(MSG_TYPE_TERMINAL, &[])?;
+        self.finished = true;
+        Ok(())
     }
 
     /// Commit a [`MemberClosed`] control record.
@@ -1312,6 +1361,96 @@ mod tests {
         assert_eq!(data, 2, "finish drained both member records");
         assert_eq!(closed, 1, "member drained + closed");
         assert_eq!(terminal, 1, "a terminal marker was committed");
+    }
+
+    /// A member record too big for the topic's `mtu` is **rejected and counted**, and the member
+    /// keeps flowing afterwards — it must not wedge the topic, and it must not be *silently*
+    /// skipped either.
+    ///
+    /// The provenance prefix is what makes this reachable at all: a record that fitted its own
+    /// channel exactly can exceed the topic's limit by those 18 bytes. Leaving it to `try_reserve`
+    /// would surface as an ordinary commit error, indistinguishable from a transient one — and the
+    /// cursor used to advance *before* the commit, so each retry consumed a different record and
+    /// quietly shredded the member's stream.
+    #[test]
+    fn an_oversized_member_record_is_rejected_and_the_member_keeps_flowing() {
+        let dir = temp_dir("mtu-reject");
+        let (topic, m) = (dir.join("topic"), dir.join("m"));
+        let big = vec![0xAAu8; 512];
+        write_member(&m, &[(1, 0, b"small"), (1, 1, &big), (1, 2, b"after")]);
+
+        let geometry = TopicGeometry {
+            region_size: REGION_U32,
+            mtu: 256,
+            file_roll_size: 0,
+            keep_files: 0,
+        };
+        let mut mux = Mux::open(&topic, &geometry, 64).unwrap();
+        mux.add_member("m", 0, &m).unwrap();
+        assert_eq!(mux.poll().unwrap(), 2, "the two that fit are merged");
+
+        let status = mux.status().unwrap();
+        assert_eq!(
+            status.members[0].rejected, 1,
+            "the oversized one is counted"
+        );
+        assert_eq!(
+            status.members[0].merged, 3,
+            "and the member is not stuck on it"
+        );
+        drop(mux);
+
+        // The hole is visible in provenance: indices 0 and 2 present, 1 missing.
+        let (data, _) = read_topic(&topic);
+        let indices: Vec<u64> = data.iter().map(|(_, p, _)| p.member_index).collect();
+        assert_eq!(
+            indices,
+            vec![0, 2],
+            "a visible gap, not a silent truncation"
+        );
+    }
+
+    /// A retired mux is **inert**: nothing is ever committed after the terminal marker, however
+    /// long someone holds a handle to it.
+    ///
+    /// This is an invariant of the engine rather than of its caller on purpose. Once muxes are
+    /// individually locked, `deregister_topic` can remove one from the map while a poll loop is
+    /// still holding a handle it sampled moments earlier — and that poll would otherwise merge
+    /// records *past* the marker that says the topic ended. The coarse map lock used to prevent
+    /// that by accident; this makes it true by construction.
+    #[test]
+    fn a_retired_mux_merges_nothing_more() {
+        let dir = temp_dir("retired");
+        let (topic, m) = (dir.join("topic"), dir.join("m"));
+        write_member(&m, &[(1, 0, b"before")]);
+
+        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
+        mux.add_member("m", 0, &m).unwrap();
+        assert_eq!(mux.poll().unwrap(), 1);
+        mux.finish().unwrap();
+
+        // The producer keeps writing, and a stale handle keeps polling.
+        write_member(&m, &[(1, 1, b"after"), (1, 2, b"later")]);
+        assert_eq!(mux.poll().unwrap(), 0, "a retired mux merges nothing");
+        assert!(
+            mux.add_member("m2", 0, &m).is_err(),
+            "and accepts no new member"
+        );
+        mux.finish().unwrap(); // idempotent — must not write a second marker
+        drop(mux);
+
+        // Exactly one terminal marker, and nothing after it.
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        let (mut terminals, mut after_terminal) = (0, 0);
+        while let Some(msg) = r.try_read().unwrap() {
+            if msg.header().message_type == MSG_TYPE_TERMINAL {
+                terminals += 1;
+            } else if terminals > 0 {
+                after_terminal += 1;
+            }
+        }
+        assert_eq!(terminals, 1, "one terminal marker, not one per finish call");
+        assert_eq!(after_terminal, 0, "nothing committed past the marker");
     }
 
     #[test]

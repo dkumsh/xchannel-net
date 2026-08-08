@@ -280,6 +280,17 @@ table is emitted at the **head of every segment**, so one is always inside the r
 Proven by a cross-process daemon-restart test. Chose option (a) content-sniff over (b) an
 xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
 
+**Per-mux locking** (post-0.1.0 fix): `muxes` is `HashMap<String, Arc<Mutex<Mux>>>`; the map lock
+is held only to clone a handle, **never across mux IO**. **Lock order: map → mux, never the
+reverse** — go through `mux_of`/`mux_handles` and it holds by construction. `poll_muxes` also no
+longer aborts the sweep on the first error (`?`), which used to let one topic stall all the others.
+Two correctness fixes came with it, both of which the coarse lock had been masking: `Mux::finish`
+marks the engine **inert** (a poll holding a handle sampled just before `deregister_topic` can no
+longer commit past the terminal marker), and `merge_one` advances the cursor **after** the commit,
+not before (a failed commit used to consume a record the topic never held). An over-`mtu` member
+record — reachable because the 18-byte provenance prefix can push a record over the topic's limit —
+is now rejected and counted rather than erroring forever.
+
 **Mux merge latency** (post-0.1.0 fix): `run_mux` takes a `MuxIdle` strategy instead of a fixed
 interval. It used to `sleep(5ms)` after *every* poll, so merge latency was 0–5 ms for a hot
 producer; it now backs off **only when a poll merged nothing** (spin → yield → park doubling
@@ -346,7 +357,7 @@ now configures peering. Test gaps closed: 2-member restart + **2-node remote mer
 process tests. Added Socrates' ordering-contract paragraph (TOPICS §4.3: topic order is arrival-
 order only — no causal/reproducible/cross-producer meaning; use per-member provenance).
 Follow-up (perf, not correctness): reconstruct double-scans each topic.
-- Mux poll holds the `muxes` lock during IO (§4.3 promotion path is the eventual remedy).
+- (Fixed post-0.1.0: the mux poll no longer holds a shared lock during IO — per-mux locks.)
 - Reserved control `msg_type` range is fixed (not per-`TopicOptions` as §4.2 muses).
 - §9 open questions remain open **by design**: hierarchical topics (gated on registry cycle
   detection), per-topic promotion trigger (default: operator-configured), standalone-mux

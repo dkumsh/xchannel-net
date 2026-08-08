@@ -7,6 +7,27 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 ## Unreleased
 
 ### Fixed
+- **Topics no longer share one lock across their merges.** `poll_muxes` held the map lock for the
+  whole sweep, and a merge is the one thing the daemon does that is unbounded while holding a lock
+  — so every topic's poll was a head-of-line block on every other topic, and on `create_topic`,
+  `topic_status` and the maintenance loop's attach pass. The hotter the poll loop, the worse it
+  got, and the loop is now as hot as records arriving. Each mux carries its own lock; the map lock
+  is taken only to clone a handle out. **Lock order is map → mux, never the reverse.** `poll_muxes`
+  also no longer abandons the sweep on the first error, which used to let one unmergeable topic
+  stall all the others — a different set each round, since `HashMap` order varies.
+- **Nothing is committed after a topic's terminal marker.** `Mux::finish` now marks the engine
+  inert, so a poll still holding a handle sampled just before `deregister_topic` merges nothing
+  more, and a second `finish` does not write a second marker. The coarse map lock had been
+  preventing this by accident; per-mux locking would have exposed it.
+- **A failed commit no longer consumes the record it failed on.** `merge_one` advanced the member
+  cursor *before* committing, so a commit error left the cursor claiming progress the topic's log
+  did not have — the shape of the `recover_cursors` conflation bug, reached from the other
+  direction. The cursor now advances only once the record is durable.
+- **A member record too large for its topic is rejected, not retried forever.** The 18-byte
+  provenance prefix can push a record that fitted its own channel over the *topic's* `mtu`. That is
+  a permanent contract violation, so it is now dropped and counted like a reserved-`msg_type`
+  record — leaving a visible hole in the member's index sequence — rather than surfacing as a
+  commit error indistinguishable from a transient one.
 - **Merge latency no longer waits on a poll tick.** `run_mux` slept a flat 5 ms after *every* poll,
   including ones that merged, so a producer on a hot stream paid the full tick on each record
   before it was even written to the topic — broker-class latency on the one path built for
