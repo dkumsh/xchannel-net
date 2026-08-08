@@ -4,6 +4,78 @@ All notable changes to xchannel-net are documented here. Versioning is pre-1.0 a
 experimental: the wire protocol and on-disk layout may change without notice (see
 `SECURITY.md`).
 
+## Unreleased
+
+### Fixed
+- **Every tombstone this node produces now reaches its own discovery log.** Retiring a topic
+  (`deregister_topic`) and reaping a member whose owner had died both announced to peers but
+  skipped the local publish, so a client watching discovery **on that node** never saw the
+  `Removed` and kept a phantom source indefinitely. The asymmetry made it hard to spot: a peer
+  republishes whatever it merges, so every *other* daemon reported the removal correctly. The two
+  halves — publish locally, announce to peers — are now one operation (`disseminate_tombstone`)
+  rather than two calls to remember at each site. Registration keeps its separate path on purpose:
+  there, `Registry::merge_tracked` decides whether anything changed and publishing follows that
+  verdict, whereas a locally-produced tombstone is a change by construction.
+- **A topic channel now honours its own rolling and retention.** `TopicOptions.channel` carries
+  `file_roll_size`/`keep_files`, but only `region_size`/`mtu` reached the mux's writer — and those
+  two are the only ones xchannel keeps in the channel header. `create_topic` precreated the file
+  with the full options and immediately dropped that writer; the mux's writer, the one that
+  actually writes every merged record, was built from geometry alone. So a topic **never rolled and
+  never pruned**, growing as one unbounded file however it was configured, while its
+  `SubscribeAck` advertised bounds the origin wasn't applying. The four fields now travel together
+  as `mux::TopicGeometry` — into the writer on every open (not just at creation), into the slot
+  table, and back out on re-host.
+- **A topic's disk bounds survive a restart.** They ride the slot table alongside the geometry, so
+  a re-hosted topic keeps rolling and pruning and re-advertises the bounds to subscribers. Without
+  this the bug returned one restart later, since a `Writer`'s rolling policy is not in the header.
+- **A quiet member's merge cursor survives the topic's own retention.** Slot entries now carry the
+  cursor, so a member whose data records have aged out of the *topic* is not mistaken for a fresh
+  member and re-merged from its own genesis. Enabling retention on topics without this would have
+  traded an unbounded-disk bug for a duplication one. Recovery treats a table's cursors as
+  authoritative at that scan position (an overwrite, not a max) because a cursor can legally move
+  backwards there — `MemberRegressed` resets a member that restarted onto a shorter log.
+- **A slot table is now emitted at the head of every segment**, making "a recent slot table is
+  always retained" (§6.3, and the restart content-sniff) true by construction. The previous
+  guarantee was a record-counted refresh (`SLOT_TABLE_REFRESH`) held against a byte-counted
+  retention window — units that do not compose, so a window narrower than the refresh interval
+  could retain no table at all. Since xchannel's `Writer` cannot report a roll it performed
+  internally, the mux now **drives its own rolling** (`file_roll_size` is no longer handed to the
+  writer) and emits the table before the first record of each new segment. `keep_files` remains the
+  writer's job. The byte counter resets on reopen, so the first segment after a restart can reach
+  ~2× `file_roll_size`.
+- **A restarted daemon no longer serves before it has rebuilt from disk.**
+  `reconstruct_from_disk` ran *after* the client and control planes began serving, so for a window
+  at startup the daemon answered from an empty registry: a client was told its channel did not
+  exist and would go create one already on disk, and a peer got an empty anti-entropy snapshot.
+  Reconstruction now runs after the listeners are **bound** but before anything accepts on them,
+  so an early client blocks until the daemon can answer properly while `connect_or_spawn`'s
+  single-instance arbitration (decided by the bind) still resolves immediately. Doing it before
+  `connect_seeds` also makes the first snapshot sent to a peer complete. Since this is now blocking
+  startup work on a scan that is O(retained records), `reconstruct_from_disk` returns a
+  `Reconstructed { topics, origins, skipped }` summary and the daemon logs it — `skipped` being the
+  only signal that a channel present on disk is not being served.
+
+### Docs
+- Corrected claims in `DESIGN.md`, `RESTART.md`, `TOPICS.md` and the dev skill that 0.1.0's work
+  had made false: restart-reconstruct, true `SubscribeAck.head`, lost-collision detection and the
+  client `Deregister` RPC were all still described as unbuilt; the `xchannel` dep was cited as
+  4.0.0 (it is 5.1.0); topics were described as living on a `topics` branch that has since been
+  rebased into `main` and deleted, and the skill's per-commit references pointed at that branch's
+  orphaned hashes. Two claims were narrowed rather than deleted, since only part of each had
+  landed: cross-node collision notification is still absent (only a *locally known* collision is
+  rejected), and crash resume is tested only for a quiesced writer, not a kill mid-commit.
+  Separately, `RESTART.md` and `Node::host_channel` still described a reconstructed origin's
+  replicas as "no rolling" — since roll mirroring they do roll (following the origin's
+  boundaries) and simply never prune.
+
+### Changed
+- **Slot-table wire format** gains a leading version byte, the topic's `file_roll_size`/`keep_files`,
+  and a per-entry `cursor`. A table of another version is **refused** rather than decoded at the
+  wrong offsets, since misreading one misattributes `member_ref → (name, epoch)` — the failure class
+  of the recovery-conflation bug. **On-disk format change**: a 0.1.0 topic log is not re-hosted on
+  upgrade (its tables no longer decode, so it reconstructs as a plain channel); pre-existing topic
+  data directories are not migrated.
+
 ## 0.1.0 (2026-08-07)
 
 **Topics — multi-producer fan-in** (`doc/TOPICS.md`): a set of single-writer member channels

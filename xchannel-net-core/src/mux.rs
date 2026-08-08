@@ -34,11 +34,15 @@ pub const PROVENANCE_LEN: usize = 2 + 8 + 8;
 pub const RESERVED_MSG_TYPE_MIN: u16 = 0xFFF0;
 
 /// The mux re-emits the slot table at least once per this many merged records, even without a
-/// membership change. This bounds how stale the retained slot table can get, so a rolled +
-/// pruned topic always keeps a recent one — needed both for a `LateJoin` consumer to decode
-/// provenance (§6.3) and for restart reconstruction to identify the topic + its members
-/// (`doc/RESTART.md`).
+/// membership change or a roll. A **secondary** bound on staleness, for the §6.3 promise that a
+/// `LateJoin` consumer can always decode provenance; the load-bearing guarantee is the
+/// per-segment one below.
 pub const SLOT_TABLE_REFRESH: u64 = 4096;
+
+/// Estimated per-record framing overhead in a segment (xchannel's `MessageHeader` is 16 bytes and
+/// records are 8-aligned). Used only to decide when to roll, so an inexact figure changes how
+/// closely a segment tracks `file_roll_size` — never correctness.
+const RECORD_OVERHEAD: u64 = 16;
 
 /// Slot-table record: `member_ref → (name, epoch)` for every current member (§6.3).
 pub const MSG_TYPE_SLOT_TABLE: u16 = 0xFFFF;
@@ -219,38 +223,93 @@ impl MemberClosed {
     }
 }
 
-/// One slot-table entry: which `(name, epoch)` a `member_ref` denotes. `epoch` is the
-/// member channel's registry generation — the incarnation, so a respawned producer (new
-/// epoch) is a distinct slot and never spliced onto the old one (TOPICS §3.2, decision:
-/// incarnation = epoch).
+/// The topic channel's own writer configuration: xchannel geometry **and** its disk bounds.
+///
+/// These four travel together everywhere — building the topic `Writer`, riding the slot table so
+/// the topic self-describes how to reopen it (`doc/RESTART.md`), and being advertised to
+/// subscribers so their replicas inherit the same bounds. Splitting them is what let
+/// `file_roll_size`/`keep_files` be dropped on the floor: they are *writer-instance* state in
+/// xchannel, not header fields, so a topic whose writer is rebuilt without them (every
+/// `Mux::open`, including the one right after `create_topic` precreated the file *with* them)
+/// silently never rolls and never prunes.
+// No `Default`: a zero `region_size` cannot open a writer, so a defaulted value would only ever
+// be a bug. Build one from `ChannelOptions` (which has a real default) or from a slot table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TopicGeometry {
+    pub region_size: u32,
+    /// Max payload; `0` = unlimited.
+    pub mtu: u32,
+    /// Roll to a new segment past this many bytes; `0` = roll only when asked.
+    pub file_roll_size: u64,
+    /// Retain at most this many segments; `0` = keep everything.
+    pub keep_files: u32,
+}
+
+impl From<&crate::wire::ChannelOptions> for TopicGeometry {
+    /// A topic channel is an ordinary channel, so the options a client asks for *are* its writer
+    /// configuration — all four fields, not just the two that live in the header.
+    fn from(o: &crate::wire::ChannelOptions) -> Self {
+        Self {
+            region_size: o.region_size,
+            mtu: o.mtu,
+            file_roll_size: o.file_roll_size,
+            keep_files: o.keep_files,
+        }
+    }
+}
+
+/// One slot-table entry: which `(name, epoch)` a `member_ref` denotes, and how far that member
+/// had been merged when the table was written. `epoch` is the member channel's registry
+/// generation — the incarnation, so a respawned producer (new epoch) is a distinct slot and never
+/// spliced onto the old one (TOPICS §3.2, decision: incarnation = epoch).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SlotEntry {
     pub member_ref: u16,
     pub name: String,
     pub epoch: u64,
+    /// The member's merge cursor — the next member index to merge, i.e. `Slot::cursor`. Carried
+    /// so recovery survives the topic's *own* retention: once a topic rolls and prunes (which it
+    /// does as soon as `keep_files` is set), a member that has been quiet long enough for all of
+    /// its data records to age out would otherwise resolve to "never seen" and be re-merged from
+    /// scratch. The periodic re-emit ([`SLOT_TABLE_REFRESH`]) guarantees a recent table is always
+    /// retained, so every member's cursor is too.
+    pub cursor: u64,
 }
 
-/// A decoded slot table: the topic channel's geometry (so restart reconstruction can reopen the
-/// topic writer without a persisted marker — `doc/RESTART.md`) plus its current members.
+/// A decoded slot table: the topic channel's writer configuration (so restart reconstruction can
+/// reopen it without a persisted marker — `doc/RESTART.md`) plus its current members and their
+/// merge cursors.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SlotTable {
-    pub region_size: u32,
-    pub mtu: u32,
+    pub geometry: TopicGeometry,
     pub members: Vec<SlotEntry>,
 }
 
-/// Encode a slot table as a control-record payload: `u32 region_size, u32 mtu, u16 count`, then
-/// per entry `u16 member_ref, u64 epoch, u16 name_len, name`. The geometry rides the slot table
-/// (which is periodically re-emitted, so a recent copy is always retained) so a topic
-/// self-describes how to reopen it.
-pub fn encode_slot_table(region_size: u32, mtu: u32, entries: &[SlotEntry]) -> Vec<u8> {
+/// Wire version of the slot-table payload. Bumped when the layout changes; a table written by a
+/// different version is **refused** rather than misread, because misreading one silently
+/// misattributes provenance — the failure class of the `member_ref` conflation bug.
+///
+/// Version 1 (0.1.0) had no version byte and began with `u32 region_size`, whose low byte is `0`
+/// for any page-multiple region size, so a v1 table cannot be mistaken for a v2 one.
+const SLOT_TABLE_VERSION: u8 = 2;
+
+/// Encode a slot table as a control-record payload:
+/// `u8 version, u32 region_size, u32 mtu, u64 file_roll_size, u32 keep_files, u16 count`, then
+/// per entry `u16 member_ref, u64 epoch, u64 cursor, u16 name_len, name`. The topic's writer
+/// configuration rides the table (which is periodically re-emitted, so a recent copy is always
+/// retained) so a topic self-describes how to reopen it.
+pub fn encode_slot_table(geometry: &TopicGeometry, entries: &[SlotEntry]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&region_size.to_le_bytes());
-    out.extend_from_slice(&mtu.to_le_bytes());
+    out.push(SLOT_TABLE_VERSION);
+    out.extend_from_slice(&geometry.region_size.to_le_bytes());
+    out.extend_from_slice(&geometry.mtu.to_le_bytes());
+    out.extend_from_slice(&geometry.file_roll_size.to_le_bytes());
+    out.extend_from_slice(&geometry.keep_files.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
     for e in entries {
         out.extend_from_slice(&e.member_ref.to_le_bytes());
         out.extend_from_slice(&e.epoch.to_le_bytes());
+        out.extend_from_slice(&e.cursor.to_le_bytes());
         let name = e.name.as_bytes();
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
@@ -258,7 +317,8 @@ pub fn encode_slot_table(region_size: u32, mtu: u32, entries: &[SlotEntry]) -> V
     out
 }
 
-/// Decode a slot-table control-record payload produced by [`encode_slot_table`].
+/// Decode a slot-table control-record payload produced by [`encode_slot_table`]. Refuses a
+/// payload written by a different [`SLOT_TABLE_VERSION`].
 pub fn decode_slot_table(mut b: &[u8]) -> io::Result<SlotTable> {
     fn take<'a>(b: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
         if b.len() < n {
@@ -271,13 +331,23 @@ pub fn decode_slot_table(mut b: &[u8]) -> io::Result<SlotTable> {
         *b = rest;
         Ok(head)
     }
+    let version = take(&mut b, 1)?[0];
+    if version != SLOT_TABLE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("slot table version {version} != supported {SLOT_TABLE_VERSION}"),
+        ));
+    }
     let region_size = u32::from_le_bytes(take(&mut b, 4)?.try_into().unwrap());
     let mtu = u32::from_le_bytes(take(&mut b, 4)?.try_into().unwrap());
+    let file_roll_size = u64::from_le_bytes(take(&mut b, 8)?.try_into().unwrap());
+    let keep_files = u32::from_le_bytes(take(&mut b, 4)?.try_into().unwrap());
     let count = u16::from_le_bytes(take(&mut b, 2)?.try_into().unwrap()) as usize;
     let mut members = Vec::with_capacity(count);
     for _ in 0..count {
         let member_ref = u16::from_le_bytes(take(&mut b, 2)?.try_into().unwrap());
         let epoch = u64::from_le_bytes(take(&mut b, 8)?.try_into().unwrap());
+        let cursor = u64::from_le_bytes(take(&mut b, 8)?.try_into().unwrap());
         let name_len = u16::from_le_bytes(take(&mut b, 2)?.try_into().unwrap()) as usize;
         let name = std::str::from_utf8(take(&mut b, name_len)?)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "slot name not UTF-8"))?
@@ -286,11 +356,16 @@ pub fn decode_slot_table(mut b: &[u8]) -> io::Result<SlotTable> {
             member_ref,
             name,
             epoch,
+            cursor,
         });
     }
     Ok(SlotTable {
-        region_size,
-        mtu,
+        geometry: TopicGeometry {
+            region_size,
+            mtu,
+            file_roll_size,
+            keep_files,
+        },
         members,
     })
 }
@@ -316,14 +391,14 @@ struct Slot {
 /// daemon's forwarding loop or inside a standalone host (§4.1). Local members only for now;
 /// a remote member is just a local replica of it, consumed identically (Phase 2).
 ///
-/// The mux persists nothing of its own: per-member cursors are recovered on restart by
-/// scanning the topic's own tail (§5), since every record self-describes its origin.
+/// The mux persists nothing of its own: per-member cursors are recovered on restart by scanning
+/// the topic's own tail (§5), since every record self-describes its origin — and, for a member
+/// whose records have aged out of the topic's retention, from the cursor its slot table carries.
 pub struct Mux {
     topic: Writer,
-    /// Topic channel geometry, embedded in every slot table so the topic self-describes how to
-    /// reopen it on restart (`doc/RESTART.md`).
-    region_size: u32,
-    mtu: u32,
+    /// The topic channel's writer configuration, embedded in every slot table so the topic
+    /// self-describes how to reopen it on restart (`doc/RESTART.md`).
+    geometry: TopicGeometry,
     slots: Vec<Slot>,
     next_ref: u16,
     max_batch_per_member: usize,
@@ -335,8 +410,21 @@ pub struct Mux {
     /// Count of slot-table emissions — bumps on every membership change (§8 slot-table version).
     slot_table_version: u64,
     /// Records merged since the last slot-table emission; drives the [`SLOT_TABLE_REFRESH`]
-    /// periodic re-emit so a recent slot table stays within the retained window.
+    /// secondary re-emit.
     since_slot_table: u64,
+    /// Approximate bytes committed into the current segment. The **mux drives its own rolling**
+    /// (rather than letting the writer's `file_roll_size` do it) for one reason: it must emit a
+    /// slot table at the *head of every segment*, and xchannel's `Writer` exposes no way to
+    /// observe a roll it performed internally. That placement is what makes "a slot table is
+    /// always inside the retained window" exact — retention prunes whole *segments*, so a table
+    /// at each segment head survives any `keep_files ≥ 1`. A record-counted refresh alone cannot
+    /// promise that: [`SLOT_TABLE_REFRESH`] counts records while retention counts bytes, so a
+    /// window narrower than the refresh interval can hold no table at all.
+    ///
+    /// Reset to 0 on reopen even though the segment may be partly full, so the first segment after
+    /// a restart can reach ~2× `file_roll_size`. Bounded, and the alternative needs a byte-offset
+    /// accessor xchannel does not expose.
+    bytes_in_segment: u64,
 }
 
 /// Per-member merge status (§8): how far the mux has merged vs the member's head.
@@ -366,14 +454,20 @@ pub struct MuxStatus {
 }
 
 impl Mux {
-    /// Open (or reopen) the mux for a topic channel at `path`. Recovers per-member cursors
-    /// from any existing topic content first, then opens the topic writer for append. A member
-    /// data record must use a `msg_type` below [`RESERVED_MSG_TYPE_MIN`] (the reserved range is
-    /// the mux's control records) — that is the member contract, not enforced here.
+    /// Open (or reopen) the mux for a topic channel at `path`, configured by `geometry`. Recovers
+    /// per-member cursors from any existing topic content first, then opens the topic writer for
+    /// append. A member data record must use a `msg_type` below [`RESERVED_MSG_TYPE_MIN`] (the
+    /// reserved range is the mux's control records) — that is the member contract, not enforced
+    /// here.
+    ///
+    /// `geometry.file_roll_size`/`keep_files` must be passed on **every** open, not just the
+    /// first: xchannel holds them on the `Writer`, not in the channel header, so a reopen that
+    /// omits them produces a topic that never rolls and never prunes however it was created. They
+    /// ride the slot table precisely so a restart can supply them again
+    /// ([`topic_config`]).
     pub fn open(
         path: &Path,
-        region_size: u32,
-        mtu: u32,
+        geometry: &TopicGeometry,
         max_batch_per_member: usize,
     ) -> io::Result<Self> {
         let recovered = match recover_cursors(path) {
@@ -381,14 +475,19 @@ impl Mux {
             Err(e) if e.kind() == io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e),
         };
-        let topic = WriterBuilder::new(path)
-            .region_size(region_size as usize)
-            .mtu(mtu as u64)
-            .build()?;
+        // `file_roll_size` is deliberately *not* handed to the writer: the mux rolls explicitly so
+        // it can put a slot table at each segment head (see `bytes_in_segment`). `keep_files` is
+        // the writer's job — retention sweeps on roll, whoever triggered it.
+        let mut builder = WriterBuilder::new(path)
+            .region_size(geometry.region_size as usize)
+            .mtu(geometry.mtu as u64);
+        if geometry.keep_files > 0 {
+            builder = builder.keep_files(geometry.keep_files as u64);
+        }
+        let topic = builder.build()?;
         Ok(Self {
             topic,
-            region_size,
-            mtu,
+            geometry: *geometry,
             slots: Vec::new(),
             next_ref: 0,
             max_batch_per_member: max_batch_per_member.max(1),
@@ -396,7 +495,32 @@ impl Mux {
             gaps_emitted: 0,
             slot_table_version: 0,
             since_slot_table: 0,
+            bytes_in_segment: 0,
         })
+    }
+
+    /// Commit one record into the topic and account its size against the current segment. The
+    /// single commit path, so nothing can write to the topic without being counted (which would
+    /// silently defeat rolling) — and so the reserve/copy/commit triple appears once.
+    fn commit_record(&mut self, msg_type: u16, payload: &[u8]) -> io::Result<()> {
+        let buf = self.topic.try_reserve(payload.len())?;
+        buf.copy_from_slice(payload);
+        self.topic.commit(msg_type, payload.len() as u32, 0)?;
+        self.bytes_in_segment += RECORD_OVERHEAD + payload.len().next_multiple_of(8) as u64;
+        Ok(())
+    }
+
+    /// Roll to a new segment if the current one has reached `file_roll_size`, and start the new
+    /// segment with a slot table. Called only before committing a *data* record, so a segment
+    /// always opens with a table and control records never trigger a roll on their own.
+    fn roll_if_full(&mut self) -> io::Result<()> {
+        if self.geometry.file_roll_size == 0 || self.bytes_in_segment < self.geometry.file_roll_size
+        {
+            return Ok(());
+        }
+        self.topic.roll_file()?;
+        self.bytes_in_segment = 0;
+        self.emit_slot_table()
     }
 
     /// Snapshot the mux's merge health (§8): per-member merged/head/lag, topic head, gaps
@@ -544,11 +668,11 @@ impl Mux {
                 orig_user_meta: frame.user_meta,
             };
             let payload = frame_data(prov, &frame.payload);
-            let buf = self.topic.try_reserve(payload.len())?;
-            buf.copy_from_slice(&payload);
-            self.topic.commit(frame.msg_type, payload.len() as u32, 0)?;
-            // Periodically refresh the slot table so a recent one is always retained (roll/prune
-            // safe) — see SLOT_TABLE_REFRESH.
+            // Roll *before* the record, so the slot table that opens the new segment precedes any
+            // data in it and every retained window therefore contains one.
+            self.roll_if_full()?;
+            self.commit_record(frame.msg_type, &payload)?;
+            // Secondary staleness bound, for a topic that never rolls — see SLOT_TABLE_REFRESH.
             self.since_slot_table += 1;
             if self.since_slot_table >= SLOT_TABLE_REFRESH {
                 self.emit_slot_table()?;
@@ -590,10 +714,7 @@ impl Mux {
         for (name, epoch) in members {
             self.remove_member(&name, epoch)?;
         }
-        let buf = self.topic.try_reserve(0)?;
-        debug_assert!(buf.is_empty());
-        self.topic.commit(MSG_TYPE_TERMINAL, 0, 0)?;
-        Ok(())
+        self.commit_record(MSG_TYPE_TERMINAL, &[])
     }
 
     /// Commit a [`MemberClosed`] control record.
@@ -603,11 +724,7 @@ impl Mux {
             final_index,
         }
         .to_payload();
-        let buf = self.topic.try_reserve(payload.len())?;
-        buf.copy_from_slice(&payload);
-        self.topic
-            .commit(MSG_TYPE_MEMBER_CLOSED, payload.len() as u32, 0)?;
-        Ok(())
+        self.commit_record(MSG_TYPE_MEMBER_CLOSED, &payload)
     }
 
     /// Whether a member with this `(name, epoch)` is already attached.
@@ -633,10 +750,7 @@ impl Mux {
             resumed_at,
         }
         .to_payload();
-        let buf = self.topic.try_reserve(payload.len())?;
-        buf.copy_from_slice(&payload);
-        self.topic
-            .commit(MSG_TYPE_TOPIC_GAP, payload.len() as u32, 0)?;
+        self.commit_record(MSG_TYPE_TOPIC_GAP, &payload)?;
         self.gaps_emitted += 1;
         Ok(())
     }
@@ -654,11 +768,7 @@ impl Mux {
             head,
         }
         .to_payload();
-        let buf = self.topic.try_reserve(payload.len())?;
-        buf.copy_from_slice(&payload);
-        self.topic
-            .commit(MSG_TYPE_MEMBER_REGRESSED, payload.len() as u32, 0)?;
-        Ok(())
+        self.commit_record(MSG_TYPE_MEMBER_REGRESSED, &payload)
     }
 
     /// Commit an updated slot table so a `LateJoin` topic reader can decode every member_ref.
@@ -670,13 +780,11 @@ impl Mux {
                 member_ref: s.member_ref,
                 name: s.name.clone(),
                 epoch: s.epoch,
+                cursor: s.cursor,
             })
             .collect();
-        let payload = encode_slot_table(self.region_size, self.mtu, &entries);
-        let buf = self.topic.try_reserve(payload.len())?;
-        buf.copy_from_slice(&payload);
-        self.topic
-            .commit(MSG_TYPE_SLOT_TABLE, payload.len() as u32, 0)?;
+        let payload = encode_slot_table(&self.geometry, &entries);
+        self.commit_record(MSG_TYPE_SLOT_TABLE, &payload)?;
         self.slot_table_version += 1;
         self.since_slot_table = 0;
         Ok(())
@@ -689,21 +797,24 @@ impl Mux {
 ///
 /// Phase 1 scans from genesis for simplicity; §5's bounded scan (stop at the last slot-table
 /// record once every current member is seen) is a later optimization.
-/// The information restart reconstruction needs to re-host a topic: its channel geometry and its
-/// last-known members. `topic_config` returns `Some` iff the channel at `path` is a topic (its
+/// The information restart reconstruction needs to re-host a topic: its writer configuration and
+/// its last-known members. `topic_config` returns `Some` iff the channel at `path` is a topic (its
 /// content carries a decodable `SlotTable` — the self-describing marker, no persisted flag).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TopicConfig {
-    pub region_size: u32,
-    pub mtu: u32,
+    /// Geometry **and disk bounds** — pass this straight back to [`Mux::open`], and advertise the
+    /// bounds to subscribers, so a re-hosted topic rolls and prunes exactly as it did before the
+    /// restart.
+    pub geometry: TopicGeometry,
     /// `(name, epoch)` of every member in the most recent slot table (may be empty).
     pub members: Vec<(String, u64)>,
 }
 
-/// Identify whether the channel at `path` is a **topic** and, if so, return its geometry + last
-/// membership (`doc/RESTART.md`, option (a) content-sniff). `Some` iff the channel carries a
-/// decodable `SlotTable` record; `None` for an ordinary channel or a topic that never had a
-/// member (no slot table). Used by restart reconstruction to re-host topics and re-attach members.
+/// Identify whether the channel at `path` is a **topic** and, if so, return its writer
+/// configuration + last membership (`doc/RESTART.md`, option (a) content-sniff). `Some` iff the
+/// channel carries a decodable `SlotTable` record; `None` for an ordinary channel, a topic that
+/// never had a member (no slot table), or a topic whose tables are all of an unsupported
+/// [`SLOT_TABLE_VERSION`]. Used by restart reconstruction to re-host topics and re-attach members.
 pub fn topic_config(path: &Path) -> io::Result<Option<TopicConfig>> {
     let mut reader = ReaderBuilder::new(path).late_join().build()?;
     let mut cfg: Option<TopicConfig> = None;
@@ -712,8 +823,7 @@ pub fn topic_config(path: &Path) -> io::Result<Option<TopicConfig>> {
             && let Ok(table) = decode_slot_table(m.payload())
         {
             cfg = Some(TopicConfig {
-                region_size: table.region_size,
-                mtu: table.mtu,
+                geometry: table.geometry,
                 members: table
                     .members
                     .into_iter()
@@ -725,16 +835,23 @@ pub fn topic_config(path: &Path) -> io::Result<Option<TopicConfig>> {
     Ok(cfg)
 }
 
-/// **Invariant: this scan MUST start at genesis (the earliest retained record) and see every
-/// record.** Recovery attributes a member's max index by resolving its ref through the slot
-/// table *in force at each record*, so it must observe both a member's data records and the
-/// slot table that maps its ref. §5.2 sketches a bounded scan ("stop at the last slot-table
-/// record once every current member is seen") — but a naive mid-log start is the **dual of the
-/// member_ref conflation bug**: a live-but-quiet member whose records sit before the start point
-/// resolves to `None` → treated as fresh → `want = 0` → its retained records are **silently
-/// re-merged (duplication)**. Any future bounding must prove it still recovers a quiet member
-/// whose records precede the bound; `recovery_quiet_member_far_behind_tail_is_not_duplicated`
-/// guards this.
+/// **Invariant: this scan MUST see every retained record, in order, from the start of the retained
+/// window.** Recovery attributes a member's max index by resolving its ref through the slot table
+/// *in force at each record*, so it must observe both a member's data records and the slot table
+/// that maps its ref. A naive mid-log start is the **dual of the member_ref conflation bug**: a
+/// live-but-quiet member whose records sit before the start point would resolve to `None` →
+/// treated as fresh → `want = 0` → its retained records **silently re-merged (duplication)**.
+/// `recovery_quiet_member_far_behind_tail_is_not_duplicated` guards this.
+///
+/// The window is the *retained* one, not true genesis — a topic with `keep_files` set prunes its
+/// own tail, which is why every slot table carries each member's [`cursor`](SlotEntry::cursor).
+/// A member's cursor therefore survives its data records aging out, and the periodic re-emit
+/// ([`SLOT_TABLE_REFRESH`]) is what guarantees a table is always inside the window.
+/// `a_quiet_members_cursor_survives_the_topics_own_retention` guards this.
+///
+/// This is also what a future bounded scan (§5.2) can key on: starting at the last retained slot
+/// table is sound *because* that table names every member and its cursor — but the bound must
+/// still be proven against both guard tests above.
 fn recover_cursors(path: &Path) -> io::Result<HashMap<(String, u64), u64>> {
     let mut reader = ReaderBuilder::new(path).late_join().build()?;
     // The ref → (name, epoch) mapping *in force at the current scan position*. `member_ref` is
@@ -748,11 +865,25 @@ fn recover_cursors(path: &Path) -> io::Result<HashMap<(String, u64), u64>> {
     while let Some(m) = reader.try_read()? {
         let mt = m.header().message_type;
         if mt == MSG_TYPE_SLOT_TABLE {
-            active = decode_slot_table(m.payload())?
+            let table = decode_slot_table(m.payload())?;
+            active = table
                 .members
-                .into_iter()
-                .map(|e| (e.member_ref, (e.name, e.epoch)))
+                .iter()
+                .map(|e| (e.member_ref, (e.name.clone(), e.epoch)))
                 .collect();
+            // A table's cursors **overwrite** what the scan has accumulated, rather than being
+            // maxed into it: they are authoritative as of this position, and a cursor can legally
+            // move *backwards* here — `MemberRegressed` resets a member that restarted onto a
+            // shorter log under the same `(name, epoch)`. Taking a max would resurrect the stale
+            // higher cursor and skip the new log's records, which is the very bug this function
+            // was rewritten to fix. `cursor == 0` means nothing merged yet, which is "absent".
+            for e in &table.members {
+                let key = (e.name.clone(), e.epoch);
+                match e.cursor.checked_sub(1) {
+                    Some(highest_merged) => out.insert(key, highest_merged),
+                    None => out.remove(&key),
+                };
+            }
         } else if !is_control(mt) {
             let (prov, _) = Provenance::split(m.payload())?;
             if let Some(member) = active.get(&prov.member_ref) {
@@ -810,18 +941,47 @@ mod tests {
                 member_ref: 0,
                 name: "md.aapl".to_string(),
                 epoch: 0,
+                cursor: 0,
             },
             SlotEntry {
                 member_ref: 1,
                 name: "md.msft".to_string(),
                 epoch: 3,
+                cursor: 4_000_000_000,
             },
         ];
-        let encoded = encode_slot_table(1 << 20, 7, &entries);
+        // Disk bounds ride the table alongside the geometry: without them a restart reopens the
+        // topic writer with no rolling and no retention, whatever it was created with.
+        let geometry = TopicGeometry {
+            region_size: 1 << 20,
+            mtu: 7,
+            file_roll_size: 64 << 20,
+            keep_files: 3,
+        };
+        let encoded = encode_slot_table(&geometry, &entries);
         let table = decode_slot_table(&encoded).unwrap();
-        assert_eq!(table.region_size, 1 << 20);
-        assert_eq!(table.mtu, 7);
+        assert_eq!(table.geometry, geometry);
         assert_eq!(table.members, entries);
+    }
+
+    /// A slot table from a different wire version is **refused**, not misread: silently decoding
+    /// one at the wrong offsets misattributes `member_ref → (name, epoch)`, which is the failure
+    /// class of the conflation bug below. 0.1.0's table had no version byte and began with
+    /// `u32 region_size`, whose low byte is 0 for any page-multiple region.
+    #[test]
+    fn a_slot_table_of_another_version_is_refused() {
+        let mut encoded = encode_slot_table(&geom(REGION_U32, 0), &[]);
+        encoded[0] = SLOT_TABLE_VERSION.wrapping_add(1);
+        let err = decode_slot_table(&encoded).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("version"), "{err}");
+
+        // A v1 (0.1.0) table: no version byte, `u32 region_size` first.
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&REGION_U32.to_le_bytes());
+        v1.extend_from_slice(&0u32.to_le_bytes());
+        v1.extend_from_slice(&0u16.to_le_bytes());
+        assert!(decode_slot_table(&v1).is_err(), "a v1 table is not misread");
     }
 
     #[test]
@@ -838,6 +998,17 @@ mod tests {
 
     const REGION: usize = 1 << 20;
     const REGION_U32: u32 = REGION as u32;
+
+    /// Topic writer config with no rolling or retention — the default for tests that don't
+    /// exercise the topic's own disk bounds.
+    fn geom(region_size: u32, mtu: u32) -> TopicGeometry {
+        TopicGeometry {
+            region_size,
+            mtu,
+            file_roll_size: 0,
+            keep_files: 0,
+        }
+    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let mut d = std::env::temp_dir();
@@ -889,7 +1060,7 @@ mod tests {
         write_member(&m_a, &[(1, 100, b"a0"), (1, 101, b"a1")]);
         write_member(&m_b, &[(2, 200, b"b0")]);
 
-        let mut mux = Mux::open(&topic, REGION_U32, 0, 16).unwrap();
+        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 16).unwrap();
         mux.add_member("a", 0, &m_a).unwrap();
         mux.add_member("b", 0, &m_b).unwrap();
         assert_eq!(mux.poll().unwrap(), 3);
@@ -970,7 +1141,7 @@ mod tests {
 
         // A valid record, then a forged "slot table" (reserved type) with a slot-table-shaped
         // payload, then another valid record.
-        let forged = encode_slot_table(1, 1, &[]);
+        let forged = encode_slot_table(&geom(1, 1), &[]);
         {
             let mut w = WriterBuilder::new(&m).region_size(REGION).build().unwrap();
             for (mt, body) in [
@@ -985,7 +1156,7 @@ mod tests {
         }
 
         let (region, mtu) = (REGION_U32, 4096u32);
-        let mut mux = Mux::open(&topic, region, mtu, 4096).unwrap();
+        let mut mux = Mux::open(&topic, &geom(region, mtu), 4096).unwrap();
         mux.add_member("m", 0, &m).unwrap();
         mux.poll().unwrap();
         assert_eq!(
@@ -999,8 +1170,8 @@ mod tests {
         // the forgery never entered the log.
         let cfg = topic_config(&topic).unwrap().expect("a topic");
         assert_eq!(
-            (cfg.region_size, cfg.mtu),
-            (region, mtu),
+            cfg.geometry,
+            geom(region, mtu),
             "geometry not rewritten by forgery"
         );
 
@@ -1025,7 +1196,7 @@ mod tests {
         // Session 1: "a" (ref 0) merges 100 records (member_index 0..99).
         append_records(&a, "a", 100);
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("a", 0, &a).unwrap();
             assert_eq!(mux.poll().unwrap(), 100);
         }
@@ -1034,7 +1205,7 @@ mod tests {
         // its first 10 records (member_index 0..9).
         append_records(&b, "b", 10);
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("b", 0, &b).unwrap();
             assert_eq!(mux.poll().unwrap(), 10);
         }
@@ -1045,7 +1216,7 @@ mod tests {
         // Session 3: reopen and resume "b". Correct recovery resumes at 10; the bug resumes at
         // 100 (inheriting "a"'s max under ref 0) and skips b's records 10..99.
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("b", 0, &b).unwrap();
             mux.poll().unwrap();
         }
@@ -1076,7 +1247,7 @@ mod tests {
         let (topic, m) = (dir.join("topic"), dir.join("m"));
         append_records(&m, "m", 100); // indices 0..99
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("m", 0, &m).unwrap();
             assert_eq!(mux.poll().unwrap(), 100);
         }
@@ -1089,7 +1260,7 @@ mod tests {
         assert_eq!(head, 5);
 
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("m", 0, &m).unwrap();
             assert_eq!(
                 mux.members()[0].2,
@@ -1121,7 +1292,7 @@ mod tests {
         let (topic, m) = (dir.join("topic"), dir.join("m"));
         write_member(&m, &[(1, 0, b"m0"), (1, 1, b"m1")]);
 
-        let mut mux = Mux::open(&topic, REGION_U32, 0, 1).unwrap();
+        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 1).unwrap();
         mux.add_member("m", 0, &m).unwrap();
         assert_eq!(mux.poll().unwrap(), 1); // batch=1, one merged, one pending
         mux.finish().unwrap();
@@ -1149,7 +1320,7 @@ mod tests {
         let (topic, member) = (dir.join("topic"), dir.join("m"));
         write_member(&member, &[(1, 0, b"m0"), (1, 1, b"m1"), (1, 2, b"m2")]);
 
-        let mut mux = Mux::open(&topic, REGION_U32, 0, 1).unwrap();
+        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 1).unwrap();
         mux.add_member("m", 0, &member).unwrap();
         // Merge only one (bounded batch = 1), leaving records behind.
         assert_eq!(mux.poll().unwrap(), 1);
@@ -1187,7 +1358,7 @@ mod tests {
         // Member writes a few records; the mux merges them (cursor → 3).
         write_member_rolling(&member, 3, roll, keep);
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
             mux.add_member("m", 0, &member).unwrap();
             assert_eq!(mux.poll().unwrap(), 3);
             assert_eq!(mux.members()[0].2, 3);
@@ -1203,7 +1374,7 @@ mod tests {
         );
 
         // Reopen: the mux can't resume contiguously, so it records a TopicGap and skips ahead.
-        let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
         mux.add_member("m", 0, &member).unwrap();
         assert_eq!(
             mux.members()[0].2,
@@ -1238,7 +1409,7 @@ mod tests {
 
         // Session 1: both members merged.
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("a", 0, &a).unwrap();
             mux.add_member("b", 0, &b).unwrap();
             assert_eq!(mux.poll().unwrap(), 10);
@@ -1246,14 +1417,14 @@ mod tests {
         // "b" produces a long tail while "a" stays quiet.
         append_records(&b, "b", 2000);
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("a", 0, &a).unwrap();
             mux.add_member("b", 0, &b).unwrap();
             mux.poll().unwrap();
         }
         // Session 3: reopen. "a" (records far behind the tail) must resume at 5, not re-merge.
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 4096).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("a", 0, &a).unwrap();
             assert_eq!(
                 mux.members()[0].2,
@@ -1293,7 +1464,7 @@ mod tests {
             "genesis should have pruned (earliest={earliest})"
         );
 
-        let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap(); // fresh topic, no cursor
+        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap(); // fresh topic, no cursor
         mux.add_member("m", 0, &m).unwrap();
         assert_eq!(
             mux.members()[0].2,
@@ -1314,6 +1485,134 @@ mod tests {
         assert_eq!((gaps[0].from, gaps[0].resumed_at), (0, earliest));
     }
 
+    /// Rolling + retention on the **topic channel itself** must be applied on every `Mux::open`,
+    /// not just when the channel is created. xchannel keeps `file_roll_size`/`keep_files` on the
+    /// `Writer`, not in the header, so a reopen that omits them yields a topic that never rolls
+    /// and never prunes — one unbounded file per topic — however it was created. That is the shape
+    /// of the bug this test pins: `create_topic` precreates the file with the client's bounds and
+    /// then drops that writer, so the mux's writer is the only one that matters.
+    #[test]
+    fn a_reopened_topic_keeps_rolling_and_pruning() {
+        let dir = temp_dir("bounds");
+        let (topic, m) = (dir.join("topic"), dir.join("m"));
+        let bounded = TopicGeometry {
+            region_size: REGION_U32,
+            mtu: 0,
+            file_roll_size: (REGION as u64) * 2,
+            keep_files: 1,
+        };
+
+        // Session 1 creates the topic and merges enough to roll at least once.
+        write_member_rolling(&m, 3000, (REGION as u64) * 2, 0);
+        {
+            let mut mux = Mux::open(&topic, &bounded, 100_000).unwrap();
+            mux.add_member("m", 0, &m).unwrap();
+            assert_eq!(mux.poll().unwrap(), 3000);
+        }
+        // Session 2 *reopens* it and merges more. If the reopen dropped the bounds, everything
+        // below lands in one file that is never pruned.
+        write_member_rolling(&m, 3000, (REGION as u64) * 2, 0);
+        {
+            let mut mux = Mux::open(&topic, &bounded, 100_000).unwrap();
+            mux.add_member("m", 0, &m).unwrap();
+            assert_eq!(mux.poll().unwrap(), 3000);
+        }
+
+        let base = ReaderBuilder::new(&topic)
+            .late_join()
+            .build()
+            .unwrap()
+            .base_record_index();
+        assert!(
+            base > 0,
+            "topic must have rolled *and* pruned (earliest retained index is still 0)"
+        );
+        let segments = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("topic"))
+            .count();
+        assert!(
+            segments <= 2,
+            "keep_files(1) must bound the topic to ~1 rolled segment, found {segments}"
+        );
+    }
+
+    /// Once a topic prunes its own tail (which it does as soon as `keep_files` is set), a member
+    /// that has been **quiet** long enough for all of its data records to age out of the topic must
+    /// still have its cursor recovered — otherwise it looks like a brand-new member, resumes from
+    /// its own genesis, and its retained history is **re-merged into the topic (duplication)**.
+    ///
+    /// This is why every slot table carries each member's cursor: the periodic re-emit keeps a
+    /// table inside the retained window even when a member's records are long gone. Enabling
+    /// retention on topics without this would have traded an unbounded-disk bug for a duplication
+    /// bug. Companion to `recovery_quiet_member_far_behind_tail_is_not_duplicated`, which covers
+    /// the same member being far behind the tail but still *retained*.
+    #[test]
+    fn a_quiet_members_cursor_survives_the_topics_own_retention() {
+        let dir = temp_dir("quietprune");
+        let (topic, a, b) = (dir.join("topic"), dir.join("a"), dir.join("b"));
+        let bounded = TopicGeometry {
+            region_size: REGION_U32,
+            mtu: 0,
+            file_roll_size: (REGION as u64) * 2,
+            keep_files: 1,
+        };
+
+        // "a" writes 5 records and goes quiet forever; "b" then floods the topic.
+        append_records(&a, "a", 5);
+        write_member_rolling(&b, 12_000, (REGION as u64) * 2, 0);
+        {
+            let mut mux = Mux::open(&topic, &bounded, 1_000_000).unwrap();
+            mux.add_member("a", 0, &a).unwrap();
+            mux.add_member("b", 0, &b).unwrap();
+            assert_eq!(mux.poll().unwrap(), 5 + 12_000);
+        }
+
+        // Preconditions, asserted so a failure below explains itself: the topic pruned, none of
+        // "a"'s data records survive in the retained window, and a slot table naming "a" does.
+        let mut r = ReaderBuilder::new(&topic).late_join().build().unwrap();
+        assert!(r.base_record_index() > 0, "topic should have pruned");
+        let (mut a_records, mut a_in_table) = (0, None);
+        while let Some(msg) = r.try_read().unwrap() {
+            let mt = msg.header().message_type;
+            if mt == MSG_TYPE_SLOT_TABLE {
+                let table = decode_slot_table(msg.payload()).unwrap();
+                if let Some(e) = table.members.iter().find(|e| e.name == "a") {
+                    a_in_table = Some(e.cursor);
+                }
+            } else if !is_control(mt) {
+                let (_, body) = Provenance::split(msg.payload()).unwrap();
+                if body.starts_with(b"a") {
+                    a_records += 1;
+                }
+            }
+        }
+        assert_eq!(
+            a_records, 0,
+            "the quiet member's data records must have aged out for this test to mean anything"
+        );
+        assert_eq!(
+            a_in_table,
+            Some(5),
+            "a retained slot table must still carry the quiet member's cursor"
+        );
+
+        // Reopen: "a" must resume at 5 from that table, not re-merge its 5 records.
+        let mut mux = Mux::open(&topic, &bounded, 1_000_000).unwrap();
+        mux.add_member("a", 0, &a).unwrap();
+        assert_eq!(
+            mux.members()[0].2,
+            5,
+            "quiet member's cursor recovered from the slot table, not reset to 0"
+        );
+        assert_eq!(
+            mux.poll().unwrap(),
+            0,
+            "nothing to re-merge — the member is caught up"
+        );
+    }
+
     #[test]
     fn recovers_cursors_after_restart_without_duplication() {
         let dir = temp_dir("recover");
@@ -1321,7 +1620,7 @@ mod tests {
         write_member(&m_a, &[(1, 0, b"a0"), (1, 1, b"a1")]);
 
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 16).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 16).unwrap();
             mux.add_member("a", 0, &m_a).unwrap();
             assert_eq!(mux.poll().unwrap(), 2);
         }
@@ -1329,7 +1628,7 @@ mod tests {
         write_member(&m_a, &[(1, 2, b"a2")]);
 
         // Reopen: recovery must resume "a" at index 2, not re-merge 0,1.
-        let mut mux = Mux::open(&topic, REGION_U32, 0, 16).unwrap();
+        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 16).unwrap();
         mux.add_member("a", 0, &m_a).unwrap();
         assert_eq!(mux.members()[0].2, 2, "resumes at recovered cursor");
         assert_eq!(mux.poll().unwrap(), 1, "only the new record merges");
@@ -1380,7 +1679,7 @@ mod tests {
             ],
         );
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
             mux.add_member("a", 1, &a1).unwrap();
             assert_eq!(mux.poll().unwrap(), 5);
         }
@@ -1390,7 +1689,7 @@ mod tests {
         // from BOTH incarnations, and the latest slot table maps ref 0 → (a, epoch 2).
         write_member(&a2, &[(1, 0, b"e2-0"), (1, 1, b"e2-1")]);
         {
-            let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
             mux.add_member("a", 2, &a2).unwrap();
             assert_eq!(
                 mux.poll().unwrap(),
@@ -1420,7 +1719,7 @@ mod tests {
         // Boot 3: recover "a"@epoch2's cursor. It truly merged through index 1, so it must
         // resume at 2 and merge 2..=7. The bug: recovery maxes ref-0 across BOTH incarnations
         // (max = 4, from epoch1) and resumes epoch2 at 5, silently dropping indices 2,3,4.
-        let mut mux = Mux::open(&topic, REGION_U32, 0, 64).unwrap();
+        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
         mux.add_member("a", 2, &a2).unwrap();
         assert_eq!(
             mux.members()[0].2,

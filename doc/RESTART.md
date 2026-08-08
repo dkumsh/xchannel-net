@@ -35,6 +35,16 @@ layering clean: xchannel stays topic-agnostic; a topic is "just a channel"):
    channel finds no matching member files and stays inert.)
 3. **Re-host**: `Mux::open` (recovers per-member cursors from the tail) → register the topic
    channel in the registry + announce it → insert into the mux map.
+
+   **Ordering: all of this runs before any plane serves.** Until reconstruction returns the
+   registry is empty and no topic is hosted, so a client answered in that window is told its
+   channel does not exist — and goes off to create one that is already on disk — while a peer gets
+   an empty anti-entropy snapshot. Those are wrong answers, not slow ones. The listeners are
+   *bound* first and only then reconstructed against, so an early client blocks in `accept` until
+   the daemon can answer properly, and `connect_or_spawn`'s single-instance arbitration (which is
+   decided by the bind) still resolves immediately. Reconstructing before `connect_seeds` also
+   makes the first snapshot sent to a peer already complete, rather than relying on the eager
+   announce to catch it up.
 4. **Re-attach members** named in the topic's most recent slot table: a **local** member by its
    origin log (`data_dir/<name>/log`), a **remote** member by its on-disk replica
    (`data_dir/.replicas/<name>/log`), re-registering it with `member_of = topic` so the normal
@@ -50,18 +60,34 @@ upgrade path if the limitations below ever bite.
 
 §6.3 promises a `LateJoin` reader can always decode provenance because the mux re-emits the slot
 table on every membership change. But a topic with **stable membership** that rolls + prunes can
-prune *all* its slot tables — breaking both a late consumer's `ref → (name, epoch)` decode and
-this restart sniff. Fix: the mux **re-emits the slot table every `SLOT_TABLE_REFRESH` merged
-records**, bounding staleness so a recent slot table is always within the retained window (given
-`keep_files × file_roll_size` exceeds the refresh interval). Small control-record overhead;
-required to honor §6.3.
+prune *all* its slot tables — breaking a late consumer's `ref → (name, epoch)` decode, this restart
+sniff, and (since the table also carries per-member cursors) cursor recovery for a quiet member.
+
+A record-counted refresh cannot promise this on its own: `SLOT_TABLE_REFRESH` counts **records**
+while retention prunes **bytes**, so a window narrower than the refresh interval can hold no table
+at all. The guarantee is instead made structural — **the mux emits a slot table at the head of
+every segment**. Retention prunes whole segments, so any `keep_files ≥ 1` retains a table by
+construction, with no proviso relating two different units.
+
+That requires the mux to know when a roll happened, and xchannel's `Writer` exposes no way to
+observe one it performed internally (`Reader::file_sequence()` has no writer counterpart). So the
+mux **drives its own rolling**: `file_roll_size` is not handed to the writer at all; the mux tracks
+bytes committed into the current segment and calls `Writer::roll_file()` itself, then emits the
+table before the next data record. `keep_files` stays the writer's job — retention sweeps on roll,
+whoever triggered it. `SLOT_TABLE_REFRESH` remains as a secondary bound for a topic that never
+rolls. Accepted cost: the byte counter resets on reopen, so the first segment after a restart can
+reach ~2× `file_roll_size` (bounded; the alternative needs a write-position accessor xchannel does
+not have).
 
 ## Limitations (accepted)
 
 - **Empty topics** (created, no member ever attached ⇒ no slot table) are not identifiable and
   are not re-hosted; a reconnecting client re-creates them (the "clients reconnecting" leg).
-- **`TopicOptions`** (reap threshold, `max_batch_per_member`) are not persisted; re-host uses
-  defaults (reap reverts to *never* — safe; batch to default).
+- **`TopicOptions`** is only partly recoverable. The topic channel's own writer configuration —
+  `region_size`, `mtu`, **and `file_roll_size`/`keep_files`** — rides the slot table and is restored
+  (and re-advertised to subscribers, so their replicas stay bounded too). The mux *policy* fields
+  (`member_reap_after_ms`, `max_batch_per_member`) are not persisted; re-host uses defaults (reap
+  reverts to *never* — safe; batch to default).
 - **Remote members** resume from their on-disk replica and refresh once the owner is reachable
   again (membership rebuilt from heartbeats).
 - **General origin re-registration** for non-topic channels **is now implemented** too:
@@ -69,8 +95,13 @@ required to honor §6.3.
   header via `xchannel::Reader::region_size()` / `mtu()` (added in xchannel 4.2.0 — a generic,
   topic-agnostic accessor, *not* option (b)'s topic marker). `member_of` and rolling/retention
   are not persisted, so a re-registered member reconciles `member_of` via peer anti-entropy on a
-  mesh (a local topic re-attaches its members from its own slot table regardless), and replicas
-  of a reconstructed origin fall back to no rolling (same as in-process `host_channel`).
+  mesh (a local topic re-attaches its members from its own slot table regardless), and a
+  reconstructed origin advertises `(0, 0)` — same as in-process `host_channel`.
+  **What that now means for its replicas** has changed with roll mirroring: a replica still
+  *rolls*, because it follows the origin's boundaries via `RecordFrame::starts_segment` whatever
+  it was told, but with `keep_files = 0` it never *prunes*. So the exposure is unbounded replica
+  growth rather than one unbounded file — the same outcome, reached differently. A topic is
+  unaffected: its bounds ride the slot table and are re-advertised on re-host.
 - **Option (b)** (a topic marker in the header) was **considered and rejected**: its only real
   benefit is surviving *empty* topics (no data, no members — a reconnecting client re-creates
   them), which isn't worth pushing the topic concept into the substrate. Not planned.

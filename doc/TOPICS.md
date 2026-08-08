@@ -1,9 +1,9 @@
 # xchannel-net — Topics (multi-producer fan-in) — Design
 
-Status: **implemented on the `topics` branch** (with documented deviations — see the
-implementation-status note after §1). This document is the design; the §1 prerequisites it
-depended on have since landed. Section numbering here is local to this document;
-cross-references of the form `DESIGN.md §N` refer to the main design document.
+Status: **implemented on `main`** (with documented deviations — see the implementation-status note
+after §1; the `topics` branch it was built on has been rebased in and deleted). This document is
+the design; the §1 prerequisites it depended on have since landed. Section numbering here is local
+to this document; cross-references of the form `DESIGN.md §N` refer to the main design document.
 
 ---
 
@@ -54,7 +54,7 @@ become correctness bugs under topics. **These must land first:**
 Building topics before these exists is explicitly rejected: member churn will exercise
 every hole in the LWW map in production.
 
-> **Implementation status** (on the `topics` branch). All §1 prerequisites landed (tombstones as
+> **Implementation status.** All §1 prerequisites landed (tombstones as
 > an `(epoch, deleted)` generation; `RegisterRejected` at create time; liveness-gated resolution;
 > true `SubscribeAck.head`). **Incarnation is realized as that `epoch`**: `member_id = (name,
 > epoch)`, respawn reclaims at `epoch+1`, a crashed producer is bridged by the reaper (§6.1).
@@ -66,9 +66,10 @@ every hole in the LWW map in production.
 > clean-leave drain → `MemberClosed` (§6.1); topic retirement + terminal marker (§4.1);
 > `TopicOptions` + reaper (§6.1); status/observability (§8); and **restart = reconstruct** — a
 > restarted daemon re-hosts its topics from disk (content-sniff via the self-describing slot
-> table, which also carries the topic's geometry; `doc/RESTART.md`) and resumes merging without a
-> client re-issuing `create_topic` (cross-process restart test). Slot tables are re-emitted
-> periodically so a recent one is always retained (roll/prune safe; also honors §6.3).
+> table, which also carries the topic's **writer configuration** — geometry *and*
+> `file_roll_size`/`keep_files` — plus each member's merge cursor; `doc/RESTART.md`) and resumes
+> merging without a client re-issuing `create_topic` (cross-process restart test). A slot table is
+> emitted at the head of every segment, so one is always inside the retained window (§6.3).
 >
 > **Known deviations / not-yet (honest):**
 > - **Execution model (§4.1):** the mux runs on its **own thread** (`Node::run_mux`, a poll+sleep
@@ -314,6 +315,20 @@ Whenever membership changes (join, leave, gap-resume), the mux commits an update
 slot-table record so any `LateJoin` reader of the topic can decode provenance without
 external metadata. Self-describing files, per the project's restart-reconstruct
 doctrine.
+
+Membership change alone is not enough once the topic has retention of its own: a topic with
+**stable membership** would prune every table it ever wrote. So the mux also emits one at the
+**head of every segment** (it drives its own rolling to be able to; see `doc/RESTART.md`), which
+makes "a table is always inside the retained window" true by construction rather than by a
+proviso relating a record count to a byte bound.
+
+Each entry carries the member's **merge cursor** as well as its `(name, epoch)`. That is what
+makes §5's recovery survive the topic's own retention: a member quiet long enough for all its data
+records to age out would otherwise recover as "never seen", resume from its own genesis, and have
+its retained history re-merged — trading unbounded disk for duplication. Recovery therefore treats
+a table's cursors as *authoritative at that scan position* (an overwrite, not a max), since a
+cursor can legally move backwards there — `MemberRegressed` resets a member that restarted onto a
+shorter log.
 
 ---
 

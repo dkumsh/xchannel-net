@@ -171,6 +171,19 @@ pub struct MemberInfo {
     pub state: MemberState,
 }
 
+/// What [`Node::reconstruct_from_disk`] rebuilt from the data dir at startup.
+///
+/// `skipped` counts channels found on disk that could not be re-hosted — a channel whose name is
+/// already owned elsewhere, or whose files won't open. Worth surfacing rather than swallowing:
+/// reconstruction is best-effort per channel, so a non-zero count is the only sign that a channel
+/// present on disk is *not* being served.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Reconstructed {
+    pub topics: usize,
+    pub origins: usize,
+    pub skipped: usize,
+}
+
 /// Observability snapshot of a hosted topic (§8).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TopicStatus {
@@ -305,12 +318,31 @@ impl Node {
         let Some(tombstone) = tombstone else {
             return Ok(false);
         };
-        self.publish_change(&self.change_of(&tombstone));
-        self.dissemination
-            .lock_safe()
-            .announce(std::slice::from_ref(&tombstone))?;
+        self.disseminate_tombstone(&tombstone)?;
         self.retire_subscription(name);
         Ok(true)
+    }
+
+    /// Disseminate a tombstone this node just produced: publish it to the **local discovery log**
+    /// and announce it to **peers**. Both, always — which is why there is one function rather than
+    /// two calls at each site.
+    ///
+    /// The halves are easy to mistake for alternatives, and they are not. A peer that receives the
+    /// announcement merges it and republishes it into *its own* discovery log
+    /// ([`merge_and_publish`](Self::merge_and_publish)), so omitting the local publish leaves
+    /// watchers on **this** node — and only this node — holding a phantom entry for a channel the
+    /// whole network agrees is gone. That asymmetry makes the omission unusually hard to see: every
+    /// other daemon reports the removal correctly.
+    ///
+    /// Registration takes a different path on purpose: `Registry::merge_tracked` decides whether
+    /// anything actually changed, so [`claim_name`](Self::claim_name) publishes from that verdict
+    /// and [`announce_hosted`](Self::announce_hosted) only announces. A tombstone has no such
+    /// question — it was produced locally and is by construction a change.
+    fn disseminate_tombstone(&self, tombstone: &ChannelIdentity) -> io::Result<()> {
+        self.publish_change(&self.change_of(tombstone));
+        self.dissemination
+            .lock_safe()
+            .announce(std::slice::from_ref(tombstone))
     }
 
     /// Acquire a connection slot, or `None` if at [`MAX_CONNECTIONS`].
@@ -352,10 +384,13 @@ impl Node {
         // can't be read back to advertise in the `SubscribeAck`. We therefore announce
         // `(0, 0)` (no rolling / unlimited) — which matches the WriterBuilder default, so
         // for an unconfigured channel origin and replicas agree. But if the closure *does*
-        // set rolling/retention, the origin rolls-and-prunes while its replicas grow
-        // unbounded (safe direction: replicas never drop records, only over-retain).
-        // Clients that need replicas to inherit disk bounds should use the client RPC
-        // (`create_for_client` / `ChannelOptions`), which propagates both fields.
+        // set rolling/retention, the origin rolls-and-prunes while its replicas never prune.
+        // (They do still *roll*: a replica follows the origin's boundaries via
+        // `RecordFrame::starts_segment` regardless of what it was told. Only `keep_files`
+        // is lost, so the growth is unbounded segments rather than one unbounded file.)
+        // Safe direction — replicas never drop records, only over-retain. Clients that need
+        // replicas to inherit disk bounds should use the client RPC (`create_for_client` /
+        // `ChannelOptions`), which propagates both fields.
         self.announce_hosted(&identity, path, 0, 0)?;
         Ok(writer)
     }
@@ -466,11 +501,8 @@ impl Node {
         let Some(tombstone) = tombstone else {
             return Ok(false);
         };
-        self.publish_change(&self.change_of(&tombstone));
         self.hosted.lock_safe().remove(name);
-        self.dissemination
-            .lock_safe()
-            .announce(std::slice::from_ref(&tombstone))?;
+        self.disseminate_tombstone(&tombstone)?;
         // Delete the on-disk channel so a later restart's data-dir scan can't resurrect this
         // deregistered name (`reconstruct_from_disk` has no tombstone to consult on an isolated
         // restart — the registry is rebuilt from scratch). Deregistration is deliberate removal.
@@ -494,12 +526,11 @@ impl Node {
         } else {
             options.max_batch_per_member as usize
         };
-        let mux = Mux::open(
-            &path,
-            options.channel.region_size,
-            options.channel.mtu,
-            batch,
-        )?;
+        // The mux's writer must be given the **full** channel configuration, not just the header
+        // geometry: `create_for_client` precreated the file with the client's rolling/retention,
+        // but those live on the `Writer` xchannel drops there, so a mux opened with geometry alone
+        // would leave the topic growing as one unbounded file.
+        let mux = Mux::open(&path, &mux::TopicGeometry::from(&options.channel), batch)?;
         self.muxes.lock_safe().insert(name.to_string(), mux);
         if options.member_reap_after_ms != 0 {
             self.topic_reap.lock_safe().insert(
@@ -667,11 +698,9 @@ impl Node {
                 };
                 if dead_for >= reap_after {
                     self.member_dead_since.lock_safe().remove(&key);
-                    if let Some(tombstone) = self.registry.lock_safe().reap(&m.name) {
-                        let _ = self
-                            .dissemination
-                            .lock_safe()
-                            .announce(std::slice::from_ref(&tombstone));
+                    let tombstone = self.registry.lock_safe().reap(&m.name);
+                    if let Some(tombstone) = tombstone {
+                        let _ = self.disseminate_tombstone(&tombstone);
                     }
                 }
             }
@@ -724,9 +753,15 @@ impl Node {
     /// identified by content (a decodable slot table, via `mux::topic_config`) and its geometry +
     /// membership come from that self-describing slot table. Call once at startup. Best-effort:
     /// a channel that fails to re-host is skipped (a client re-issuing `create_topic` recovers it).
-    pub fn reconstruct_from_disk(&self) {
+    ///
+    /// **Call before any plane starts serving.** Until this returns, the registry is empty and the
+    /// mux map holds no topics, so a client or peer answered earlier would be told this node hosts
+    /// nothing — a wrong answer, not a slow one. Returns what it rebuilt so a caller can report it:
+    /// the scan is O(retained records) (`doc/RESTART.md`), so on a large data dir this is
+    /// noticeable startup latency that would otherwise look like a hang.
+    pub fn reconstruct_from_disk(&self) -> Reconstructed {
         let Ok(rd) = std::fs::read_dir(&self.config.data_dir) else {
-            return;
+            return Reconstructed::default();
         };
         // One subdirectory per channel, so the scan needs no heuristic: no guessing whether
         // `md.aapl.4` is a channel or a rolled segment, and a channel whose segment 0 has been
@@ -754,13 +789,23 @@ impl Node {
         // `member_of`, so the origin pass then skips those (already hosted) rather than
         // re-registering them with `member_of = None` — which would make the detach pass retire a
         // member that never left.
+        let mut out = Reconstructed::default();
         for (name, cfg) in &topics {
-            let _ = self.rehost_topic(name, cfg);
+            if self.rehost_topic(name, cfg).is_ok() {
+                out.topics += 1;
+            } else {
+                out.skipped += 1;
+            }
         }
         // Then re-register the remaining plain origins (skips anything already hosted).
         for name in &origins {
-            let _ = self.reregister_origin(name);
+            if self.reregister_origin(name).is_ok() {
+                out.origins += 1;
+            } else {
+                out.skipped += 1;
+            }
         }
+        out
     }
 
     /// Re-register a non-topic origin channel found on disk (helper for
@@ -794,9 +839,17 @@ impl Node {
             return Ok(());
         }
         let path = self.channel_path(name)?;
-        let identity = self.claim_name(name, cfg.region_size, cfg.mtu, None)?;
-        self.announce_hosted(&identity, path.clone(), 0, 0)?;
-        let mux = Mux::open(&path, cfg.region_size, cfg.mtu, MAX_BATCH_PER_MEMBER)?;
+        let identity = self.claim_name(name, cfg.geometry.region_size, cfg.geometry.mtu, None)?;
+        // A topic's disk bounds *are* recoverable (unlike a plain origin's): they ride the slot
+        // table. So re-host with them — both on the writer, so the topic keeps rolling and
+        // pruning, and in the announcement, so subscribers' replicas keep inheriting the bounds.
+        self.announce_hosted(
+            &identity,
+            path.clone(),
+            cfg.geometry.file_roll_size,
+            cfg.geometry.keep_files,
+        )?;
+        let mux = Mux::open(&path, &cfg.geometry, MAX_BATCH_PER_MEMBER)?;
         self.muxes.lock_safe().insert(name.to_string(), mux);
         for (member, epoch) in &cfg.members {
             // A member with a **local origin** is one we own: re-register it with `member_of`
@@ -917,9 +970,7 @@ impl Node {
             .deregister(topic, self.config.node_id)
         {
             self.hosted.lock_safe().remove(topic);
-            self.dissemination
-                .lock_safe()
-                .announce(std::slice::from_ref(&tombstone))?;
+            self.disseminate_tombstone(&tombstone)?;
         }
         // Delete the topic channel on disk so a later restart's data-dir scan can't re-host this
         // retired topic (the terminal marker above is best-effort for still-connected subscribers).
@@ -2086,6 +2137,69 @@ mod tests {
         assert!(topic.member_of.is_none());
     }
 
+    /// **Every** tombstone this node produces must reach its own discovery log, not just its
+    /// peers. Two paths used to announce to peers and skip the local publish — the topic-retirement
+    /// path (`deregister_topic`) and the member reaper — so a watcher on the reaping node kept a
+    /// phantom source indefinitely while every *other* daemon reported the removal correctly,
+    /// because a peer republishes what it merges. That asymmetry is what makes the omission worth
+    /// a test rather than a reading.
+    #[test]
+    fn every_locally_produced_tombstone_reaches_the_discovery_log() {
+        let node = Node::new(config(144, temp_dir("discovery-tombstones")));
+        node.create_topic(
+            "agg",
+            TopicOptions {
+                member_reap_after_ms: 1, // opt the reaper in with a tiny threshold
+                ..TopicOptions::default()
+            },
+        )
+        .unwrap();
+        // A member of "agg" owned by a node that is never a live member, so the reaper takes it.
+        node.registry.lock_safe().merge(ChannelIdentity {
+            name: "feed.x".to_string(),
+            owner: NodeId(99),
+            region_size: 1 << 20,
+            mtu: 0,
+            earliest_index: RecordIndex(0),
+            registered_at_nanos: 1,
+            epoch: 0,
+            member_of: Some("agg".to_string()),
+            deleted: false,
+        });
+        // A plain channel to retire by the already-covered owner path, so this test also pins that
+        // the shared helper did not break it.
+        drop(node.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap());
+
+        let (_, cursor) = node.list_channels("").unwrap();
+
+        // Reap first: retiring the topic drops its reap threshold, so the reaper would no longer
+        // consider its members.
+        node.reap_dead_members(); // records "dead since now"
+        std::thread::sleep(Duration::from_millis(3));
+        node.reap_dead_members(); // past the threshold — tombstones it
+        assert!(
+            node.registry.lock_safe().get("feed.x").is_none(),
+            "the reaper should have tombstoned the dead owner's member"
+        );
+        assert!(node.deregister("md.aapl").unwrap());
+        assert!(node.deregister_topic("agg").unwrap());
+
+        let removed: Vec<String> = drain_changes(&cursor)
+            .into_iter()
+            .filter_map(|c| match c {
+                ChannelChange::Removed { name, .. } => Some(name),
+                ChannelChange::Upserted(_) => None,
+            })
+            .collect();
+        for name in ["md.aapl", "agg", "feed.x"] {
+            assert!(
+                removed.contains(&name.to_string()),
+                "no Removed published for '{name}' — a watcher here keeps a phantom source \
+                 (published: {removed:?})"
+            );
+        }
+    }
+
     /// Anti-entropy re-merges a peer's entire registry on every reconnect. Publishing per
     /// *merge* rather than per *change* would make each reconnect a storm of no-ops.
     #[test]
@@ -2839,6 +2953,84 @@ mod tests {
         );
         // Not attached to any local mux (we don't host that topic).
         assert_eq!(node.topic_member_count("remote.topic"), None);
+    }
+
+    /// `TopicOptions.channel` configures the topic channel — **all** of it, not just the header
+    /// geometry. `file_roll_size`/`keep_files` live on the `Writer`, and the writer that matters is
+    /// the mux's (the one `create_for_client` precreated with is dropped immediately), so a mux
+    /// opened with geometry alone leaves the topic growing as a single unbounded file however the
+    /// client configured it. They must also survive a restart, which is why they ride the slot
+    /// table: a re-hosted topic that quietly stopped pruning is the same bug one restart later.
+    #[test]
+    fn a_topic_channel_honours_its_retention_and_keeps_it_across_a_restart() {
+        let dir = temp_dir("topic-retention");
+        let options = TopicOptions {
+            channel: ChannelOptions {
+                region_size: 1 << 20,
+                mtu: 0,
+                file_roll_size: 1 << 21,
+                keep_files: 1,
+            },
+            ..TopicOptions::default()
+        };
+        let node = Node::new(config(60, dir.clone()));
+        node.create_topic("agg", options).unwrap();
+        let member = node
+            .publish_to_topic("agg", "mem.a", ChannelOptions::default())
+            .unwrap();
+
+        // Enough traffic through the member to roll the topic past its retention window.
+        let write_member = |from: u64, n: u64| {
+            let mut w = WriterBuilder::new(&member)
+                .region_size(1 << 20)
+                .build()
+                .unwrap();
+            let payload = vec![0xABu8; 1024];
+            for i in from..from + n {
+                let buf = w.try_reserve(payload.len()).unwrap();
+                buf.copy_from_slice(&payload);
+                w.commit(1, payload.len() as u32, i).unwrap();
+            }
+        };
+        write_member(0, 4000);
+        // `max_batch_per_member` bounds each poll, so drain.
+        while node.poll_muxes().unwrap() > 0 {}
+
+        let topic_path = node.channel_path("agg").unwrap();
+        let base_before = xchannel::ReaderBuilder::new(&topic_path)
+            .late_join()
+            .build()
+            .unwrap()
+            .base_record_index();
+        assert!(
+            base_before > 0,
+            "the topic must roll and prune on the options it was created with"
+        );
+
+        // Restart: the re-hosted topic must recover those bounds from its slot table and keep
+        // pruning, rather than silently reverting to one unbounded file.
+        let restarted = Node::new(config(60, dir));
+        restarted.reconstruct_from_disk();
+        assert_eq!(restarted.topic_member_count("agg"), Some(1), "re-hosted");
+        write_member(4000, 4000);
+        while restarted.poll_muxes().unwrap() > 0 {}
+
+        let base_after = xchannel::ReaderBuilder::new(&topic_path)
+            .late_join()
+            .build()
+            .unwrap()
+            .base_record_index();
+        assert!(
+            base_after > base_before,
+            "a re-hosted topic must keep pruning (earliest retained index stuck at {base_before})"
+        );
+        // And the bounds are advertised again, so subscribers' replicas stay bounded too.
+        let hosted = restarted.hosted.lock_safe().get("agg").cloned().unwrap();
+        assert_eq!(
+            (hosted.file_roll_size, hosted.keep_files),
+            (1 << 21, 1),
+            "re-hosted topic must advertise its retention to subscribers"
+        );
     }
 
     #[test]

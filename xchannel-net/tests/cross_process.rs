@@ -158,6 +158,70 @@ fn client_replicates_through_a_spawned_daemon() {
     );
 }
 
+/// Reconstruction runs **before any plane serves**, so the *first* answer a restarted daemon gives
+/// already reflects what is on disk. `list_channels` is the sharp instrument for this: unlike
+/// `subscribe` it has no wait parameter and no retry, so this asserts the contract with zero
+/// tolerance — one RPC, and the rebuilt registry must already be in it. A client that got an empty
+/// listing here would conclude the channels are gone and go create them, which is a wrong answer
+/// rather than a slow one.
+///
+/// Honest about its reach: this pins the contract, it does not reliably *reproduce* the race it
+/// guards. With the old ordering (reconstruct after the serve threads spawn) a data dir this small
+/// is rebuilt long before a client can connect, so the window is real but vanishingly narrow here.
+/// It has teeth against a regression that makes reconstruction slow or moves it later still.
+#[test]
+fn a_restarted_daemon_serves_nothing_until_it_has_rebuilt_from_disk() {
+    let data_dir = temp_dir("reconstruct-before-serve");
+    let opts = ChannelOptions::default();
+
+    // Session 1: one plain origin and one topic with a member — the two reconstruction paths.
+    {
+        let (daemon1, client_path) = spawn_daemon(&data_dir);
+        let mut client = connect_with_retry(&client_path);
+        drop(client.create_channel("md.x", &opts).unwrap());
+        client
+            .create_topic("agg", &TopicOptions::default())
+            .unwrap();
+        let mut w = client.publish_to_topic("agg", "mem.a", &opts).unwrap();
+        let buf = w.try_reserve(2).unwrap();
+        buf.copy_from_slice(b"m0");
+        w.commit(1, 2, 0).unwrap();
+        // Let the mux merge, so the topic has a slot table to be content-sniffed by.
+        let mut reader = client
+            .subscribe("agg", SubscribeMode::LateJoin, Some(Duration::from_secs(5)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut merged = false;
+        while !merged && Instant::now() < deadline {
+            if let Some(m) = reader
+                .read_blocking(Some(Duration::from_millis(200)))
+                .unwrap()
+                && !is_control(m.header().message_type)
+            {
+                merged = true;
+            }
+        }
+        assert!(
+            merged,
+            "session 1 must merge, so a slot table exists on disk"
+        );
+        drop(daemon1);
+    }
+
+    // Session 2: the very first RPC — no polling, no deadline.
+    let (_daemon2, client_path) = spawn_daemon(&data_dir);
+    let mut client = connect_with_retry(&client_path);
+    let (channels, _) = client.list_channels("").unwrap();
+    let names: Vec<&str> = channels.iter().map(|c| c.name.as_str()).collect();
+    for expected in ["md.x", "agg", "mem.a"] {
+        assert!(
+            names.contains(&expected),
+            "'{expected}' missing from the first listing a restarted daemon served — it answered \
+             before finishing reconstruction (got {names:?})"
+        );
+    }
+}
+
 #[test]
 fn plain_channel_reregisters_after_daemon_restart() {
     let data_dir = temp_dir("reregister");

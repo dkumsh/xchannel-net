@@ -95,7 +95,7 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   │                         ChannelIdentity stays address-free, DESIGN §9)
 │   ├── dissemination.rs      Dissemination trait — the swappable broadcast/gossip seam
 │   ├── replication.rs        ReplicationSource (tail→frames) / ReplicationSink
-│   │                         (frames→replica) — implemented over xchannel 4.0.0; absolute
+│   │                         (frames→replica) — implemented over xchannel 5.1.0; absolute
 │   │                         RecordIndex via base_record_index + next_record_index()
 │   └── stream.rs             Stream-plane protocol over a Transport (generic): origin
 │   │                         accept_subscription→StreamServer; subscriber subscribe→
@@ -132,19 +132,24 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
 - Future SWIM (only if node count outgrows ~100): **`foca` 1.0.0** is the fit
   (runtime/transport-agnostic, `no_std+alloc`, no forced tokio). `chitchat` 0.11.0 is
   prior art but hard-depends on tokio. `libp2p`/gossipsub rejected (wrong scale/shape).
-- `xchannel` is the substrate — the published crates.io release `xchannel = "4.0.0"` (the
-  v2 format change has shipped). Key facts (Live/LateJoin, reserve/commit, file rolling,
-  retention via `keep_files`, byte-offset resume) are mapped in DESIGN.md §1.
+- `xchannel` is the substrate — the published crates.io release `xchannel = "5.1.0"`
+  (`format_version = 3`). Key facts (Live/LateJoin, reserve/commit, file rolling,
+  retention via `keep_files`, byte-offset resume) are mapped in DESIGN.md §1. **Note what is
+  *not* in the header:** `file_roll_size`/`keep_files` are `Writer`-instance state, so any code
+  that reopens a channel must re-supply them (this bit us — see Topic disk bounds below).
 - **Verified: reopen-for-append** (`Writer::open_or_create` → `open_file`): a restarted
   writer reopens the latest segment without truncation, resumes at the persisted
   `write_position`, with bounded crash recovery (INV5). Load-bearing for §5; no special
   support needed.
-- **Landed in xchannel (format_version 2)** for this project: `ChannelHeader` grew to 128
+- **Landed in xchannel for this project.** `format_version = 2`: `ChannelHeader` grew to 128
   bytes with `base_record_index` (intrinsic absolute index — killed the sidecar);
-  `message_count` is now a per-file *user*-record count; new `Writer::next_record_index()`,
-  `Reader::base_record_index()`, `WriterBuilder::base_record_index()`. Greenfield: refuses
-  v0/v1 files, no migrator (the `migrate` module/example were removed). See the xchannel
-  repo's `FORMAT.md` §3 + `CHANGELOG`.
+  `message_count` became a per-file *user*-record count; `Writer::next_record_index()`,
+  `Reader::base_record_index()`, `WriterBuilder::base_record_index()`. `format_version = 3`
+  (5.0.0) widened `channel_name` 20 → 48 bytes. Greenfield at every step: the current build
+  refuses v0/v1/v2 files, no migrator. See the xchannel repo's `FORMAT.md` §3 + `CHANGELOG`.
+  (`channel_name` is **never set** by this project — `WriterBuilder::channel_name` is uncalled,
+  and our names run to 200 chars, so the 48-byte field could not hold them anyway. Stamping it
+  would let `reconstruct_from_disk` stop trusting the *directory* name; open question.)
 
 ## Conventions
 
@@ -160,8 +165,9 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
 
 ## Current status (update this section as work lands)
 
-_As of 2026-08-07 (released **0.1.0** — all three crates on crates.io):_
-- Dep is published **`xchannel = "4.0.0"`**. `.justfile` present in every commit; every
+_As of 2026-08-08. **0.1.0** released 2026-08-07 (all three crates on crates.io); unreleased
+fixes on `main` since — see `CHANGELOG.md` "Unreleased"._
+- Dep is published **`xchannel = "5.1.0"`**. `.justfile` present in every commit; every
   commit passes `just check` (cargo check + fmt --check + clippy --all-targets).
 - **v1 complete and hardened.** External client process → `Client` RPC → local `xchanneld`
   → gossip discovery + membership → cross-node replication. Hardening done:
@@ -192,22 +198,23 @@ _As of 2026-08-07 (released **0.1.0** — all three crates on crates.io):_
   - **Cross-process test** spawns the real `xchanneld` and replicates via `Client` across
     processes (reads the replica — only possible cross-process). `Client::subscribe`
     retries the replica open (async creation race).
-- ~28 tests across unit + two-node + client-RPC + cross-process; clippy clean; release builds.
+- 92 tests across unit + two-node + client-RPC + cross-process; `just check` clean.
 
 ### Topics (multi-producer fan-in) — design implemented, with documented deviations (`doc/TOPICS.md`)
 
-The TOPICS.md design (§0–§8) is built on the `topics` branch, ~56 tests green (`just check`
-clean), with the deviations noted at the end of this section (chiefly the §4.1 execution model).
+The TOPICS.md design (§0–§8) is implemented on `main` (the `topics` branch was rebased in and is
+gone — its commit hashes below are the post-rebase ones), with the deviations noted at the end of
+this section (chiefly the §4.1 execution model).
 **Phase 0 (the §1 prerequisites):**
 - **`RegisterRejected`**: `claim_name` reserves the name before file creation and fails
-  `AlreadyExists` on a lost collision (`de6f558`).
+  `AlreadyExists` on a lost collision (`bd54bc8`).
 - **True `SubscribeAck.head`**: via `xchannel::Reader::head_record_index()` — dep bumped to
   **`xchannel = "4.1.0"`** (published; the head method is `2873410` in the xchannel repo)
-  (`2c69805`).
+  (`8c8c323`).
 - **Liveness-gated resolution**: `resolve` → `HostUnreachable` (owner not live) vs `TimedOut`
-  (unknown) (`0398f44`).
+  (unknown) (`8439fd6`).
 - **Tombstones**: registry merge carries `(epoch, deleted)`; deregister, anti-resurrection,
-  reclaim at `epoch+1`; permutation-convergence test (`add9994`).
+  reclaim at `epoch+1`; permutation-convergence test (`2583899`).
 - **Incarnation (5th prereq) — DECISION: `incarnation == the tombstone epoch`** (my best
   judgment while the user was away; revisitable). `member_id = (name, epoch)`. Respawn =
   deregister→reclaim (bumps epoch); crash = liveness→member-reaper tombstones→reclaim. No
@@ -219,45 +226,45 @@ creates member channels, the daemon's mux merges them into the topic channel, an
 `subscribe`s to the topic like any channel. Pieces:
 - **Record format** (`core/mux.rs`): provenance **option (b)** — 18-byte prefix
   `{member_ref, member_index, orig_user_meta}` + slot-table control records; reserved control
-  `msg_type` range (`d525b2a`).
+  `msg_type` range (`914557e`).
 - **Mux engine** (`core/mux.rs`): merges member `ReplicationSource`s into one topic `Writer` in
   arrival order with provenance, `max_batch_per_member` fairness, and **cursor recovery by
-  scanning the topic tail** (no sidecar) — permutation-free but restart-safe (`6227435`).
+  scanning the topic tail** (no sidecar) — permutation-free but restart-safe (`c07efd3`).
 - **Node API** (`create_topic`/`publish_to_topic`/`poll_muxes`/`run_mux`), members are ordinary
-  registered channels; epoch = incarnation (`5ccf397`).
+  registered channels; epoch = incarnation (`8be8b2f`).
 - **Client RPC** (`CreateTopic`/`PublishToTopic`) + `main.rs` mux loop + **cross-process
   end-to-end test** (`this commit`).
 
 **Phase 2 core (remote members) — landed.** A member on any node feeds a topic hosted on
-another: `member_of` rides `ChannelIdentity` (`3492da1`), and the topic owner's maintenance
+another: `member_of` rides `ChannelIdentity` (`0247d5b`), and the topic owner's maintenance
 loop (`attach_pending_members`) discovers members and attaches them — local ones by origin
 file, remote ones by subscribing (a replica the mux reads, concurrent R+W across daemon
-threads, which xchannel supports) (`4f2643e`). `publish_to_topic` no longer requires the topic
+threads, which xchannel supports) (`813bf70`). `publish_to_topic` no longer requires the topic
 to be local. Proven by a two-node test (member on B → topic on A). `add_member` is idempotent
 so publish-time and discovery-time attach don't collide.
 
 **Phase 2 lifecycle (§6) + observability (§8) — landed.** The full design (§0–§8) is now
 implemented:
-- **`TopicGap`** (`4521b4b`): on resume, if a member aged records out of retention below the
+- **`TopicGap`** (`21c7340`): on resume, if a member aged records out of retention below the
   mux cursor, an attributed `TopicGap{member_ref, from, resumed_at}` is committed and the merge
   resumes at `earliest` — never a silent splice (§6.2).
-- **Clean leave** (`9f425f4`): `Mux::remove_member` drains to head → `MemberClosed{final_index}`;
+- **Clean leave** (`85f18bf`): `Mux::remove_member` drains to head → `MemberClosed{final_index}`;
   the node detaches members whose registry entry is tombstoned/gone (drain + stop subscription).
-- **Topic retirement** (`0f2b556`): `Node::deregister_topic` drains all members, writes a
+- **Topic retirement** (`2f87d46`): `Node::deregister_topic` drains all members, writes a
   terminal marker, tombstones the topic channel, stops member subscriptions (§4.1).
-- **`TopicOptions` + reaper** (`6cbd868`): `create_topic(&TopicOptions)` carries geometry +
+- **`TopicOptions` + reaper** (`acdaa5c`): `create_topic(&TopicOptions)` carries geometry +
   `max_batch_per_member` + `member_reap_after`; the reaper tombstones a member whose owner has
   been unreachable past the (opt-in, default-never) threshold so its incarnation can be
   reclaimed — `Registry::reap` is the deliberate not-owner-only exception.
-- **Observability** (`2f1c0be`): `Node::topic_status` → per-member `{merged, head, lag, state:
+- **Observability** (`5c28651`): `Node::topic_status` → per-member `{merged, head, lag, state:
   Quiet|Active|Unreachable}`, topic head, gaps emitted, slot-table version (§8).
 
-**Recovery data-loss fix** (`a915d4d`, from a council review): `recover_cursors` originally keyed
+**Recovery data-loss fix** (`c994b04`, from a council review): `recover_cursors` originally keyed
 cursors on the bare `member_ref` (max over the whole log) with the *latest* slot table — but
 `member_ref` is a per-session counter reset each `Mux::open`, so two incarnations reusing a ref
 across reopens conflated → a member could resume past its own head and **silently skip committed
 records** (no `TopicGap`). Fixed by resolving each record's ref through the slot table **active at
-that scan position** and keying the cursor on the resulting `(name, epoch)`. Also (`dbb7961`):
+that scan position** and keying the cursor on the resulting `(name, epoch)`. Also (`090e8d0`):
 `next_ref` u16-exhaustion now errors instead of wrapping; the reaper dead-timer is keyed on
 `(name, epoch)`; `add_member` emits a `TopicGap` for a fresh member with a pruned genesis and for
 a resume that overshoots the source head (never `skip_to` past head). Failing repro landed first,
@@ -265,12 +272,40 @@ then the fix.
 
 **Restart = reconstruct** (`doc/RESTART.md`): a restarted daemon **re-hosts its topics from disk**
 (`Node::reconstruct_from_disk` at startup) with no persisted marker — a topic is content-sniffed
-via its slot table (`mux::topic_config`), which now also **carries the topic's geometry**
-(`region_size`/`mtu`) so the writer can reopen; members are re-attached from that slot table
-(local origin / remote replica). Slot tables are **re-emitted every `SLOT_TABLE_REFRESH` records**
-so a recent one is always retained (roll/prune safe; also honors §6.3's late-consumer-decode
-promise). Proven by a cross-process daemon-restart test. Chose option (a) content-sniff over (b) an
+via its slot table (`mux::topic_config`), which also **carries the topic's whole writer config**
+(`mux::TopicGeometry` = `region_size`/`mtu`/`file_roll_size`/`keep_files`) plus **each member's
+merge cursor**; members are re-attached from that table (local origin / remote replica). A slot
+table is emitted at the **head of every segment**, so one is always inside the retained window
+(§6.3's late-consumer-decode promise, the restart sniff, and cursor recovery for a quiet member).
+Proven by a cross-process daemon-restart test. Chose option (a) content-sniff over (b) an
 xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
+
+**Startup ordering** (post-0.1.0 fix): `reconstruct_from_disk` runs after the listeners are
+**bound** but before any plane accepts on them, and before `connect_seeds`. It used to run after
+the serve threads spawned, so at startup the daemon could answer from an empty registry — a wrong
+answer (client goes and re-creates a channel that is on disk; peer gets an empty anti-entropy
+snapshot), not a slow one. Bind-then-reconstruct-then-serve keeps `connect_or_spawn`'s
+single-instance arbitration (decided by the bind) working while an early client just blocks in
+`accept`. It returns `Reconstructed { topics, origins, skipped }`, logged at startup because the
+scan is O(retained records).
+
+**Tombstones and discovery** (post-0.1.0 fix): a locally-produced tombstone must be **published to
+the local discovery log *and* announced to peers** — one call, `Node::disseminate_tombstone`.
+`deregister_topic` and the member reaper did only the second, so a watcher on the originating node
+kept a phantom source while every *other* daemon reported the removal correctly (a peer
+republishes what it merges). Registration keeps its own path: `merge_tracked` decides whether the
+map changed and publishing follows that verdict, which is what stops anti-entropy reconnects from
+storming the log.
+
+**Topic disk bounds** (post-0.1.0 fix): the four writer-config fields travel together as
+`TopicGeometry` because `file_roll_size`/`keep_files` are **`Writer`-instance state in xchannel,
+not header fields** — so they must be re-supplied on *every* `Mux::open`, not just at creation.
+They weren't, so a topic never rolled or pruned however `TopicOptions` configured it. Two knock-on
+invariants came with the fix: the **mux drives its own rolling** (`file_roll_size` is not given to
+the writer) because `Writer` cannot report a roll it did internally and the table must land at each
+segment head; and **slot entries carry cursors**, because once a topic prunes, a quiet member's
+data records age out and it would otherwise recover as fresh and be re-merged. Recovery
+**overwrites** from a table (never maxes) — `MemberRegressed` can legally move a cursor backwards.
 
 **Honest remainders / known deviations:**
 - **§4.1 execution model:** the mux runs on its **own thread** (`run_mux`, poll+sleep), not as
@@ -279,7 +314,7 @@ xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
 - Recovery is correct but scans from genesis — not the bounded §5.2 scan (needs reverse reads).
 - Reconstruct covers **topics + non-topic origins** (the latter recovering geometry via xchannel
   4.2.0 `Reader::region_size()`/`mtu()`). Not re-hosted: **empty** topics (no slot table). Dep is
-  `xchannel = "5.0.0"` (published; no patch). Recent adds: **4.3.0** `Reader::file_sequence()`
+  `xchannel = "5.1.0"` (published; no patch). The version history: **4.3.0** `Reader::file_sequence()`
   (roll boundaries observable — consumed by `RecordFrame::starts_segment`); **4.4.0**
   `ChannelHeader.generation`, an opaque incarnation id stamped into every segment
   (`WriterBuilder::generation` / `Reader::generation()` / `Writer::generation()`) — the registry
@@ -294,10 +329,10 @@ xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
 
 **Council whole-branch review — both blockers fixed:** (1) member records using a reserved control
 `msg_type` are now **rejected** at `merge_one` (never forge a control record into the topic —
-`e7e643f`); (2) restart no longer **resurrects** a deregistered channel (deregister deletes its
-files — `b64336a`) nor **spuriously retires** a re-hosted member (detach only on a positive
+`4aeba4e`); (2) restart no longer **resurrects** a deregistered channel (deregister deletes its
+files — `7522df9`) nor **spuriously retires** a re-hosted member (detach only on a positive
 registry signal; rehost re-registers local members with `member_of`). Remote members are
-**re-subscribed on reconnect/restart** so stale replicas refresh (`6351ef7`); `XCHANNELD_SEEDS`
+**re-subscribed on reconnect/restart** so stale replicas refresh (`324be1b`); `XCHANNELD_SEEDS`
 now configures peering. Test gaps closed: 2-member restart + **2-node remote merge/resume** cross-
 process tests. Added Socrates' ordering-contract paragraph (TOPICS §4.3: topic order is arrival-
 order only — no causal/reproducible/cross-producer meaning; use per-member provenance).
@@ -330,10 +365,10 @@ planes, signed `ChannelIdentity` (don't trust `registered_at_nanos`/`owner`), au
 1. **Auto-spawn hardening** — `connect_or_spawn` resolves an absolute path (no `PATH`), but
    doesn't `setsid`/daemonize; its exact wrapper isn't automated-tested (the cross-process
    test spawns the daemon directly).
-2. **Client `Deregister` RPC** — tombstones + `Node::deregister` exist (registry merge carries
-   `(epoch, deleted)`, reclaim at `epoch+1`), but there is no `ClientRequest::Deregister` to
-   invoke it from a client, and an incoming tombstone doesn't proactively stop a live local
-   subscription (it fails to re-resolve on next reconnect).
+2. **Cross-node collision notification** — `claim_name` rejects a collision the local registry
+   already knows about, but a race resolved *after* this node served its client a `Writer` is
+   still silent. Needs a server→client push the client RPC does not have (strictly one request →
+   one reply). The one genuinely open piece of `RegisterRejected`.
 3. **Membership pruning** — `Membership::forget_stale` exists but nothing calls it; the
    maintenance loop could prune dead peers.
 4. **Observability / graceful shutdown** — daemon loops swallow errors (`let _ =`); no

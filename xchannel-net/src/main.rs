@@ -123,6 +123,26 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    // Restart = reconstruct (DESIGN.md §5.2, doc/RESTART.md): re-host topics and re-register
+    // origins found on disk, so a restarted daemon resumes without waiting for a client to
+    // re-declare.
+    //
+    // **Before anything serves or gossips**, because until it returns this node's registry is
+    // empty and it hosts no topics. A client answered in that window is told the channel does not
+    // exist and a peer is handed an empty anti-entropy snapshot — wrong answers, not slow ones,
+    // and the client's would send it off to create a channel that is already on disk. Binding
+    // first and reconstructing second means an early client blocks in `accept` until the daemon
+    // can answer properly; the listeners are already bound, so `connect_or_spawn`'s
+    // single-instance arbitration still resolves immediately. Reconstructing before
+    // `connect_seeds` also makes the *first* snapshot we send a peer already complete.
+    let rebuilt = node.reconstruct_from_disk();
+    if rebuilt != Default::default() {
+        eprintln!(
+            "xchanneld[{node_id}]: reconstructed {} topic(s), {} origin(s), {} skipped",
+            rebuilt.topics, rebuilt.origins, rebuilt.skipped
+        );
+    }
+
     node.connect_seeds();
     for (node, run) in [
         (node.clone(), Plane::Control(control_listener)),
@@ -139,9 +159,6 @@ fn main() -> std::io::Result<()> {
             let _ = node.run_maintenance(std::time::Duration::from_millis(500));
         });
     }
-    // Restart = reconstruct (DESIGN.md §5.2, doc/RESTART.md): re-host topics found on disk so a
-    // restarted daemon resumes merging without waiting for a client to re-issue create_topic.
-    node.reconstruct_from_disk();
     {
         // Drive topic muxes: merge member channels into their topic channels (doc/TOPICS.md).
         let node = node.clone();

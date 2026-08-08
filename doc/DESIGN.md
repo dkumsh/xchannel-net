@@ -49,7 +49,9 @@ owner to read-only replicas on subscribing nodes.
   tombstone dominates its generation (a stale `Register` can't resurrect a deregistered name)
   and a reclaim at `epoch + 1` lets a new owner retake the name. Tombstones are hidden from
   `get` but retained and propagated by anti-entropy. `Node::deregister` tombstones + announces;
-  convergence is covered by a permutation test. *Remaining: a client-facing `Deregister` RPC.*
+  convergence is covered by a permutation test. Client-facing `Deregister` and `ForceDeregister`
+  RPCs invoke it (the latter being the operator-only path to reclaim a *dead* owner's name), and
+  merging a tombstone proactively retires any subscription held for that name.
 - **Lost-collision detection (`RegisterRejected`)** — `claim_name` reserves the name before
   creating any file and fails with `AlreadyExists` if an earlier registration owns it, so the
   client is told rather than silently believing it owns the name (§"Name collisions").
@@ -65,17 +67,24 @@ owner to read-only replicas on subscribing nodes.
   errors is dropped, no retry); reconvergence relies on `RegistrySync` at (re)connect. With
   no `seeds` configured (the binary's default is `seeds: vec![]`) and inbound-only links not
   re-dialed, a healed partition may not reconverge automatically — two nodes can keep
-  divergent registries (and, with §"Name collisions" unimplemented, both believe they own a
-  name).
-- **Crash/restart resume is unverified here.** It relies on xchannel's `next_record_index()`
-  equalling the durably-committed user-record count after a crash (read and reasoned about
-  in §5.3) — but there is **no kill/restart test in this repo** exercising it.
+  divergent registries, and both believe they own a name. Lost-collision detection does not
+  help here: `claim_name` can only reject a collision the *local* registry already knows
+  about, and across a partition neither side knows about the other (§"Name collisions").
+- **Crash resume is verified only for a quiesced writer.** Cross-process tests `SIGKILL` the
+  daemon and respawn it, asserting every member resumes contiguously — which exercises the
+  reopen path where the daemon *is* the writer (a topic's mux). What is still unverified is a
+  kill **mid-commit**: the claim in §5.3 that `next_record_index()` equals the durably-committed
+  user-record count after a torn write is read and reasoned about, not tested here.
+- **Restart = reconstruct is implemented but not total (§5.2, `doc/RESTART.md`).**
+  `Node::reconstruct_from_disk` scans the data dir at startup, re-registers plain origins
+  (geometry from the channel header) and re-hosts topics (content-sniffed via their slot table,
+  which carries the topic's writer configuration and members). Not recovered: an **empty** topic
+  (no slot table to sniff), a plain origin's `member_of`, and a plain origin's rolling/retention
+  policy — none of which is persisted anywhere, so the first reconciles via peer anti-entropy
+  and the others fall back to defaults.
 
 **Not yet implemented** (designed below, absent from the code):
 
-- **Restart = reconstruct (§5.2)** — there is no data-dir scan / re-register on startup. A
-  restarted daemon does **not** automatically re-register hosted channels or re-attach
-  replicas; recovery currently depends on clients reconnecting and re-declaring.
 - **Stream multiplexing (§6)** — `StreamId` is hardcoded to `0`; one connection carries one
   subscription. The multiplexing described in §6 is not built.
 - **Authentication / authorization / encryption (§8)** — none. All three planes are
@@ -123,7 +132,7 @@ Three consequences drive the whole design:
 |---|---|---|
 | **Owner death** | Channel **freezes** — no failover, no election. | Identical to plain xchannel when a writer stops. *Writer liveness* is an application concern. |
 | **Discovery** | **Decentralized CRDT registry**; v1 dissemination = eager broadcast + join-time anti-entropy. | No SPOF, no central name server to bootstrap. Full epidemic gossip is *not* needed at the expected scale (≤100 nodes, LAN) — see §2.1. |
-| **Namespace** | **Flat global names**, first-registrant-wins. | Identity = the name. Collisions resolved deterministically (below). *Tiebreak uses wall-clock timestamps — see §0 clock caveat; loser-notification not yet implemented.* |
+| **Namespace** | **Flat global names**, first-registrant-wins. | Identity = the name. Collisions resolved deterministically (below). *Tiebreak uses wall-clock timestamps — see §0 clock caveat. A loser is notified at create time; a loss decided only after it was served a `Writer` still is not — see §2.1.* |
 | **Initial pull** | **Always full (retained) history.** | Any subscribing node materializes the whole channel, so any local reader (Live or LateJoin) is instantly serviceable. No lazy/backfill logic. |
 
 ### Two liveness concepts, kept separate
@@ -177,11 +186,16 @@ computes identically, with no coordination round:
 winner = (min registered_at_nanos, then min NodeId)
 ```
 
-The loser's manager *should* report `RegisterRejected { winner }` to its client. (See
-`identity::ChannelIdentity::resolve_collision`.) **Note (not yet — see §0):** the merge and
-tiebreak are implemented and tested, but `register_origin` does not yet detect a lost
-collision or emit `RegisterRejected`, so a losing registrant currently believes it owns the
-name. The tiebreak also depends on wall-clock timestamps — see the clock caveat in §0.
+The loser's manager reports the rejection to its client. (See
+`identity::ChannelIdentity::resolve_collision`.) `Node::claim_name` reserves the name through the
+merge **before creating any file**, and fails the create with `AlreadyExists` if an earlier
+registration owns it — so a losing registrant is told, and leaves no orphan origin file behind.
+
+**Note (not yet — see §0):** that covers a collision the local registry already knows about, which
+is the common case. A cross-node race resolved only *after* this node has already handed its
+client a `Writer` is not covered: reporting it needs a server→client push the client RPC does not
+have (it is strictly one request → one reply). The tiebreak also depends on wall-clock timestamps
+— see the clock caveat in §0.
 
 ---
 
@@ -324,9 +338,9 @@ A writer client writes to its local xchannel via mmap **directly**; the manager 
 
 ### 5.2 Restart = reconstruct, never restore from node-owned metadata
 
-> **(Not yet — see §0.)** This section describes the intended recovery model. The code does
-> not yet scan the data dir or re-register on startup; today a restarted daemon recovers
-> only as clients reconnect and re-declare. The rest of this section is the design target.
+> **Implemented** (`Node::reconstruct_from_disk`, called at startup; see `doc/RESTART.md` for the
+> mechanism and its accepted limits). This section remains the model; §0 lists what reconstruction
+> does *not* recover, all of it state that was never persisted in the first place.
 
 A node persists **no separate registry/subscription database.** On restart it rebuilds
 from three authoritative sources:
@@ -480,8 +494,9 @@ Gap          { name, earliest, head }                        source → subscrib
   receive genesis.
 - **`head`** = source's high-water index at accept time. The subscriber is *synchronized*
   once it has applied up to `head`; historical replay and live tail are the **same**
-  stream, so there is no explicit catch-up message. **(Not yet — see §0:** `head` is
-  currently a placeholder equal to `start`, not the true high-water index.**)**
+  stream, so there is no explicit catch-up message. Read from the source's own log at accept
+  time (`Reader::head_record_index()`), so it is the real frontier — but a *snapshot* of it,
+  which goes stale as soon as the source moves on.
 - **`region_size` / `mtu`** = the source's authoritative geometry, so the sink builds a
   replica `Writer` guaranteed to fit every record (the registry copy may be stale).
 - **`file_roll_size` / `keep_files`** = the source's rolling + retention policy, so the
