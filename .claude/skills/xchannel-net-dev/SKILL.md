@@ -64,7 +64,7 @@ orientation layer; when they disagree, DESIGN.md wins — and update both.
 |---|---|---|
 | Owner death | Channel **freezes**, no failover | Same as a local writer stopping; *writer liveness* is an app concern, not ours. Reclaiming a dead owner's *name* is possible but **operator-invoked** (`force_deregister`, guarded on not-live + `reclaim_after`) — never automatic, since an automatic reaper is failover and would let a partitioned minority retire a live channel, its `epoch+1` reclaim then winning the merge. |
 | Discovery | **Decentralized CRDT registry** | Last-writer-wins map keyed by `(registered_at_nanos, NodeId)`. No SPOF, no central name server. |
-| Dissemination (v1) | **Eager broadcast + relay-on-change + join-time anti-entropy + heartbeats** | NOT epidemic gossip / SWIM. Right for the expected **≤100 LAN nodes**. The mesh is **self-forming**: heartbeats carry a control address, second-hand knowledge travels as `PeerHint`, and a node dials what it learns — so any connected seed graph closes into a full mesh. |
+| Dissemination (v1) | **Eager broadcast + relay-on-change + join-time anti-entropy + heartbeats** | NOT epidemic gossip / SWIM. Right for the expected **≤100 LAN nodes**. The mesh is **self-forming**: heartbeats carry a control address, second-hand knowledge travels as `PeerHint`, and a node dials what it learns — so any connected seed graph closes into a full mesh. **Both ends dial** and `dedup_links` collapses the duplicate (keep the link whose initiator has the lower `NodeId`); electing a dialler up front breaks under asymmetric reachability, where it can pick the node that cannot dial. |
 | Namespace | **Flat global names**, first-registrant-wins | Identity = the name; collisions resolved by the CRDT merge, loser gets `RegisterRejected`. |
 | Initial pull | **Always full (retained) history** | Subscribing node materializes the whole channel; any local reader (Live/LateJoin) is instantly serviceable. |
 | Redundancy / HA | **Post-v1, but keep 2 hooks** (DESIGN.md §9) | Absolute `RecordIndex` intrinsic in xchannel v2 `base_record_index` (done); name → *set* of endpoints (don't hard-bind one address). Same-machine redundancy = zero-downtime upgrades only, not machine HA. |
@@ -416,6 +416,12 @@ Follow-up (perf, not correctness): reconstruct double-scans each topic.
   discovery (filesystem-watch candidate), cross-topic txns (explicitly out of scope).
 - Client RPC surfaces `create_topic`/`publish_to_topic`; `deregister_topic`/`topic_status` are
   Node APIs (thin client-RPC wrappers are a trivial future add).
+
+**`NodeId` uniqueness is unenforced.** `XCHANNELD_NODE_ID`, default **`1`** — so two unconfigured
+daemons collide. Everything is keyed on it: membership (addresses overwrite each other), channel
+ownership + the collision tiebreak, and link dedup (would drop the link between two distinct
+peers). A node warns once if it hears its own id from a peer; a duplicate between two *other* nodes
+is undetectable locally. Operator's job.
 
 ## Security
 

@@ -33,6 +33,21 @@ experimental: the wire protocol and on-disk layout may change without notice (se
   weaken exactly the guard that stops a partition retiring a channel whose owner is alive and
   writing. Liveness follows from dialling the node and hearing from it directly.
 
+  **Both ends of a pair dial**, and the duplicate link is collapsed afterwards by `dedup_links`.
+  Electing one dialler in advance — the lower `NodeId` — was the first shape of this and it is
+  wrong: the election happens before anyone knows whether the elected node can *reach* the other,
+  so under asymmetric reachability (a firewall, a NAT) it hands the job to the node that cannot
+  dial and the pair never links, though the other direction would have worked first time. The
+  duplicate is resolved by a rule both ends compute identically — keep the link whose initiator has
+  the lower `NodeId` — since resolving it differently would leave them with no link at all. Dialling
+  is gated on node *identity*, not dial address: an inbound link has no dial address, so
+  address-based tracking alone would call its peer unconnected and dial it again.
+
+  A node now **warns once if a peer claims its own `NodeId`**. Nothing assigns or enforces them
+  (`XCHANNELD_NODE_ID` defaults to `1`), and a duplicate makes two nodes indistinguishable in
+  membership, in channel ownership, and now in link dedup — where it would drop the link between
+  two genuinely distinct peers.
+
   Honest about what each half buys: with the mesh closing, **relay is not what makes a chain
   converge** — the new link delivers the registry as join-time anti-entropy anyway. Relay covers
   the window before the mesh closes and any pair that never manages to link. The tests say so

@@ -100,6 +100,15 @@ impl Membership {
             .collect()
     }
 
+    /// Which node is reachable at `control` — the reverse of [`known_peers`](Self::known_peers),
+    /// so a dial candidate can be checked against the links we already hold.
+    pub fn node_at(&self, control: SocketAddr) -> Option<NodeId> {
+        self.members
+            .iter()
+            .find(|(_, m)| m.control_addr == control)
+            .map(|(&n, _)| n)
+    }
+
     /// Every node we know of and the control address to reach it on — the candidate set for
     /// forming links, whether we heard from it directly or were told about it.
     pub fn known_peers(&self) -> Vec<(NodeId, SocketAddr)> {

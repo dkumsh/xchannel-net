@@ -209,9 +209,27 @@ liveness by hearsay would let a node on the far side of a partition look reachab
 party vouched for it, which is exactly what `force_deregister` exists to refuse. A hint says only
 "it exists, here is where"; liveness follows from dialling it and hearing for oneself.
 
-**One link per pair.** Both ends of a newly-learned pair know about each other, so both would dial;
-the lower `NodeId` is the one that does. Configured seeds are exempt — those are explicit operator
-intent, and a node must reach its seed however the ids fall.
+**Both ends dial; the duplicate is collapsed afterwards.** Electing one dialler in advance — the
+lower `NodeId`, say — is tidier and wrong, because the election happens before anyone knows whether
+the elected node can actually *reach* the other. Under asymmetric reachability (a firewall, a NAT)
+it can hand the job to the node that cannot dial, and the pair then never links although the other
+direction would have worked first time. So both dial, and `dedup_links` resolves the resulting
+duplicate knowing which direction succeeded.
+
+Resolution has to be one both ends reach independently, or they would drop opposite links and be
+left with none: **keep the link whose initiator has the lower `NodeId`**. Each end knows, for each
+link, whether it dialled and who the peer is, so both compute the same initiator for the same link.
+A link's peer is learned from its first heartbeat, which is also why dialling is gated on *node
+identity* rather than dial address — an inbound link has no dial address, so address-based tracking
+alone would call its peer unconnected and dial it a second time.
+
+**`NodeId`s must be unique, and nothing enforces it.** They come from `XCHANNELD_NODE_ID`, which
+defaults to `1`. A duplicate makes two nodes indistinguishable in the membership map (their
+addresses overwrite each other), in channel ownership (`ChannelIdentity.owner`, and the
+`registered_at_nanos`/`NodeId` collision tiebreak), and now in link deduplication, where it would
+drop the link between two genuinely distinct peers. A node that hears its own id on a peer link
+warns once; a duplicate between two *other* nodes is not detectable from here. Assigning ids is the
+operator's job.
 
 ### Name collisions
 

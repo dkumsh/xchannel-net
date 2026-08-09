@@ -11,9 +11,10 @@
 //! inbound queue (registry deltas/syncs) and the shared [`Membership`] (heartbeats); the
 //! send side stays here for `announce` / heartbeat emission. `pump` drains the queue.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use xchannel_net_core::NodeId;
@@ -36,6 +37,25 @@ type SharedMembership = Arc<Mutex<Membership>>;
 /// Dial addresses of outbound peer links currently believed connected (for dedup +
 /// reconnection). An outbound peer's reader removes its address here on disconnect.
 type Connected = Arc<Mutex<HashSet<SocketAddr>>>;
+/// Which node sits at the far end of each link, learned from its first heartbeat. Written by
+/// reader threads; read when deduplicating links.
+type LinkPeers = Arc<Mutex<HashMap<PeerId, NodeId>>>;
+
+/// One peer link: the send half, plus what is needed to resolve a duplicate deterministically.
+struct Peer {
+    id: PeerId,
+    conn: TcpTransport,
+    /// Whether **we** dialled this link. Half of the tie-break: the initiator's `NodeId` is
+    /// `self_node` for an outbound link and the peer's for an inbound one, and both ends compute
+    /// the same value for the same link.
+    outbound: bool,
+}
+
+/// Which node opened a link: ourselves if we dialled, otherwise the peer. Both ends of a link
+/// compute the same answer, which is what lets them resolve a duplicate without negotiating.
+fn initiator(p: &Peer, peer_node: NodeId, self_node: NodeId) -> NodeId {
+    if p.outbound { self_node } else { peer_node }
+}
 
 /// Eager-broadcast dissemination over a set of peer TCP connections.
 pub struct BroadcastDissemination {
@@ -49,9 +69,12 @@ pub struct BroadcastDissemination {
     self_control_addr: SocketAddr,
     /// Send halves of peer connections, each with a stable id (broadcast target for
     /// deltas/heartbeats). Ids are stable across peer removal, unlike positions.
-    peers: Vec<(PeerId, TcpTransport)>,
+    peers: Vec<Peer>,
     next_peer_id: PeerId,
     hints: Hints,
+    link_peers: LinkPeers,
+    /// Whether we have already complained that another node is using our `NodeId`.
+    dup_warned: Arc<AtomicBool>,
     /// Filled by per-peer reader threads; drained by [`pump`](Self::pump).
     inbox: Inbox,
     membership: SharedMembership,
@@ -68,6 +91,8 @@ impl BroadcastDissemination {
             peers: Vec::new(),
             next_peer_id: NO_PEER + 1,
             hints: Arc::new(Mutex::new(VecDeque::new())),
+            link_peers: Arc::new(Mutex::new(HashMap::new())),
+            dup_warned: Arc::new(AtomicBool::new(false)),
             inbox: Arc::new(Mutex::new(VecDeque::new())),
             membership: Arc::new(Mutex::new(Membership::new())),
             connected: Arc::new(Mutex::new(HashSet::new())),
@@ -123,7 +148,10 @@ impl BroadcastDissemination {
             Arc::clone(&self.hints),
             Arc::clone(&self.membership),
             Arc::clone(&self.connected),
+            Arc::clone(&self.link_peers),
             addr,
+            self.self_node,
+            Arc::clone(&self.dup_warned),
         );
 
         let mut send = transport;
@@ -143,8 +171,79 @@ impl BroadcastDissemination {
                 control_addr,
             }))?;
         }
-        self.peers.push((id, send));
+        self.peers.push(Peer {
+            id,
+            conn: send,
+            outbound: addr.is_some(),
+        });
         Ok(())
+    }
+
+    /// Collapse duplicate links to the same node, keeping exactly one.
+    ///
+    /// Both ends of a newly-discovered pair dial each other, so a cross-dial race is normal
+    /// rather than exceptional — which is the price of not electing a dialler in advance. It has
+    /// to be, because election has to happen before anyone knows whether the elected node can
+    /// actually reach the other: under asymmetric reachability (a firewall, a NAT) the wrong
+    /// choice means the pair never links at all.
+    ///
+    /// Resolution must be one both ends reach independently, or they would drop opposite links
+    /// and be left with none. **Keep the link whose initiator has the lower `NodeId`** — each end
+    /// knows, for each link, whether it dialled and who the peer is, so both compute the same
+    /// initiator for the same link. The `PeerId` tie-break below is for two links with the same
+    /// initiator, which `connected` already prevents; it exists only to make the ordering total.
+    pub fn dedup_links(&mut self) {
+        let ids = self.link_peers.lock_safe().clone();
+        let self_node = self.self_node;
+        let key = |p: &Peer| {
+            ids.get(&p.id)
+                .map(|&node| (node, initiator(p, node, self_node)))
+        };
+
+        // The winning (initiator, link) per node.
+        let mut winner: HashMap<NodeId, (NodeId, PeerId)> = HashMap::new();
+        for p in &self.peers {
+            if let Some((node, init)) = key(p) {
+                let cand = (init, p.id);
+                winner
+                    .entry(node)
+                    .and_modify(|best| {
+                        if cand < *best {
+                            *best = cand;
+                        }
+                    })
+                    .or_insert(cand);
+            }
+        }
+
+        let (keep, drop): (Vec<Peer>, Vec<Peer>) =
+            self.peers.drain(..).partition(|p| match key(p) {
+                // Identity not learned yet — keep it; the next tick decides.
+                None => true,
+                Some((node, init)) => winner.get(&node) == Some(&(init, p.id)),
+            });
+        for p in drop {
+            // Shut the socket so the far end's reader unblocks now rather than whenever the OS
+            // notices, and so its `connected` tracking clears promptly.
+            let _ = p.conn.shutdown();
+        }
+        self.peers = keep;
+    }
+
+    /// Nodes we currently hold a link to, by identity rather than by dial address — an inbound
+    /// link has no dial address, so address-based tracking alone would call its peer unconnected
+    /// and dial it again.
+    pub fn linked_nodes(&self) -> HashSet<NodeId> {
+        let ids = self.link_peers.lock_safe();
+        self.peers
+            .iter()
+            .filter_map(|p| ids.get(&p.id).copied())
+            .collect()
+    }
+
+    /// Which node is known to sit at `control`, if any.
+    pub fn node_at(&self, control: SocketAddr) -> Option<NodeId> {
+        self.membership.lock_safe().node_at(control)
     }
 
     /// This node's own heartbeat frame.
@@ -233,7 +332,7 @@ impl BroadcastDissemination {
     /// Broadcast to every peer except `from`; drops peers whose send fails (disconnected).
     fn send_except(&mut self, from: PeerId, frame: &[u8]) {
         self.peers
-            .retain_mut(|(id, p)| *id == from || p.send_frame(frame).is_ok());
+            .retain_mut(|p| p.id == from || p.conn.send_frame(frame).is_ok());
     }
 }
 
@@ -274,7 +373,10 @@ fn spawn_reader(
     hints: Hints,
     membership: SharedMembership,
     connected: Connected,
+    link_peers: LinkPeers,
     addr: Option<SocketAddr>,
+    self_node: NodeId,
+    dup_warned: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         while let Ok(bytes) = reader.recv_frame() {
@@ -293,6 +395,22 @@ fn spawn_reader(
                     addr,
                     control_addr,
                 } => {
+                    // A heartbeat is the only thing that says who is on the far end of this link,
+                    // which is what makes duplicate links resolvable.
+                    link_peers.lock_safe().insert(id, node);
+                    // Nothing assigns or enforces `NodeId`s, so a misconfiguration lands here.
+                    // Say so once: a shared id makes two nodes indistinguishable in the membership
+                    // map, in channel ownership, and in link deduplication — where it would drop
+                    // the link between two genuinely different peers.
+                    if node == self_node && !dup_warned.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "xchanneld: WARNING: peer at {control_addr} claims NodeId {} — the \
+                             same as ours. NodeIds must be unique across the mesh; channel \
+                             ownership, membership and peer links are all keyed on them. Set \
+                             XCHANNELD_NODE_ID (it defaults to 1).",
+                            node.0
+                        );
+                    }
                     if membership.lock_safe().record(node, addr, control_addr) {
                         hints.lock_safe().push_back((id, node, addr, control_addr));
                     }
@@ -311,7 +429,9 @@ fn spawn_reader(
                 _ => {} // not expected on a peer link
             }
         }
-        // Connection dropped: clear outbound tracking so the node reconnects this seed.
+        // Connection dropped: forget who was on it, and clear outbound tracking so the node
+        // reconnects.
+        link_peers.lock_safe().remove(&id);
         if let Some(addr) = addr {
             connected.lock_safe().remove(&addr);
         }

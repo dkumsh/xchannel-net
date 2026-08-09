@@ -1404,41 +1404,59 @@ impl Node {
     /// (Re)connect to any configured seed peer not currently linked. Called at startup and
     /// each maintenance tick, so a dropped seed link is re-established. Uses a bounded dial
     /// timeout so a down seed doesn't stall the loop.
-    /// Dial peers we have *learned about* but hold no link to, so a seed graph closes itself
-    /// into a full mesh.
+    /// Whether to dial `addr` — no if a dial is already outstanding or in place, and no if we
+    /// already hold a link to whatever node lives there.
     ///
-    /// Only the lower `NodeId` of a pair dials. Both sides know about each other, and without a
-    /// tie-break both would dial, leaving two links per pair — twice the connections, twice the
-    /// heartbeats, and every delta delivered twice. Configured seeds are exempt from the rule:
-    /// those are explicit operator intent, and a node must be able to reach its seed regardless
-    /// of how the ids fall.
+    /// Checking by **node identity**, not just by dial address, is what stops the two from
+    /// diverging: an inbound link has no dial address, so address-based tracking alone would call
+    /// its peer unconnected and dial it a second time. An address we have never identified is
+    /// always worth trying — that is the bootstrap case for a seed.
+    fn should_dial(&self, addr: SocketAddr) -> bool {
+        let d = self.dissemination.lock_safe();
+        if d.is_connected(addr) {
+            return false;
+        }
+        match d.node_at(addr) {
+            Some(node) => !d.linked_nodes().contains(&node),
+            None => true,
+        }
+    }
+
+    /// Dial `addr` as a peer, best-effort.
+    fn dial_peer(&self, addr: SocketAddr) {
+        if let Ok(conn) = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            let snapshot = self.registry_snapshot();
+            let _ = self
+                .dissemination
+                .lock_safe()
+                .add_outbound_peer(conn, addr, &snapshot);
+        }
+    }
+
+    /// Dial peers we have *learned about* but hold no link to, so a seed graph closes itself into
+    /// a full mesh.
+    ///
+    /// **Both ends of a pair dial.** Electing one — say the lower `NodeId` — looks tidier and is
+    /// wrong: the election happens before anyone knows whether the elected node can actually reach
+    /// the other. Under asymmetric reachability (a firewall, a NAT) it can hand the job to the
+    /// node that cannot dial, and the pair then never links even though the other direction would
+    /// have worked first time. So both dial, and the resulting duplicate is collapsed afterwards
+    /// by `dedup_links`, which can decide it knowing who is actually reachable.
     pub fn connect_learned_peers(&self) {
         let candidates = self.dissemination.lock_safe().unconnected_peers();
-        for (node, control_addr) in candidates {
-            if node < self.config.node_id || self.config.seeds.contains(&control_addr) {
-                continue;
-            }
-            if let Ok(conn) = TcpTransport::connect_timeout(&control_addr, Duration::from_secs(1)) {
-                let snapshot = self.registry_snapshot();
-                let _ =
-                    self.dissemination
-                        .lock_safe()
-                        .add_outbound_peer(conn, control_addr, &snapshot);
+        for (_, control_addr) in candidates {
+            if self.should_dial(control_addr) {
+                self.dial_peer(control_addr);
             }
         }
     }
 
     pub fn connect_seeds(&self) {
         for addr in self.config.seeds.clone() {
-            if self.dissemination.lock_safe().is_connected(addr) {
-                continue;
-            }
-            if let Ok(conn) = TcpTransport::connect_timeout(&addr, Duration::from_secs(1)) {
-                let snapshot = self.registry_snapshot();
-                let _ = self
-                    .dissemination
-                    .lock_safe()
-                    .add_outbound_peer(conn, addr, &snapshot);
+            // Same identity check as a learned peer. Without it, a seed link that lost the
+            // duplicate tie-break would be re-dialled every tick and dropped again every tick.
+            if self.should_dial(addr) {
+                self.dial_peer(addr);
             }
         }
     }
@@ -1459,6 +1477,8 @@ impl Node {
                 // Forward peer knowledge learned since the last tick, so the mesh keeps closing
                 // itself; only knowledge that was *new* to us is queued, so this goes quiet.
                 d.relay_hints();
+                // Collapse any duplicate links the cross-dial race produced.
+                d.dedup_links();
                 d.pump()?
             };
             if !pumped.is_empty() {
@@ -2372,9 +2392,23 @@ mod tests {
     }
 
     fn start_with(cfg: NodeConfig) -> (Node, SocketAddr, SocketAddr) {
+        start_advertising(cfg, None)
+    }
+
+    /// [`start_with`], but advertising `advertise` as this node's control address instead of the
+    /// one it bound. Simulates a node that can dial out but cannot be dialled: peers learn an
+    /// address that refuses connections, exactly as they would through a firewall. Applied before
+    /// any thread runs, so the real address is never gossiped even once.
+    fn start_advertising(
+        cfg: NodeConfig,
+        advertise: Option<SocketAddr>,
+    ) -> (Node, SocketAddr, SocketAddr) {
         let node = Node::new(cfg);
         let stream_l = node.bind_stream().unwrap();
         let control_l = node.bind_control().unwrap();
+        if let Some(addr) = advertise {
+            node.dissemination.lock_safe().set_self_control_addr(addr);
+        }
         let stream_addr = stream_l.local_addr().unwrap();
         let control_addr = control_l.local_addr().unwrap();
         for (node, run) in [
@@ -2501,6 +2535,79 @@ mod tests {
             c.dissemination.lock_safe().live_addr_of(NodeId(80)),
             "C resolves the owner to the address it heard from A directly"
         );
+    }
+
+    /// **Asymmetric reachability.** A node behind a firewall can dial out but cannot be dialled.
+    /// The mesh must still close, using the direction that works.
+    ///
+    /// Simulated by having A advertise a control address nothing listens on — which is exactly
+    /// what a peer sees through a firewall: the address is known and the connection is refused.
+    /// A can still reach everyone; nobody can reach A.
+    ///
+    /// Ids are chosen so the *old* rule would fail. It elected the lower `NodeId` as the dialler,
+    /// so with A(90) unreachable and C(80) reachable it made C dial A — the one direction that
+    /// cannot work — while A skipped C as "not my job". The pair never linked. Now both dial and
+    /// the duplicate is collapsed afterwards, so A's outbound link is the one that survives.
+    #[test]
+    fn a_node_reachable_only_outbound_still_joins_the_mesh() {
+        let (b, _b_stream, b_control) = start(85, "asym-b");
+        // A is unreachable inbound from the outset: it only ever advertises an address that
+        // refuses connections, so no peer can dial it.
+        let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (a, _a_stream, _a_control) = start_advertising(
+            NodeConfig {
+                seeds: vec![b_control],
+                ..config(90, temp_dir("asym-a"))
+            },
+            Some(unreachable),
+        );
+        let (c, _c_stream, _c_control) = start_seeded(80, "asym-c", &[b_control]);
+
+        // A registers a channel; only B is adjacent to it at first.
+        drop(a.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap());
+
+        // A and C must become directly linked — provable by liveness, which only a heartbeat
+        // received first-hand confers.
+        poll_until(|| {
+            let a_sees_c = a.dissemination.lock_safe().live_addr_of(NodeId(80));
+            let c_sees_a = c.dissemination.lock_safe().live_addr_of(NodeId(90));
+            (a_sees_c.is_some() && c_sees_a.is_some()).then_some(())
+        });
+
+        // ...and C can resolve A's channel, which needs both the registry entry and live
+        // membership for its owner.
+        let (id, _addr) = c.resolve("md.aapl", Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(id.owner, NodeId(90));
+    }
+
+    /// A cross-dial race leaves one link, not two, and both ends keep the *same* one — if they
+    /// resolved it differently they would be left with none.
+    #[test]
+    fn a_cross_dial_race_collapses_to_a_single_link() {
+        let (a, _a_stream, a_control) = start(94, "dup-a");
+        let (b, _b_stream, b_control) = start(95, "dup-b");
+
+        // Seed each at the other, so both dial: exactly the race the tie-break used to prevent
+        // by picking a dialler in advance.
+        a.connect_control_peer(b_control).unwrap();
+        b.connect_control_peer(a_control).unwrap();
+
+        // Both settle on one link to the other, and it stays settled.
+        poll_until(|| {
+            let a_links = a.dissemination.lock_safe().linked_nodes();
+            let b_links = b.dissemination.lock_safe().linked_nodes();
+            (a_links.contains(&NodeId(95)) && b_links.contains(&NodeId(94))).then_some(())
+        });
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(
+                a.dissemination
+                    .lock_safe()
+                    .linked_nodes()
+                    .contains(&NodeId(95)),
+                "the surviving link must not be dropped by a later dedup pass"
+            );
+        }
     }
 
     /// Hearsay teaches an address but must never confer liveness. `live_members` has to keep
