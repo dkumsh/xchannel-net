@@ -41,15 +41,29 @@ pub const MAX_FRAME_LEN: usize = 64 << 20; // 64 MiB
 /// smaller than this number suggests: a receiver reading every 150 ms was observed producing sender gaps
 /// that grew to 254 ms.
 ///
-/// It is therefore *not* a reliable "healthy peers survive a retransmission timeout" guarantee, and the
-/// earlier version of this comment claiming so was wrong. A single TCP RTO with a full send buffer is
-/// ~200 ms and grows with loss, so on a lossy or high-latency link this constant is inside the noise. It
-/// is chosen for the one job it does well: turning a *wedged* peer's cost from a payload-sized allowance
-/// (measured at 12.8 s for 36 MiB) into a constant.
+/// **Sized above TCP's retransmission backoff, because that is the silence it must not mistake.** A sender
+/// cannot distinguish "the peer is not reading" from "the peer's acknowledgements are not arriving" — that
+/// is the information TCP gives it — so any silence-based rule prices a lossy link as a wedged one. On a
+/// typical LAN path a single retransmission timeout is ~200 ms with the send buffer full, and the *first
+/// backoff* is ~400 ms; at 250 ms this rule dropped links that were working. Measured: a peer draining in
+/// bursts with 400 ms pauses had a 4.5 MiB registry torn down, where the previous release delivered all of
+/// it at a cost to the sender of 0.571 s. A working link traded for nothing.
+///
+/// A second in exchange for a couple of retransmissions is affordable *because the aggregate is bounded
+/// elsewhere*: `xchannel-net`'s per-tick write ceiling caps the sum across peers and bursts, so a generous
+/// per-peer silence allowance no longer risks the heartbeat. Without that ceiling this number would have to
+/// be small, and small is what made it wrong.
+///
+/// One threshold worth knowing, because it decides whether this rule is reachable at all: no pause can
+/// stall a write until the payload exceeds the socket pipe (send buffer + peer's receive window — measured
+/// at 2.61 MiB on a loopback path, smaller on a real link). Below that the rule is invisible; above it,
+/// every pause longer than this is fatal. So the point at which the control plane wants a real outbox is
+/// the pipe, around **2.6 MiB of registry (~29 000 channels)** — not the tens of megabytes the rate
+/// arithmetic alone suggests.
 ///
 /// Must stay larger than the caller's per-syscall write timeout, which is how this loop learns that
 /// nothing moved. `xchannel-net`'s `PEER_WRITE_SLICE` asserts that at compile time.
-pub const STALL_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
+pub const STALL_LIMIT: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// `write_all`, but abandoning the frame once `deadline` passes, or once the peer has accepted nothing
 /// for [`STALL_LIMIT`].
@@ -669,6 +683,52 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(conn);
         let _ = trickle.join();
+    }
+
+    /// **A peer that pauses for longer than a retransmission backoff must keep its link.** This is the half
+    /// of the discriminator that nothing pinned: `STALL_LIMIT` could be set to 5 ms and the whole suite still
+    /// passed, because every other test either drains eagerly or never drains at all.
+    ///
+    /// The pause here is 400 ms — the first TCP retransmission backoff on a typical LAN path, and the exact
+    /// case that made a 250 ms limit tear down working links: a peer draining a 4.5 MiB registry in bursts
+    /// was dropped, where the previous release delivered all of it for 0.571 s of the sender's time.
+    ///
+    /// The payload must exceed the socket pipe (send buffer plus the peer's receive window) or a pause cannot
+    /// stall a write at all and this proves nothing — that is why it is 8 MiB rather than a few hundred
+    /// kilobytes.
+    #[test]
+    fn a_peer_that_pauses_longer_than_a_retransmission_backoff_keeps_its_link() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut sink = vec![0u8; 1 << 20];
+            let mut total = 0usize;
+            while total < (8 << 20) {
+                // A long pause, then a healthy gulp: bursty but entirely functional.
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                match std::io::Read::read(&mut conn, &mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n,
+                }
+            }
+            total
+        });
+
+        let mut conn = TcpTransport::connect(addr).unwrap();
+        conn.set_write_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        let payload = vec![0u8; 8 << 20];
+        conn.send_frame_by(
+            &payload,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .expect(
+            "a peer that pauses for a retransmission backoff and then drains is healthy — dropping it \
+             trades a working link for nothing",
+        );
+        drop(conn);
+        assert!(reader.join().unwrap() > 0);
     }
 
     /// **A peer that keeps making progress must not be judged by the stall limit.** This is the whole

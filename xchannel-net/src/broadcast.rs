@@ -123,11 +123,13 @@ const PEER_BURST_MIN: Duration = Duration::from_millis(500);
 /// Budget for a single *small* frame — a heartbeat, a hint, a departure notice. Tens of bytes, so a
 /// peer that cannot take one in this long is wedged rather than slow.
 ///
-/// Deliberately much smaller than a burst's, because these are the frames sent to **every** peer in one
-/// pass: each peer gets this allowance of its own, so a heartbeat broadcast costs P times it in the worst
-/// case, and at the ≤100-node target a 250 ms budget would have made that 25 s. Each failed write also
-/// drops its peer, so the cost is paid once per wedged peer, not once per round.
-const PEER_SMALL_FRAME_BUDGET: Duration = Duration::from_millis(50);
+/// Small relative to a burst's, but **above a retransmission backoff**: at 50 ms this was five times below
+/// one, so a healthy peer whose send buffer was momentarily full lost its link on a *heartbeat* — measured
+/// at 63 ms for a peer that demonstrably drained 64 KiB an instant later — and `STALL_LIMIT` never even got
+/// to apply, because the smaller of the two bounds decides. The P-times-this cost that used to argue for a
+/// tiny value is now bounded by [`TICK_WRITE_BUDGET`] instead, which is a ceiling on the sum rather than a
+/// guess about each term.
+const PEER_SMALL_FRAME_BUDGET: Duration = Duration::from_millis(300);
 
 /// How long **each peer** may take over a burst of `bytes` before it is treated as not keeping up.
 ///

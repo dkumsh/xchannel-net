@@ -314,12 +314,18 @@ peer that is not moving, which is how a single wedged peer held the control plan
 burst. A peer that keeps accepting bytes is judged by its allowance.
 
 Be precise about what the stall limit costs, because it is a constraint on **burstiness** and not on rate,
-and it therefore supersedes the rate policy for some peers the rate policy would keep: measured, a peer
-sustaining twice the minimum rate is dropped if it takes that throughput in half-second gulps, and TCP
-window-update batching makes sender-side progress events sparser than receiver-side reads. It is *not* a
-guarantee that a healthy peer survives a retransmission timeout — on a lossy or high-latency link the limit
-is inside the noise. It is chosen for the one job it does well, turning a wedged peer's cost from
-payload-sized into constant, and a link dropped for burstiness is re-dialled under the ordinary backoff.
+and it therefore supersedes the rate policy for some peers the rate policy would keep. It must be sized above
+TCP's retransmission backoff for that reason: a sender cannot distinguish "the peer is not reading" from "the
+peer's acknowledgements are not arriving", so any silence-based rule prices a lossy link as a wedged one. One
+retransmission is ~200 ms with a full send buffer and the first backoff is ~400 ms, so a limit below that
+tears down working links — measured, a peer draining a 4.5 MiB registry in 400 ms bursts, which the previous
+release delivered in full for 0.571 s of the sender's time.
+
+Whether the rule is reachable at all depends on a quantity that is a property of the kernel rather than of
+this design: the socket pipe (send buffer plus the peer's receive window, ~2.6 MiB on a loopback path and
+smaller on a real link). Below it no pause can stall a write; above it, every pause longer than the limit is
+fatal. That, and not the rate arithmetic, is where a per-peer outbox stops being optional: **~2.6 MiB of
+registry, about 29 000 channels.**
 
 **And per-peer allowances are capped in aggregate per tick.** Giving each peer its own budget fixed the
 attribution — one slow peer no longer evicts the others — and created a global term by doing it, because

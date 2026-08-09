@@ -494,11 +494,15 @@ pub struct Node {
     /// Per-member attach penalty, for members whose subscription cannot be established.
     ///
     /// Deleting the per-tick resolve cap removed a starvation bug and left one behaviour behind it: a member
-    /// that *can* be resolved but cannot be *attached* — the owner is live but refusing connections, or is at
-    /// its own connection cap — was retried on every tick for ever. Measured: a thousand such members cost
-    /// ~9 % of a core in a permanent loop of thousands of connects a second, with nothing logged. The cap
-    /// used to hide this by throttling the whole queue to four attempts a tick; the honest fix is to back
-    /// off per member, exactly as dialling does per address.
+    /// that *can* be resolved but cannot be *attached* — the owner is live but refusing connections, at its
+    /// own connection cap, or accepting and never answering — was retried on every tick for ever. Measured:
+    /// three thousand such members held **three thousand threads** and made eight hundred connects a second,
+    /// with nothing logged; ten thousand pushed a tick to 3.4 s. Each attempt holds a thread for up to the
+    /// resolve, connect and handshake timeouts, so the retry rate *is* the thread count. The deleted per-tick
+    /// cap used to hide this by throttling the queue to four attempts a tick.
+    ///
+    /// Consulted in `spawn_establish`, the choke point all callers reach — not in `attach_pending_members`,
+    /// which was the first place it went and which throttles a loop that is not the expensive one.
     attach_backoff: Arc<Mutex<HashMap<String, DialPenalty>>>,
     /// `NodeId`s already complained about, so a permanent duplicate produces one warning rather
     /// than one per maintenance tick. Gates the *message* only — never the decision to stand
@@ -974,7 +978,8 @@ impl Node {
                 // The gate covers the *subscription* only. Attaching from a replica already on disk
                 // needs no reachable owner, and skipping that too meant a member whose owner had merely
                 // gone quiet was left unattached even with a complete local replica.
-                if remote && live_nodes.contains(&m.owner) && self.attach_due(&m.name) {
+                if remote && live_nodes.contains(&m.owner) {
+                    // Throttling lives in `spawn_establish`, which is where the threads are actually made.
                     self.ensure_member_subscription(&m.name);
                 }
 
@@ -1128,8 +1133,6 @@ impl Node {
         // never useful — and spending it on the heartbeat's thread is what made a cap seem necessary.
         if let Ok(sub) = self.subscribe(name, Some(Duration::ZERO)) {
             self.subscriptions.lock_safe().insert(name.to_string(), sub);
-            // It attached, so forget the penalty: the next drop should be retried promptly.
-            self.attach_backoff.lock_safe().remove(name);
         }
     }
 
@@ -2615,6 +2618,17 @@ impl Node {
         {
             return;
         }
+        // **And one attempt per backoff window.** This is the choke point every caller reaches, which is why
+        // the throttle belongs here: putting it on `attach_pending_members` alone throttled the wrong loop —
+        // `service_subscriptions` re-spawns for every wanted-but-unconnected subscription on every tick, so
+        // three thousand members whose owner accepts and never answers produced three thousand live threads
+        // and eight hundred connects a second, with nothing logged, unchanged by that fix. Each attempt holds
+        // a thread for up to the resolve, connect and handshake timeouts, so the retry rate *is* the thread
+        // count.
+        if !self.attach_due(name) {
+            shared.establishing.store(false, Ordering::Release);
+            return;
+        }
         let (node, name) = (self.clone(), name.to_string());
         let for_thread = Arc::clone(shared);
         let on_failure = Arc::clone(shared);
@@ -2669,6 +2683,8 @@ impl Node {
                     // Publish *before* handing the item over, so the conductor cannot decide this
                     // subscription is idle and start a second connection alongside it.
                     shared.connected.store(true, Ordering::Release);
+                    // It connected: forget the penalty, so a link that drops later is retried promptly.
+                    self.attach_backoff.lock_safe().remove(name);
                     self.duty.clients.lock_safe().push(PolledSub {
                         shared: Arc::clone(shared),
                         item,

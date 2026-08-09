@@ -272,11 +272,15 @@ test's own premise. Never retry a destructive call to make an assertion pass.
     in perpetuity. Four such hosts took the heartbeat period from 0.5 s to a sustained **4.5 s**, where
     0.2.x decayed to one attempt a minute. No exemption is needed — a link that outlasted its own gap
     has already outlived the penalty from the dial that created it.
-  - **A member that cannot be attached backs off, per member.** Deleting the per-tick resolve cap (below)
+  - **A member that cannot be attached backs off, per member — throttled where the threads are made.** Deleting the per-tick resolve cap (below)
     fixed a starvation bug and left one behaviour behind it: a member whose owner is live but unreachable in
     practice — refusing connections, or at its own connection cap — was retried on every tick for ever,
-    measured at ~9 % of a core in a permanent loop of thousands of connects a second with nothing logged.
-    Attaching now escalates and decays per member, exactly as dialling does per address.
+    measured at three thousand live threads and eight hundred connects a second with nothing logged, and ten
+    thousand members pushing a tick to 3.4 s. Each attempt holds a thread for up to the resolve, connect and
+    handshake timeouts, so the retry rate *is* the thread count. Attaching now escalates and decays per
+    member, exactly as dialling does per address — and the throttle sits in `spawn_establish`, the choke point
+    every caller reaches. It went on `attach_pending_members` first, which left the connect count byte-for-byte
+    unchanged, because the loop that actually spawns is `service_subscriptions`.
   - **Establishment uses `thread::Builder`, so a refused thread costs a tick rather than the node.** A bare
     `thread::spawn` panics when the OS declines, and this runs on the unsupervised maintenance thread — so a
     container at its pids limit would have taken out the one thread that emits heartbeats, and every peer
@@ -351,11 +355,21 @@ test's own premise. Never retry a destructive call to make an assertion pass.
     the mechanism itself, since the entire content of the stall check (that progress advances the clock)
     passed 148 of 148 tests when mutated away.
 
-    Stated honestly, because the first version of this comment overclaimed: the stall limit is a bound on
-    **burstiness**, not on rate, and it supersedes the rate policy for a peer whose progress is lumpy —
-    measured, a peer sustaining twice the minimum rate is dropped if it takes that throughput in
-    half-second gulps. It is not a guarantee that a healthy peer survives a retransmission timeout; on a
-    lossy or high-latency link it is inside the noise.
+    The limit is a bound on **burstiness**, not on rate, and it supersedes the rate policy for a peer whose
+    progress is lumpy — so it is sized above TCP's retransmission backoff rather than below it. At 250 ms it
+    was below: a sender cannot tell "the peer is not reading" from "the peer's acknowledgements are not
+    arriving", one retransmission is ~200 ms with a full send buffer, and the first backoff is ~400 ms. So a
+    peer draining a 4.5 MiB registry in bursts with 400 ms pauses had its link torn down, where the previous
+    release delivered all of it for 0.571 s of the sender's time — a working link traded for nothing. One
+    second is affordable because the per-tick ceiling above bounds the aggregate; without that ceiling this
+    number would have to be small, and small is what made it wrong. Both halves are now pinned by tests: the
+    old 250 ms value fails, and so does the 5 ms value that used to pass all 148.
+
+    One threshold worth writing down, because it decides when the outbox stops being optional: no pause can
+    stall a write until a burst exceeds the socket pipe — send buffer plus the peer's receive window, measured
+    at **2.61 MiB** on a loopback path and smaller on a real link. Below that this rule is invisible. So the
+    point where a per-peer outbox becomes necessary is around **2.6 MiB of registry (~29 000 channels)**, not
+    the tens of megabytes the rate arithmetic suggests.
 
     What remains, and is documented rather than asserted away: a burst of R bytes may hold the
     dissemination lock for up to `R / rate` per peer that is slow but still accepting bytes — measured as `0.58 s + 1.36 × R/rate`,
