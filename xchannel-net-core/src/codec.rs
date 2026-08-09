@@ -168,6 +168,32 @@ fn put_identity(w: &mut W, id: &ChannelIdentity) {
     }
 }
 
+/// Exactly how many bytes [`put_identity`] will write for `id`.
+///
+/// Exists so a caller can size a write deadline from the real payload rather than from an estimate. An
+/// estimate is the wrong tool for that job in a specific way: guess low and the deadline is too tight,
+/// which drops healthy peers for the length of somebody's channel names. `identities_encoded_len_matches`
+/// keeps this in step with the encoder, which is the only way a hand-computed length stays honest.
+pub fn identity_encoded_len(id: &ChannelIdentity) -> usize {
+    // `str` writes a u32 length prefix then the bytes.
+    let s = |t: &str| 4 + t.len();
+    s(&id.name)
+        + 8 // owner
+        + 4 // region_size
+        + 4 // mtu
+        + 8 // earliest_index
+        + 8 // registered_at_nanos
+        + 8 // epoch
+        + 1 // deleted
+        + 1 // member_of discriminant
+        + id.member_of.as_deref().map_or(0, s)
+}
+
+/// Total encoded size of `ids`, for sizing a burst's deadline.
+pub fn identities_encoded_len(ids: &[ChannelIdentity]) -> usize {
+    ids.iter().map(identity_encoded_len).sum()
+}
+
 fn get_identity(r: &mut R) -> io::Result<ChannelIdentity> {
     Ok(ChannelIdentity {
         name: r.str()?,
@@ -758,6 +784,52 @@ pub fn decode_client_reply(bytes: &[u8]) -> io::Result<ClientReply> {
 
 #[cfg(test)]
 mod tests {
+    /// A hand-computed length is only safe if something checks it against the encoder. Long names,
+    /// empty names and both `member_of` arms, because those are the parts that vary.
+    #[test]
+    fn identities_encoded_len_matches_the_encoder() {
+        use super::*;
+        let base = ChannelIdentity {
+            name: String::new(),
+            owner: NodeId(7),
+            region_size: 1 << 20,
+            mtu: 0,
+            earliest_index: RecordIndex(3),
+            registered_at_nanos: 9,
+            epoch: 1,
+            deleted: false,
+            member_of: None,
+        };
+        let cases = [
+            base.clone(),
+            ChannelIdentity {
+                name: "a".repeat(48),
+                member_of: Some("t".repeat(48)),
+                ..base.clone()
+            },
+            ChannelIdentity {
+                name: "md.aapl".into(),
+                member_of: Some("topic".into()),
+                deleted: true,
+                ..base.clone()
+            },
+        ];
+        for id in &cases {
+            let mut buf = Vec::new();
+            put_identity(&mut W::new(&mut buf), id);
+            assert_eq!(
+                buf.len(),
+                identity_encoded_len(id),
+                "size helper drifted from the encoder for {:?}",
+                id.name
+            );
+        }
+        assert_eq!(
+            identities_encoded_len(&cases),
+            cases.iter().map(identity_encoded_len).sum::<usize>()
+        );
+    }
+
     use super::*;
 
     fn ident(name: &str, owner: u64) -> ChannelIdentity {

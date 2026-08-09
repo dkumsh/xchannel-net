@@ -292,7 +292,9 @@ Everything from here down was found by a pre-release review of the four changes 
     such a peer was dropped on the first chunk; above 8 MB/s it finished. It is the *middling* peer that
     stalls a node.
 
-    The deadline scales with the payload against a minimum drain rate rather than being a constant,
+    The deadline scales with the payload — its **exact** encoded size, since an estimate that guesses low
+    makes the deadline too tight and drops a healthy peer for the length of someone else's channel names —
+    against a minimum drain rate rather than being a constant,
     because a constant cannot be both large enough for a healthy peer and small enough to bound a tick:
     at the ~13.6 MB/s a real daemon sustains, half a second buys under 7 MB, so a **healthy** peer with a
     200 000-channel registry would have failed to form a link at all. As a rate the policy reads "a peer

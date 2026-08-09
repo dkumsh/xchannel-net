@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use xchannel_net_core::NodeId;
-use xchannel_net_core::codec::{decode_control, encode_control};
+use xchannel_net_core::codec::{decode_control, encode_control, identities_encoded_len};
 use xchannel_net_core::dissemination::{Dissemination, NO_PEER, PeerId};
 use xchannel_net_core::identity::ChannelIdentity;
 use xchannel_net_core::membership::Membership;
@@ -78,11 +78,6 @@ fn link_key(local: SocketAddr, peer: SocketAddr) -> LinkKey {
 /// decides; this only keeps a blocked syscall from outliving it.
 const PEER_WRITE_SLICE: Duration = Duration::from_millis(100);
 
-/// Rough encoded size of one `ChannelIdentity`, for sizing a burst's deadline. An estimate is
-/// sufficient: it scales the deadline, and being wrong by a factor of two moves a bound that is
-/// generous by a factor of three.
-const APPROX_IDENTITY_BYTES: usize = 128;
-
 /// The minimum rate a peer must sustain to keep its link during a registry burst.
 ///
 /// **A burst's deadline is derived from its size, not fixed.** That distinction is the whole design:
@@ -113,6 +108,11 @@ const PEER_BURST_MIN: Duration = Duration::from_millis(500);
 const PEER_SMALL_FRAME_BUDGET: Duration = Duration::from_millis(50);
 
 /// How long a burst of `bytes` may take in total before the peer is treated as not keeping up.
+///
+/// `bytes` is the **exact** encoded size (`identities_encoded_len`), not an estimate. An estimate is the
+/// wrong tool here in a specific direction: guess low and the deadline is too tight, so a healthy peer
+/// is dropped because somebody else's channel names were long. A 128-byte-per-identity guess undercounts
+/// a member with a 48-character name and a 48-character topic by about 12 %.
 fn burst_deadline(bytes: usize) -> Instant {
     let allowed = Duration::from_micros((bytes as u64).saturating_mul(1_000_000) / MIN_DRAIN_RATE);
     Instant::now() + allowed.max(PEER_BURST_MIN)
@@ -316,7 +316,7 @@ impl BroadcastDissemination {
         // is too big" and made large deployments unable to form links at all. The floor keeps a small
         // join generous.
         let deadline = burst_deadline(
-            initial_sync.len() * APPROX_IDENTITY_BYTES + self.membership.lock_safe().len() * 64,
+            identities_encoded_len(initial_sync) + self.membership.lock_safe().len() * 128,
         );
         // Chunked, because anti-entropy carries the entire registry and one frame of it was measured at
         // 10.6 MB taking 6.1 s to write to a stalled peer. The receiver merges each frame independently
@@ -475,7 +475,7 @@ impl BroadcastDissemination {
         let pending: Vec<_> = self.hints.lock_safe().drain(..).collect();
         // One deadline across every hint and every peer. Each hint used to get its own, so a forming
         // 20-node mesh meant 19 hints × 19 peers = 361 independent budgets in a single tick.
-        let deadline = burst_deadline(pending.len() * 128);
+        let deadline = burst_deadline(pending.len() * 160);
         for (from, node, addr, control_addr, name) in pending {
             if node == self.self_node {
                 continue; // never gossip about ourselves second-hand; our heartbeat says it
@@ -620,7 +620,7 @@ impl Dissemination for BroadcastDissemination {
         // enough to clear each 250 ms check individually held the lock for the sum of them: measured at
         // 13.4 s for a 600 000-identity relay, four times over the liveness budget, with no bound
         // firing at any point and the peer never dropped.
-        let deadline = burst_deadline(delta.len() * APPROX_IDENTITY_BYTES);
+        let deadline = burst_deadline(identities_encoded_len(delta));
         for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
             let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
             self.broadcast(&frame, deadline);
@@ -629,7 +629,7 @@ impl Dissemination for BroadcastDissemination {
     }
 
     fn relay(&mut self, from: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
-        let deadline = burst_deadline(delta.len() * APPROX_IDENTITY_BYTES);
+        let deadline = burst_deadline(identities_encoded_len(delta));
         for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
             let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
             self.send_except(from, &frame, deadline);
@@ -638,7 +638,7 @@ impl Dissemination for BroadcastDissemination {
     }
 
     fn reply(&mut self, to: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
-        let deadline = burst_deadline(delta.len() * APPROX_IDENTITY_BYTES);
+        let deadline = burst_deadline(identities_encoded_len(delta));
         for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
             let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
             let Some(p) = self.peers.iter_mut().find(|p| p.id == to) else {
