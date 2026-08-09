@@ -139,8 +139,13 @@ const _: () = assert!(
 );
 
 /// How much of `LIVENESS_TIMEOUT` the assertion above keeps back for everything in a tick that is not
-/// dialling: the pump and its writes, member attachment, subscription servicing, and the sleep. Not a
-/// measurement of that work — a floor under what is left for it.
+/// dialling: the pump and its writes, member attachment, subscription servicing, and the sleep.
+///
+/// **Not a claim that the rest fits inside it.** It cannot be: the burst term is sized by payload, so at a
+/// 200 000-channel registry a single relay to a peer that is slow but still accepting bytes can exceed this
+/// on its own, and a tick may contain several bursts. (A peer accepting *nothing* is bounded much more
+/// tightly, by `transport::STALL_LIMIT`.) What it does is stop the *dialling* budget from being widened until
+/// nothing is left — the failure that produced two earlier versions of the assertion above.
 const TICK_RESERVE: Duration = Duration::from_secs(3);
 
 /// First retry gap after a failed dial, doubling to [`DIAL_BACKOFF_MAX`].
@@ -1058,9 +1063,14 @@ impl Node {
         }
     }
 
-    /// Ensure a self-healing subscription is replicating remote member `name` locally, so its
-    /// replica can feed the mux. Reuses the subscription map (idempotent); a short resolve
-    /// timeout keeps the maintenance loop responsive if the owner isn't reachable yet.
+    /// Ensure a self-healing subscription is replicating remote member `name` locally, so its replica can
+    /// feed the mux. Reuses the subscription map, so it is idempotent and a no-op for a member already
+    /// replicating.
+    ///
+    /// Resolves with a **zero** timeout. The caller only reaches this for a member whose owner is already
+    /// a live member, so `resolve` succeeds on its first pass; any timeout here could be spent but never
+    /// usefully waited, and spending it on the heartbeat's own thread is what made a per-tick cap look
+    /// necessary.
     fn ensure_member_subscription(&self, name: &str) {
         let live = self
             .subscriptions
@@ -3076,8 +3086,16 @@ mod tests {
         Control(TcpListener),
     }
 
+    /// Poll until a condition holds, or fail.
+    ///
+    /// The budget is generous on purpose. These tests drive real sockets, threads and mmapped logs, so a
+    /// loaded machine can stretch work that normally takes milliseconds into seconds — and a bounded poll
+    /// with no clock control is then a coin flip, which is how this suite acquired an intermittent failure
+    /// that could not be reproduced in twenty-four consecutive runs. A larger budget costs nothing when
+    /// the condition holds (it returns immediately) and cannot mask a genuine failure, only delay it.
     fn poll_until<R>(mut f: impl FnMut() -> Option<R>) -> R {
-        for _ in 0..2000 {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
             if let Some(r) = f() {
                 return r;
             }
@@ -3273,13 +3291,21 @@ mod tests {
     /// as many such addresses as fit in the budget, starving every live peer behind them.
     #[test]
     fn an_address_that_accepts_and_drops_the_link_still_backs_off() {
-        // A listener that accepts and immediately closes — what a stream port does when handed a
-        // control frame, without needing a second daemon to arrange it.
+        // A listener that accepts, **takes our join**, and then hangs up — which is what a peer on an
+        // incompatible release or a seed naming a stream port actually does. Reading first matters: it
+        // makes our writes succeed, so any reset keyed on the connect or the write "working" fires, and
+        // the address is pinned at the floor for ever instead of backing off.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for conn in listener.incoming() {
-                drop(conn);
+                let Ok(mut conn) = conn else { continue };
+                // One bounded read, then drop. The timeout matters: an unbounded read on a socket with
+                // nothing left to send never returns, so the connection would never be closed and this
+                // node would go on believing the link is up.
+                let _ = conn.set_read_timeout(Some(Duration::from_millis(50)));
+                let mut sink = [0u8; 4096];
+                let _ = std::io::Read::read(&mut conn, &mut sink);
             }
         });
 
@@ -3305,6 +3331,23 @@ mod tests {
             gap, DIAL_BACKOFF_MIN,
             "the address was dialled again inside its own backoff window"
         );
+
+        // **And it must keep escalating across attempts.** Asserting the floor after a single dial cannot
+        // fail — the floor is where every first attempt starts — so force the gap due and dial again. This
+        // is the assertion that catches a reset keyed on the connect or the write succeeding, which both do
+        // for an address that accepts, reads, and hangs up.
+        for expected in [DIAL_BACKOFF_MIN * 2, DIAL_BACKOFF_MIN * 4] {
+            // Wait for the far end's hangup to be noticed, or there is nothing to re-dial: while the
+            // link is believed up, declining to dial is correct.
+            poll_until(|| (!node.dissemination.lock_safe().is_connected(addr)).then_some(()));
+            node.dial_backoff.lock_safe().get_mut(&addr).unwrap().next = Instant::now();
+            node.connect_seeds();
+            assert_eq!(
+                node.dial_backoff.lock_safe().get(&addr).unwrap().gap,
+                expected,
+                "an address that accepts and gives us nothing must keep backing off, not reset"
+            );
+        }
     }
 
     /// The other half of that rule, and the reason no "this address once worked" exemption is needed:

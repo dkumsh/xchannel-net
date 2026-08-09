@@ -322,8 +322,15 @@ across a ten-second liveness window with no clock control.
     to every peer in one pass: at the ≤100-node target, a 250 ms budget made a heartbeat broadcast worth
     25 s.
 
+    A peer that accepts **nothing** is judged separately and far more tightly, by a stall limit rather
+    than by its allowance: an allowance sized for a whole payload is too much rope for a peer that is
+    not moving at all, which is how one wedged peer held the control plane for 12.8 s on a 36 MiB burst.
+    Bounded by the stall instead, a wedged peer costs a quarter of a second whatever the payload — and
+    the limit is set well above a TCP retransmission timeout so a healthy peer that hits one keeps its
+    link. "Too slow" and "not moving" are different failures and now have different tests.
+
     What remains, and is documented rather than asserted away: a burst of R bytes may hold the
-    dissemination lock for up to `R / rate` per unresponsive peer — measured as `0.58 s + 1.36 × R/rate`,
+    dissemination lock for up to `R / rate` per peer that is slow but still accepting bytes — measured as `0.58 s + 1.36 × R/rate`,
     so it crosses the liveness timeout at about **28 MiB of registry (~300 000 identities)** rather than
     the 40 MB the arithmetic alone suggests. Bounding that means not holding the lock across the write —
     a per-peer outbox, as the stream plane already has — and is post-0.3.0. A socket send timeout is not a

@@ -93,12 +93,15 @@ const PEER_WRITE_SLICE: Duration = Duration::from_millis(20);
 /// still keeps its link. Below it, the peer is dropped rather than allowed to hold the control plane.
 ///
 /// The residual, stated plainly because it cannot be fixed by choosing a better number: a burst of R
-/// bytes may hold the dissemination lock for up to `R / MIN_DRAIN_RATE` **per unresponsive peer**.
-/// Measured against a peer that never drains, the hold is `0.58 s + 1.36 × (R / rate)` — so it crosses
-/// `LIVENESS_TIMEOUT` at about **28 MiB of registry, ~300 000 identities** at 48-character names, not the
-/// 40 MB the arithmetic alone suggests. The 1.36× is unexplained; payload accounting was verified to
-/// 0.04 % and the snapshot clone measured at 34–48 ms, so it is a property of the write loop. Treat the
-/// arithmetic as ~40 % optimistic.
+/// bytes may hold the dissemination lock for up to `R / MIN_DRAIN_RATE` **per peer that is slow but still
+/// accepting bytes**, and a single tick can contain several bursts (a relay and a reply per source link,
+/// plus the hint flood). A peer that accepts *nothing* is bounded far more tightly, by
+/// `transport::STALL_LIMIT`, and no longer contributes here at all.
+/// Measured against a peer that never drained, the hold was `0.58 s + 1.36 × (R / rate)`, crossing
+/// `LIVENESS_TIMEOUT` at about **28 MiB of registry, ~300 000 identities** at 48-character names rather
+/// than the 40 MB the arithmetic alone suggests — so treat the arithmetic as ~40 % optimistic. That
+/// particular measurement no longer applies to a *wedged* peer, which `STALL_LIMIT` now cuts off in a
+/// quarter of a second; it stands as the shape of the cost for one that is merely slow.
 ///
 /// Bounding this requires not holding the lock across the write — a per-peer outbox, as the stream plane
 /// already has (`FramedConn`). That is post-0.3.0 work, and ~28 MiB is the number that says when it stops
@@ -147,8 +150,10 @@ fn burst_allowance(bytes: usize) -> Duration {
 /// to it.
 const MAX_IDENTITIES_PER_FRAME: usize = 256;
 
-/// Rough encoded size of one `PeerHint`. Only used to size a deadline, and the 500 ms floor absorbs
-/// the error until thousands of hints are pending at once.
+/// Rough encoded size of one `PeerHint`, and of one membership entry in the join-time directory. Used only
+/// to size an allowance — an estimate is acceptable *here*, unlike for a registry burst, because the floor
+/// absorbs it until thousands are pending at once; a registry burst is sized exactly
+/// (`identities_encoded_len`) because there the error scales with the payload.
 const HINT_ENCODED_BYTES: usize = 160;
 
 /// Cap on remembered addresses claiming our own id. A genuine duplicate is one or two; the bound is
@@ -894,7 +899,10 @@ mod tests {
     /// Poll a condition for up to two seconds. The reader runs on its own thread, so anything it
     /// records is observed rather than awaited.
     fn poll_for<R>(mut f: impl FnMut() -> Option<R>) -> R {
-        for _ in 0..2000 {
+        // Generous for the same reason as `node::tests::poll_until`: a loaded machine turns a bounded
+        // poll into a coin flip, and waiting longer cannot mask a real failure.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
             if let Some(r) = f() {
                 return r;
             }

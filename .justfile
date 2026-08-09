@@ -26,6 +26,8 @@ locks:
     @grep -rn 'let \(mut \)\?[a-z_]* = [a-z_.]*lock_safe()' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client || true
     @echo "--- guards in a for-head (alive for the whole loop) ---"
     @grep -rn 'for .* in .*lock_safe()' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client || true
+    @echo "--- typed bindings and let-else scrutinees (a let-else guard dies BEFORE the else) ---"
+    @grep -rn 'let [a-z_]*: .*lock_safe()\|let .* else = .*lock_safe()\|else {' --include='*.rs' xchannel-net/src xchannel-net-core/src | grep lock_safe || true
     @echo "--- multi-line guard bindings (check the following lines by hand) ---"
     @grep -rn -B1 '^\s*\.lock_safe()' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client | grep 'let ' || true
 

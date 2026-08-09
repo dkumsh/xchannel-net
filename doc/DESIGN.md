@@ -308,6 +308,12 @@ dissemination lock for up to `R / rate`. Bounding *that* requires not holding th
 — a per-peer outbox, which the stream plane already has — and is post-0.3.0 work. The build-time
 assertion therefore covers the connect portion of a tick only, and says so.
 
+Two different failures get two different tests. A peer still accepting bytes is working, however slowly,
+and only its allowance judges it; a peer accepting **nothing** is wedged, and is cut off by a stall limit
+instead — an allowance sized for a whole payload is far too much rope for a peer that is not moving, which
+is how a single wedged peer held the control plane for 12.8 s on a 36 MiB burst. The stall limit sits well
+above a TCP retransmission timeout, so a healthy peer that briefly cannot accept anything keeps its link.
+
 A related ordering is load-bearing and easy to get backwards: a node **spawns its reader before** sending
 its own join, so that it drains its peer while writing. Both ends of a pair dial, so both adopt at once;
 without that, two nodes with a large registry fill each other's socket buffers, both hit the deadline,

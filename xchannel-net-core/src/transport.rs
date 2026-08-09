@@ -38,16 +38,37 @@ pub const MAX_FRAME_LEN: usize = 64 << 20; // 64 MiB
 /// The distinction is the whole point: `SO_SNDTIMEO` restarts on any syscall that moved a byte, so a
 /// slow or stalled peer can stretch one `write_all` without limit. Progress is required *and* the
 /// total is bounded.
+/// How long a peer may accept **nothing at all** before it is abandoned, whatever remains of its
+/// allowance.
+///
+/// Generous against transient stalls on purpose: a single TCP retransmission timeout is ~200 ms with the
+/// send buffer full, and a healthy peer that hits one must not lose its link for it. Must stay larger
+/// than the caller's per-syscall write timeout, which is how this loop learns that nothing moved.
+const STALL_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn write_all_by<W: Write>(
     w: &mut W,
     mut bytes: &[u8],
     deadline: std::time::Instant,
 ) -> io::Result<()> {
+    let mut last_progress = std::time::Instant::now();
     while !bytes.is_empty() {
-        if std::time::Instant::now() >= deadline {
+        let now = std::time::Instant::now();
+        if now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "peer did not accept the frame within its write budget",
+            ));
+        }
+        // **Two tests, because "too slow" and "not moving" are different failures.** A peer still
+        // accepting bytes is working, however slowly, and only its total allowance should judge it. A
+        // peer accepting *nothing* is wedged, and an allowance sized for a whole payload is far too much
+        // rope: waiting one out held the control plane for 12.8 s on a 36 MiB burst. Bounded by the stall
+        // instead, a wedged peer costs the same quarter-second whatever the payload.
+        if now.duration_since(last_progress) >= STALL_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer accepted nothing for the stall limit",
             ));
         }
         match w.write(bytes) {
@@ -57,8 +78,13 @@ fn write_all_by<W: Write>(
                     "peer accepted no bytes",
                 ));
             }
-            Ok(n) => bytes = &bytes[n..],
-            // The per-syscall timeout expiring is not itself fatal — the deadline above decides.
+            Ok(n) => {
+                bytes = &bytes[n..];
+                last_progress = std::time::Instant::now();
+            }
+            // A per-syscall timeout expiring is not itself fatal — the two checks above decide. It is
+            // also the only way this loop learns that nothing moved, which is why the slice has to be
+            // shorter than the stall limit.
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
             }
@@ -543,6 +569,36 @@ mod tests {
             took < budget * 4,
             "the frame took {took:?} against a {budget:?} budget — the bound is on the syscall \
              again, not on the frame"
+        );
+        drop(held.join().unwrap());
+    }
+
+    /// **A peer that accepts nothing is abandoned on the stall limit, not on its allowance.** The
+    /// allowance is sized for a whole payload, so waiting it out is what let one wedged peer hold the
+    /// control plane for 12.8 s on a 36 MiB burst. Bounded by a stall instead, the same peer costs a
+    /// quarter of a second whatever the payload.
+    #[test]
+    fn a_peer_that_accepts_nothing_is_abandoned_on_the_stall_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = std::thread::spawn(move || listener.accept().unwrap().0);
+        let mut conn = TcpTransport::connect(addr).unwrap();
+        conn.set_write_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+
+        // An allowance far larger than the stall limit: the stall is what must decide.
+        let big = vec![0u8; 32 << 20];
+        let started = std::time::Instant::now();
+        let err = conn
+            .send_frame_by(&big, started + std::time::Duration::from_secs(30))
+            .unwrap_err();
+        let took = started.elapsed();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "a wedged peer took {took:?} — it is being judged by its allowance rather than by the \
+             fact that it moved nothing"
         );
         drop(held.join().unwrap());
     }
