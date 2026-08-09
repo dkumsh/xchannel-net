@@ -61,6 +61,11 @@ pub enum ControlMsg {
         /// Where to open a peer link to the sender, so a node that learns of it can dial it and
         /// the mesh forms itself from any connected seed graph.
         control_addr: SocketAddr,
+        /// Human-readable label for the sender — logs, errors, listings, and nothing else. Never a
+        /// key, never a tie-break; a duplicate is confusing, not incorrect. It exists because an
+        /// auto-generated `NodeId` is unreadable, and an operator has to be able to tell which box
+        /// a message is about.
+        name: String,
     },
     /// What a peer knows *about a third node* — its addresses, and nothing about its liveness.
     ///
@@ -75,6 +80,7 @@ pub enum ControlMsg {
         node: NodeId,
         addr: SocketAddr,
         control_addr: SocketAddr,
+        name: String,
     },
     /// Registration was rejected because another registration won the name.
     RegisterRejected { name: ChannelName, winner: NodeId },

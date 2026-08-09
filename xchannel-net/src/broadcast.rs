@@ -32,14 +32,14 @@ type Inbox = Arc<Mutex<VecDeque<(PeerId, ChannelIdentity)>>>;
 /// Peer knowledge worth forwarding: `(source link, node, stream addr, control addr)`. Queued by
 /// reader threads (which cannot broadcast — the send halves live on the struct) and drained by
 /// [`BroadcastDissemination::relay_hints`].
-type Hints = Arc<Mutex<VecDeque<(PeerId, NodeId, SocketAddr, SocketAddr)>>>;
+type Hints = Arc<Mutex<VecDeque<(PeerId, NodeId, SocketAddr, SocketAddr, String)>>>;
 type SharedMembership = Arc<Mutex<Membership>>;
 /// Dial addresses of outbound peer links currently believed connected (for dedup +
 /// reconnection). An outbound peer's reader removes its address here on disconnect.
 type Connected = Arc<Mutex<HashSet<SocketAddr>>>;
 /// Which node sits at the far end of each link, learned from its first heartbeat. Written by
 /// reader threads; read when deduplicating links.
-type LinkPeers = Arc<Mutex<HashMap<PeerId, NodeId>>>;
+type LinkPeers = Arc<Mutex<HashMap<PeerId, (NodeId, SocketAddr)>>>;
 
 /// One peer link: the send half, plus what is needed to resolve a duplicate deterministically.
 struct Peer {
@@ -67,6 +67,8 @@ pub struct BroadcastDissemination {
     /// The control address this node advertises, so peers can dial it back and a node that
     /// learns of us second-hand can form a direct link.
     self_control_addr: SocketAddr,
+    /// Human-readable label for this node, gossiped for display only.
+    self_name: String,
     /// Send halves of peer connections, each with a stable id (broadcast target for
     /// deltas/heartbeats). Ids are stable across peer removal, unlike positions.
     peers: Vec<Peer>,
@@ -87,6 +89,7 @@ impl BroadcastDissemination {
             self_node,
             self_addr,
             self_control_addr: self_addr,
+            self_name: String::new(),
             liveness_timeout,
             peers: Vec::new(),
             next_peer_id: NO_PEER + 1,
@@ -161,7 +164,7 @@ impl BroadcastDissemination {
         send.send_frame(&encode_control(&self.heartbeat()))?;
         // Introduce everyone we already know, so a joiner learns the whole mesh from one link
         // instead of only its seed. Sent once per link, not periodically.
-        for (node, addr, control_addr) in self.membership.lock_safe().directory() {
+        for (node, addr, control_addr, name) in self.membership.lock_safe().directory() {
             if node == self.self_node {
                 continue;
             }
@@ -169,6 +172,7 @@ impl BroadcastDissemination {
                 node,
                 addr,
                 control_addr,
+                name,
             }))?;
         }
         self.peers.push(Peer {
@@ -192,12 +196,32 @@ impl BroadcastDissemination {
     /// knows, for each link, whether it dialled and who the peer is, so both compute the same
     /// initiator for the same link. The `PeerId` tie-break below is for two links with the same
     /// initiator, which `connected` already prevents; it exists only to make the ordering total.
-    pub fn dedup_links(&mut self) {
+    /// Returns any `NodeId` found on **two different machines** — see the note in the body.
+    pub fn dedup_links(&mut self) -> Vec<NodeId> {
         let ids = self.link_peers.lock_safe().clone();
         let self_node = self.self_node;
+
+        // **Two links claiming one id at different control addresses are not a duplicate link —
+        // they are a duplicate *identity*.** Collapsing them would be the worst possible response:
+        // it would drop connectivity to a real peer to tidy up a misconfiguration. The addresses
+        // make the distinction exact, with no heuristic: one machine advertises one control
+        // address, so two of them means two machines.
+        let mut addrs: HashMap<NodeId, HashSet<SocketAddr>> = HashMap::new();
+        for p in &self.peers {
+            if let Some(&(node, control)) = ids.get(&p.id) {
+                addrs.entry(node).or_default().insert(control);
+            }
+        }
+        let conflicted: HashSet<NodeId> = addrs
+            .iter()
+            .filter(|(_, a)| a.len() > 1)
+            .map(|(&n, _)| n)
+            .collect();
+
         let key = |p: &Peer| {
             ids.get(&p.id)
-                .map(|&node| (node, initiator(p, node, self_node)))
+                .filter(|(node, _)| !conflicted.contains(node))
+                .map(|&(node, _)| (node, initiator(p, node, self_node)))
         };
 
         // The winning (initiator, link) per node.
@@ -228,6 +252,7 @@ impl BroadcastDissemination {
             let _ = p.conn.shutdown();
         }
         self.peers = keep;
+        conflicted.into_iter().collect()
     }
 
     /// Nodes we currently hold a link to, by identity rather than by dial address — an inbound
@@ -237,7 +262,7 @@ impl BroadcastDissemination {
         let ids = self.link_peers.lock_safe();
         self.peers
             .iter()
-            .filter_map(|p| ids.get(&p.id).copied())
+            .filter_map(|p| ids.get(&p.id).map(|&(node, _)| node))
             .collect()
     }
 
@@ -252,6 +277,7 @@ impl BroadcastDissemination {
             node: self.self_node,
             addr: self.self_addr,
             control_addr: self.self_control_addr,
+            name: self.self_name.clone(),
         }
     }
 
@@ -260,7 +286,7 @@ impl BroadcastDissemination {
     /// with cycles goes quiet once everyone knows everyone.
     pub fn relay_hints(&mut self) {
         let pending: Vec<_> = self.hints.lock_safe().drain(..).collect();
-        for (from, node, addr, control_addr) in pending {
+        for (from, node, addr, control_addr, name) in pending {
             if node == self.self_node {
                 continue; // never gossip about ourselves second-hand; our heartbeat says it
             }
@@ -268,6 +294,7 @@ impl BroadcastDissemination {
                 node,
                 addr,
                 control_addr,
+                name,
             });
             self.send_except(from, &frame);
         }
@@ -282,6 +309,19 @@ impl BroadcastDissemination {
             .into_iter()
             .filter(|(node, control)| *node != self.self_node && !connected.contains(control))
             .collect()
+    }
+
+    /// Set the human-readable label gossiped with this node's heartbeat.
+    pub fn set_self_name(&mut self, name: String) {
+        self.self_name = name;
+    }
+
+    /// The label a peer advertised, if known.
+    pub fn name_of(&self, node: NodeId) -> Option<String> {
+        self.membership
+            .lock_safe()
+            .name_of(node)
+            .map(str::to_string)
     }
 
     /// Set the control address advertised to peers — used after binding the control listener to
@@ -394,10 +434,11 @@ fn spawn_reader(
                     node,
                     addr,
                     control_addr,
+                    name,
                 } => {
                     // A heartbeat is the only thing that says who is on the far end of this link,
                     // which is what makes duplicate links resolvable.
-                    link_peers.lock_safe().insert(id, node);
+                    link_peers.lock_safe().insert(id, (node, control_addr));
                     // Nothing assigns or enforces `NodeId`s, so a misconfiguration lands here.
                     // Say so once: a shared id makes two nodes indistinguishable in the membership
                     // map, in channel ownership, and in link deduplication — where it would drop
@@ -411,8 +452,13 @@ fn spawn_reader(
                             node.0
                         );
                     }
-                    if membership.lock_safe().record(node, addr, control_addr) {
-                        hints.lock_safe().push_back((id, node, addr, control_addr));
+                    if membership
+                        .lock_safe()
+                        .record(node, addr, control_addr, &name)
+                    {
+                        hints
+                            .lock_safe()
+                            .push_back((id, node, addr, control_addr, name));
                     }
                 }
                 // Hearsay: learn where the node is, but grant it no liveness — we have not heard
@@ -421,9 +467,15 @@ fn spawn_reader(
                     node,
                     addr,
                     control_addr,
+                    name,
                 } => {
-                    if membership.lock_safe().learn(node, addr, control_addr) {
-                        hints.lock_safe().push_back((id, node, addr, control_addr));
+                    if membership
+                        .lock_safe()
+                        .learn(node, addr, control_addr, &name)
+                    {
+                        hints
+                            .lock_safe()
+                            .push_back((id, node, addr, control_addr, name));
                     }
                 }
                 _ => {} // not expected on a peer link
@@ -545,6 +597,56 @@ mod tests {
             a.pump().unwrap().is_empty(),
             "the relay must skip the link it arrived on"
         );
+    }
+
+    /// Two machines claiming one `NodeId` must be **detected**, not tidied away. Dedup exists to
+    /// collapse two links to the *same* node; two links to *different* nodes that share an id look
+    /// identical to it, and collapsing them would drop connectivity to a real peer in order to
+    /// resolve a misconfiguration.
+    ///
+    /// The advertised control address is what makes the distinction exact rather than heuristic:
+    /// one machine advertises one control address, so two of them under one id means two machines.
+    #[test]
+    fn one_node_id_on_two_machines_is_reported_and_both_links_kept() {
+        let t = Duration::from_secs(60);
+        let mut hub = BroadcastDissemination::new(NodeId(1), "127.0.0.1:9101".parse().unwrap(), t);
+        // Two distinct nodes, both misconfigured as NodeId(7), at different control addresses.
+        let mut twin_a =
+            BroadcastDissemination::new(NodeId(7), "127.0.0.1:9107".parse().unwrap(), t);
+        twin_a.set_self_control_addr("127.0.0.1:9207".parse().unwrap());
+        let mut twin_b =
+            BroadcastDissemination::new(NodeId(7), "127.0.0.1:9108".parse().unwrap(), t);
+        twin_b.set_self_control_addr("127.0.0.1:9208".parse().unwrap());
+        link(&mut hub, &mut twin_a);
+        link(&mut hub, &mut twin_b);
+
+        // Wait until both links have identified themselves, then dedup.
+        let conflicts = poll_until(|| {
+            let c = hub.dedup_links();
+            (!c.is_empty()).then_some(c)
+        });
+        assert_eq!(conflicts, vec![NodeId(7)], "the duplicate id is reported");
+        assert_eq!(
+            hub.peers.len(),
+            2,
+            "both links survive — they are different machines, not a duplicate link"
+        );
+
+        // And it stays reported rather than being silently resolved on a later pass.
+        assert_eq!(hub.dedup_links(), vec![NodeId(7)]);
+        assert_eq!(hub.peers.len(), 2);
+    }
+
+    /// The cosmetic name rides the heartbeat and is readable back, so operator-facing messages can
+    /// say `fra-mm-01` instead of a random 64-bit number.
+    #[test]
+    fn a_peers_name_is_learned_from_its_heartbeat() {
+        let t = Duration::from_secs(60);
+        let mut a = BroadcastDissemination::new(NodeId(1), "127.0.0.1:9111".parse().unwrap(), t);
+        let mut b = BroadcastDissemination::new(NodeId(2), "127.0.0.1:9112".parse().unwrap(), t);
+        b.set_self_name("fra-mm-01".to_string());
+        link(&mut a, &mut b);
+        assert_eq!(poll_until(|| a.name_of(NodeId(2))), "fra-mm-01".to_string());
     }
 
     /// Spin briefly until `f` yields `Some` (reader threads run asynchronously).

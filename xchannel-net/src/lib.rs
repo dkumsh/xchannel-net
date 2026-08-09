@@ -14,6 +14,7 @@
 
 pub mod broadcast;
 pub mod node;
+pub mod node_identity;
 pub mod registry;
 mod util;
 
@@ -65,4 +66,14 @@ pub struct NodeConfig {
 
     /// How the duty cycle — and each promoted topic's own loop — waits when it finds no work.
     pub mux_idle: node::MuxIdle,
+
+    /// Human-readable label for this node, gossiped for display only — never a key, never a
+    /// tie-break. It exists because an auto-generated `NodeId` is unreadable, and an operator has
+    /// to be able to tell which machine a message is about.
+    pub node_name: String,
+
+    /// Whether `node_id` was **generated** by this daemon rather than supplied by the operator.
+    /// A generated id may be discarded if it turns out to be a duplicate and nothing references it
+    /// yet; a configured one is the operator's to fix.
+    pub id_generated: bool,
 }

@@ -44,6 +44,8 @@ fn client_creates_and_subscribes_via_daemon() {
         reclaim_after: Duration::from_secs(300),
         promoted_topics: Default::default(),
         mux_idle: MuxIdle::default(),
+        node_name: "client-rpc-test".to_string(),
+        id_generated: false,
     });
 
     let stream_l = node.bind_stream().unwrap();
@@ -129,6 +131,8 @@ fn client_lists_and_watches_channels() {
         reclaim_after: Duration::from_secs(300),
         promoted_topics: Default::default(),
         mux_idle: MuxIdle::default(),
+        node_name: "client-rpc-test".to_string(),
+        id_generated: false,
     });
     let client_l = node.bind_client().unwrap();
     {
@@ -193,6 +197,8 @@ fn subscribe_to_unknown_channel_times_out() {
         reclaim_after: Duration::from_secs(300),
         promoted_topics: Default::default(),
         mux_idle: MuxIdle::default(),
+        node_name: "client-rpc-test".to_string(),
+        id_generated: false,
     });
     let stream_l = node.bind_stream().unwrap();
     let client_l = node.bind_client().unwrap();

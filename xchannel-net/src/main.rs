@@ -17,9 +17,14 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn main() -> std::io::Result<()> {
-    let node_id = env_or("XCHANNELD_NODE_ID", "1")
-        .parse::<u64>()
-        .expect("XCHANNELD_NODE_ID must be a u64");
+    // A node's identity is generated once and kept in its data dir; `XCHANNELD_NODE_ID` overrides
+    // it for deployments that need deterministic ids. There is deliberately **no default**: the
+    // old `1` meant two unconfigured daemons silently shared an identity, and everything —
+    // channel ownership, membership, peer links — is keyed on it.
+    let configured_id = std::env::var("XCHANNELD_NODE_ID")
+        .ok()
+        .map(|v| v.parse::<u64>().expect("XCHANNELD_NODE_ID must be a u64"));
+    let node_name = std::env::var("XCHANNELD_NODE_NAME").ok();
     let stream_addr: SocketAddr = env_or("XCHANNELD_STREAM_ADDR", "127.0.0.1:7000")
         .parse()
         .expect("XCHANNELD_STREAM_ADDR must be host:port");
@@ -80,8 +85,45 @@ fn main() -> std::io::Result<()> {
         ..MuxIdle::default()
     };
 
+    // The data dir must exist before the identity is resolved: a first-ever start *writes*
+    // `.node_id` into it.
+    std::fs::create_dir_all(&data_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    // Channels on disk but no identity file means the id was removed while its data was kept.
+    // That is not the same as a fresh node: the channels will be re-registered under a *new* owner
+    // with a later timestamp, peers will keep the earlier registration, and those channels end up
+    // owned by an id that never returns — frozen until an operator reclaims the names. Warn before
+    // generating, because after this point it has already happened.
+    let had_channels = std::fs::read_dir(&data_dir)
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))
+        })
+        .unwrap_or(false);
+    if had_channels
+        && configured_id.is_none()
+        && !xchannel_net::node_identity::is_persisted(&data_dir)
+    {
+        eprintln!(
+            "xchanneld: WARNING: {} holds channels but no {} — this node is about to take a NEW \
+             identity, and peers that remember the old owner will keep those channels registered \
+             to it, leaving them frozen. If this is a fresh node, clear the data dir; if it is the \
+             same node, restore its identity file.",
+            data_dir.display(),
+            xchannel_net::node_identity::NODE_ID_FILE,
+        );
+    }
+
+    let identity = xchannel_net::node_identity::resolve(&data_dir, configured_id, node_name)
+        .expect("resolve this node's identity");
+    let node_id = identity.id.0;
+
     let config = NodeConfig {
-        node_id: NodeId(node_id),
+        node_id: identity.id,
         data_dir,
         control_addr,
         stream_addr,
@@ -90,13 +132,9 @@ fn main() -> std::io::Result<()> {
         reclaim_after,
         promoted_topics,
         mux_idle,
+        node_name: identity.name.clone(),
+        id_generated: identity.generated,
     };
-    std::fs::create_dir_all(&config.data_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))?;
-    }
 
     // Single-daemon-per-data_dir guard: hold an exclusive advisory lock on `<data_dir>/.lock`
     // for the life of the process. Two daemons sharing a data dir would corrupt each other's
@@ -126,6 +164,17 @@ fn main() -> std::io::Result<()> {
     let stream_listener = node.bind_stream()?;
     let control_listener = node.bind_control()?;
     let client_listener = node.bind_client()?;
+    eprintln!(
+        "xchanneld[{}]: node {} ({}), created {}",
+        node_id,
+        identity.name,
+        if identity.generated {
+            "generated"
+        } else {
+            "configured"
+        },
+        identity.created_at_ms,
+    );
     eprintln!(
         "xchanneld[{}]: stream {} | control {} | client {}",
         node_id,

@@ -7,6 +7,46 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 ## Unreleased
 
 ### Added
+- **A node generates its own identity; no configuration needed to join.** `XCHANNELD_NODE_ID` used
+  to default to `1`, so two unconfigured daemons silently shared an identity — and everything is
+  keyed on it: channel ownership, the collision tiebreak, membership, and now peer links. There is
+  no default any more. A node generates 64 random bits from `/dev/urandom` on first start and keeps
+  them in `<data_dir>/.node_id` (dot-prefixed, so no channel name can collide), alongside the time
+  it was created. `XCHANNELD_NODE_ID` still overrides, for deployments that need deterministic ids.
+
+  This is the durable state `DESIGN.md` §5 already sanctions — "the only durable node-owned state is
+  stable `NodeId` + config" — and the id belongs with the data directory because that is what
+  defines the node: the channels it owns live there.
+
+  **Uniqueness is probabilistic, backed by exact detection.** It cannot be guaranteed without a
+  coordinator, and the design rules out both a central registry and consensus at join. Across 100
+  nodes the chance any two random ids collide is ~3 × 10⁻¹⁶ — far below the chance of undetected
+  corruption in the data being replicated. Deliberately **not** a timestamp: a nanosecond clock
+  reading's entropy is only the spread of start times, so it fails hardest in the case that matters
+  (a fleet provisioned together, sharing a clocksource), it inherits the clock's ability to move
+  backwards, and the ordering it would buy is worth nothing — `NodeId` order breaks a name collision
+  only when two `registered_at_nanos` are *exactly* equal.
+
+- **Two machines claiming one `NodeId` are now detected exactly, and both links are kept.** The
+  advertised control address makes it provable rather than heuristic: one machine advertises one
+  control address, so two under one id means two machines. `dedup_links` previously collapsed them
+  — dropping connectivity to a real peer in order to tidy away a misconfiguration. It now reports
+  them and leaves both links alone. If the reporting node's own id was *generated* and it owns
+  nothing yet, it discards the id so the next start takes a fresh one; that rescues the likely
+  copying accident, a golden image snapshotted after first start, where every clone shares an id and
+  owns nothing. Once a node owns a channel, changing its id would orphan it, so past that point this
+  can only warn.
+
+- **A cosmetic node name and creation time**, gossiped with the heartbeat and stored in membership.
+  `XCHANNELD_NODE_NAME`, defaulting to the hostname. Never a key, never a tie-break — a duplicate
+  name is confusing, not incorrect. It exists because an auto-generated id is unreadable, so without
+  it automatic identity would be a downgrade for whoever operates this: `owner of 'fills.prod.mm'
+  (node 14523907234)` becomes `(node fra-mm-01)`.
+
+- **A warning when a data directory holds channels but no `.node_id`.** Removing the id file while
+  keeping the data is not the same as a fresh node: the channels are re-registered under a new owner
+  with a later timestamp, peers keep the earlier registration, and those channels end up owned by an
+  id that never returns — frozen until an operator reclaims the names.
 - **The mesh forms itself.** Peers were previously exactly what you configured: a node dialled its
   `XCHANNELD_SEEDS` and accepted whoever dialled it, and that was the whole membership. Nothing was
   relayed — a heartbeat updated local membership and stopped there, and a registry delta merged

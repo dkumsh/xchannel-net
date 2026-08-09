@@ -367,8 +367,9 @@ pub struct Node {
 
 impl Node {
     pub fn new(config: NodeConfig) -> Self {
-        let dissemination =
+        let mut dissemination =
             BroadcastDissemination::new(config.node_id, config.stream_addr, LIVENESS_TIMEOUT);
+        dissemination.set_self_name(config.node_name.clone());
         Self {
             hosted: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(Mutex::new(Registry::new())),
@@ -430,7 +431,7 @@ impl Node {
                 io::ErrorKind::ResourceBusy,
                 format!(
                     "owner of '{name}' (node {}) is a live member — it has not gone anywhere",
-                    id.owner.0
+                    self.label(id.owner)
                 ),
             ));
         }
@@ -1404,6 +1405,63 @@ impl Node {
     /// (Re)connect to any configured seed peer not currently linked. Called at startup and
     /// each maintenance tick, so a dropped seed link is re-established. Uses a bounded dial
     /// timeout so a down seed doesn't stall the loop.
+    /// A node's label for messages a person reads: its name if it advertised one, else its id.
+    fn label(&self, node: NodeId) -> String {
+        match self.dissemination.lock_safe().name_of(node) {
+            Some(name) => format!("{name} ({})", node.0),
+            None => node.0.to_string(),
+        }
+    }
+
+    /// Two machines are using one `NodeId`. Say so, and — if our own id was generated and we own
+    /// nothing yet — discard it so the next start picks a fresh one.
+    ///
+    /// Discarding is safe **only** while nothing references the id. Once this node owns a channel,
+    /// changing its id would leave those channels registered to an owner that never comes back:
+    /// peers keep the earlier registration, it wins the merge, and the channels are frozen until
+    /// an operator reclaims the names. So past that point this can only warn.
+    ///
+    /// The case this actually rescues is a golden image snapshotted after the daemon's first start
+    /// — every clone carries the same `.node_id` and owns nothing, so every clone but one steps
+    /// aside on its own.
+    fn report_duplicate_identity(&self, conflicts: &[NodeId]) {
+        for node in conflicts {
+            eprintln!(
+                "xchanneld[{}]: WARNING: two peers claim NodeId {} at different control \
+                 addresses — NodeIds must be unique. Channel ownership, membership and peer links \
+                 are all keyed on them. Most likely a copied data directory or a cloned image.",
+                self.config.node_id.0, node.0
+            );
+        }
+        if !conflicts.contains(&self.config.node_id) {
+            return; // someone else's collision; nothing safe for us to do about it
+        }
+        if !self.config.id_generated {
+            eprintln!(
+                "xchanneld[{}]: its id was set explicitly (XCHANNELD_NODE_ID), so this daemon \
+                 will not change it — resolve the duplicate and restart.",
+                self.config.node_id.0
+            );
+            return;
+        }
+        if !self.hosted.lock_safe().is_empty() {
+            eprintln!(
+                "xchanneld[{}]: this daemon already owns channels, so changing its id would \
+                 orphan them — resolve the duplicate manually.",
+                self.config.node_id.0
+            );
+            return;
+        }
+        match crate::node_identity::discard(&self.config.data_dir) {
+            Ok(()) => eprintln!(
+                "xchanneld[{}]: it owns nothing yet, so its generated id has been discarded; \
+                 restart to take a fresh one.",
+                self.config.node_id.0
+            ),
+            Err(e) => eprintln!("xchanneld: could not discard the node id: {e}"),
+        }
+    }
+
     /// Whether to dial `addr` — no if a dial is already outstanding or in place, and no if we
     /// already hold a link to whatever node lives there.
     ///
@@ -1477,9 +1535,17 @@ impl Node {
                 // Forward peer knowledge learned since the last tick, so the mesh keeps closing
                 // itself; only knowledge that was *new* to us is queued, so this goes quiet.
                 d.relay_hints();
-                // Collapse any duplicate links the cross-dial race produced.
-                d.dedup_links();
-                d.pump()?
+                // Collapse any duplicate links the cross-dial race produced. Anything it reports
+                // is not a duplicate *link* but a duplicate *identity* — two machines claiming one
+                // `NodeId`.
+                let conflicts = d.dedup_links();
+                if !conflicts.is_empty() {
+                    drop(d);
+                    self.report_duplicate_identity(&conflicts);
+                    self.dissemination.lock_safe().pump()?
+                } else {
+                    d.pump()?
+                }
             };
             if !pumped.is_empty() {
                 let mut retired = Vec::new();
@@ -2358,6 +2424,8 @@ mod tests {
             reclaim_after: Duration::from_millis(0),
             promoted_topics: Default::default(),
             mux_idle: MuxIdle::default(),
+            node_name: format!("test-{id}"),
+            id_generated: false,
         }
     }
 
@@ -2622,7 +2690,7 @@ mod tests {
         let control: SocketAddr = "127.0.0.1:7001".parse().unwrap();
         let timeout = Duration::from_secs(60);
 
-        assert!(m.learn(NodeId(9), stream, control), "new to us");
+        assert!(m.learn(NodeId(9), stream, control, "n9"), "new to us");
         assert_eq!(
             m.known_peers(),
             vec![(NodeId(9), control)],
@@ -2637,11 +2705,11 @@ mod tests {
         assert_eq!(m.silent_for(NodeId(9)), None, "never heard from directly");
 
         // A direct heartbeat is what makes it live.
-        m.record(NodeId(9), stream, control);
+        m.record(NodeId(9), stream, control, "n9");
         assert_eq!(m.live_addr_of(NodeId(9), timeout), Some(stream));
 
         // And later hearsay must not undo that.
-        m.learn(NodeId(9), stream, control);
+        m.learn(NodeId(9), stream, control, "n9");
         assert_eq!(
             m.live_addr_of(NodeId(9), timeout),
             Some(stream),

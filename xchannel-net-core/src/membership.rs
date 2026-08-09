@@ -18,6 +18,9 @@ struct Member {
     /// Control-plane address — where to open a peer link, so a node learned second-hand can
     /// be dialled and become a direct peer.
     control_addr: SocketAddr,
+    /// Human-readable label, for messages an operator reads. Cosmetic only — never a key, never a
+    /// tie-break, so a duplicate is confusing rather than incorrect.
+    name: String,
     /// When this node was last heard from **directly**. `None` for a node known only by
     /// hearsay: a peer told us it exists, but we have never had a link to it.
     ///
@@ -47,7 +50,13 @@ impl Membership {
     /// Returns whether this taught us something new — an unknown node, or one that moved.
     /// The caller relays on `true` and stays quiet on `false`, which is what stops a steady
     /// stream of heartbeats from becoming a steady stream of relays.
-    pub fn record(&mut self, node: NodeId, addr: SocketAddr, control_addr: SocketAddr) -> bool {
+    pub fn record(
+        &mut self,
+        node: NodeId,
+        addr: SocketAddr,
+        control_addr: SocketAddr,
+        name: &str,
+    ) -> bool {
         let novel = self
             .members
             .get(&node)
@@ -57,6 +66,7 @@ impl Membership {
             Member {
                 addr,
                 control_addr,
+                name: name.to_string(),
                 last_seen: Some(Instant::now()),
             },
         );
@@ -69,12 +79,19 @@ impl Membership {
     /// Never downgrades an existing entry: if we already have a direct link to this node, its
     /// `last_seen` is preserved, so hearsay can refresh an address without ever making a node
     /// look less reachable than it is.
-    pub fn learn(&mut self, node: NodeId, addr: SocketAddr, control_addr: SocketAddr) -> bool {
+    pub fn learn(
+        &mut self,
+        node: NodeId,
+        addr: SocketAddr,
+        control_addr: SocketAddr,
+        name: &str,
+    ) -> bool {
         match self.members.get_mut(&node) {
             Some(m) => {
                 let novel = m.addr != addr || m.control_addr != control_addr;
                 m.addr = addr;
                 m.control_addr = control_addr;
+                m.name = name.to_string();
                 novel
             }
             None => {
@@ -83,6 +100,7 @@ impl Membership {
                     Member {
                         addr,
                         control_addr,
+                        name: name.to_string(),
                         last_seen: None,
                     },
                 );
@@ -93,11 +111,19 @@ impl Membership {
 
     /// Everything we know about every node: `(node, stream addr, control addr)`. Sent once to a
     /// newly adopted peer so a joiner learns the whole mesh from a single seed link.
-    pub fn directory(&self) -> Vec<(NodeId, SocketAddr, SocketAddr)> {
+    pub fn directory(&self) -> Vec<(NodeId, SocketAddr, SocketAddr, String)> {
         self.members
             .iter()
-            .map(|(&n, m)| (n, m.addr, m.control_addr))
+            .map(|(&n, m)| (n, m.addr, m.control_addr, m.name.clone()))
             .collect()
+    }
+
+    /// The human-readable label for `node`, if known and non-empty. Used only in messages.
+    pub fn name_of(&self, node: NodeId) -> Option<&str> {
+        self.members
+            .get(&node)
+            .map(|m| m.name.as_str())
+            .filter(|n| !n.is_empty())
     }
 
     /// Which node is reachable at `control` — the reverse of [`known_peers`](Self::known_peers),
@@ -193,8 +219,8 @@ mod tests {
     #[test]
     fn records_and_resolves_addresses() {
         let mut m = Membership::new();
-        m.record(NodeId(1), addr(7001), addr(7001 + 1000));
-        m.record(NodeId(2), addr(7002), addr(7002 + 1000));
+        m.record(NodeId(1), addr(7001), addr(7001 + 1000), "n");
+        m.record(NodeId(2), addr(7002), addr(7002 + 1000), "n");
         assert_eq!(m.addr_of(NodeId(1)), Some(addr(7001)));
         assert_eq!(m.addr_of(NodeId(2)), Some(addr(7002)));
         assert_eq!(m.addr_of(NodeId(3)), None);
@@ -204,8 +230,8 @@ mod tests {
     #[test]
     fn latest_heartbeat_wins_on_address_change() {
         let mut m = Membership::new();
-        m.record(NodeId(1), addr(7001), addr(7001 + 1000));
-        m.record(NodeId(1), addr(8001), addr(8001 + 1000)); // restarted on a new port
+        m.record(NodeId(1), addr(7001), addr(7001 + 1000), "n");
+        m.record(NodeId(1), addr(8001), addr(8001 + 1000), "n"); // restarted on a new port
         assert_eq!(m.addr_of(NodeId(1)), Some(addr(8001)));
         assert_eq!(m.len(), 1);
     }
@@ -213,7 +239,7 @@ mod tests {
     #[test]
     fn liveness_expires_after_timeout() {
         let mut m = Membership::new();
-        m.record(NodeId(1), addr(7001), addr(7001 + 1000));
+        m.record(NodeId(1), addr(7001), addr(7001 + 1000), "n");
         assert_eq!(m.live_members(Duration::from_secs(60)), vec![NodeId(1)]);
 
         std::thread::sleep(Duration::from_millis(20));
@@ -228,7 +254,7 @@ mod tests {
     #[test]
     fn live_addr_of_gates_on_liveness() {
         let mut m = Membership::new();
-        m.record(NodeId(1), addr(7001), addr(7001 + 1000));
+        m.record(NodeId(1), addr(7001), addr(7001 + 1000), "n");
         // Fresh: live_addr_of returns the address.
         assert_eq!(
             m.live_addr_of(NodeId(1), Duration::from_secs(60)),

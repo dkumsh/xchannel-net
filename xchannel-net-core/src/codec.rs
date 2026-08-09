@@ -237,21 +237,25 @@ pub fn encode_control_into(buf: &mut Vec<u8>, m: &ControlMsg) {
             node,
             addr,
             control_addr,
+            name,
         } => {
             w.u8(control_tag::HEARTBEAT);
             w.u64(node.0);
             w.addr(*addr);
             w.addr(*control_addr);
+            w.str(name);
         }
         ControlMsg::PeerHint {
             node,
             addr,
             control_addr,
+            name,
         } => {
             w.u8(control_tag::PEER_HINT);
             w.u64(node.0);
             w.addr(*addr);
             w.addr(*control_addr);
+            w.str(name);
         }
         ControlMsg::RegisterRejected { name, winner } => {
             w.u8(control_tag::REGISTER_REJECTED);
@@ -282,11 +286,13 @@ pub fn decode_control(bytes: &[u8]) -> io::Result<ControlMsg> {
             node: NodeId(r.u64()?),
             addr: r.addr()?,
             control_addr: r.addr()?,
+            name: r.str()?,
         },
         control_tag::PEER_HINT => ControlMsg::PeerHint {
             node: NodeId(r.u64()?),
             addr: r.addr()?,
             control_addr: r.addr()?,
+            name: r.str()?,
         },
         control_tag::REGISTER_REJECTED => ControlMsg::RegisterRejected {
             name: r.str()?,
@@ -773,11 +779,13 @@ mod tests {
                 node: NodeId(7),
                 addr: "10.0.0.4:7000".parse().unwrap(),
                 control_addr: "10.0.0.4:7001".parse().unwrap(),
+                name: "fra-mm-01".to_string(),
             },
             ControlMsg::Heartbeat {
                 node: NodeId(42),
                 addr: "127.0.0.1:7000".parse().unwrap(),
                 control_addr: "127.0.0.1:7001".parse().unwrap(),
+                name: "node-42".to_string(),
             },
             ControlMsg::RegisterRejected {
                 name: "dup".into(),
@@ -940,6 +948,7 @@ mod tests {
             node: NodeId(1),
             addr: "127.0.0.1:1".parse().unwrap(),
             control_addr: "127.0.0.1:7001".parse().unwrap(),
+            name: "node-42".to_string(),
         });
         bytes.push(0xAB);
         assert!(decode_control(&bytes).is_err());

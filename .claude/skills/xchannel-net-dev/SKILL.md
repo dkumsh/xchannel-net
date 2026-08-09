@@ -417,11 +417,20 @@ Follow-up (perf, not correctness): reconstruct double-scans each topic.
 - Client RPC surfaces `create_topic`/`publish_to_topic`; `deregister_topic`/`topic_status` are
   Node APIs (thin client-RPC wrappers are a trivial future add).
 
-**`NodeId` uniqueness is unenforced.** `XCHANNELD_NODE_ID`, default **`1`** — so two unconfigured
-daemons collide. Everything is keyed on it: membership (addresses overwrite each other), channel
-ownership + the collision tiebreak, and link dedup (would drop the link between two distinct
-peers). A node warns once if it hears its own id from a peer; a duplicate between two *other* nodes
-is undetectable locally. Operator's job.
+**`NodeId` is self-assigned** (`node_identity.rs`): 64 random bits from `/dev/urandom` on first
+start, persisted in `<data_dir>/.node_id` as `key=value` with `created_at_ms`. **No default** —
+`XCHANNELD_NODE_ID` overrides for deterministic deployments. Uniqueness is probabilistic (~3×10⁻¹⁶
+at 100 nodes) and cannot be guaranteed without a coordinator the design rules out. **Not** a
+timestamp: entropy would be only the spread of start times, worst exactly when a fleet is
+provisioned together, and the ordering buys nothing (`NodeId` breaks a name collision only on an
+exact `registered_at_nanos` tie).
+**Detection is exact**: two links reporting one id at *different control addresses* = two machines;
+`dedup_links` reports them and **keeps both links** (collapsing them would drop a real peer to tidy
+a misconfiguration). If our own generated id is the duplicate and we own nothing, discard it and
+restart — that rescues the golden-image case. Once we own a channel, changing the id would orphan
+it, so it only warns.
+**`XCHANNELD_NODE_NAME`** (default: hostname) is cosmetic — gossiped, stored in membership, used in
+messages only. Never a key or tie-break. It exists because a random id is unreadable.
 
 ## Security
 
