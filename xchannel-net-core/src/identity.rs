@@ -27,6 +27,15 @@ pub struct ChannelIdentity {
     /// Earliest record index still retained at the source. Because we always pull
     /// full history, this tells a subscriber whether it received true genesis (0) or
     /// a retention-truncated start.
+    ///
+    /// **Currently always `0`, and it could not be kept current if it were not.** The merge below
+    /// is a total order on the *key* — `(epoch, deleted, registered_at_nanos, NodeId)` — none of
+    /// which changes when an owner's retention moves the floor, so a re-registration carrying a new
+    /// value ties with the entry already held and is discarded. Nothing depends on it today: the
+    /// authoritative retention floor reaches a subscriber in `SubscribeAck.start`, computed live
+    /// from the source's own log at subscribe time, and that is what a `Gap` is reported against.
+    /// Making this field mean anything would need the merge to consider it — which is a change to
+    /// the CRDT, not to the registration path.
     pub earliest_index: RecordIndex,
 
     // --- registration tiebreak (deterministic first-registrant-wins) ---

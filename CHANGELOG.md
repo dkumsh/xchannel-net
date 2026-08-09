@@ -228,6 +228,12 @@ Everything from here down was found by a pre-release review of the four changes 
   dissemination lock, so a local registration in between broadcast its delta to the peers that existed
   at that moment — not the one being adopted — and then handed the new peer a snapshot from before the
   change. The delta was lost to it until some later reconnect. The snapshot is now taken under the lock.
+- Two error messages that named no path: binding the client socket now says *which* path was too long
+  for `SUN_LEN` (the path is derived from the data directory, so it is not in front of whoever reads
+  the message), and `ChannelIdentity::earliest_index` is documented as the dead field it currently is —
+  the merge is a total order on the registration *key*, so a re-registration carrying a new retention
+  floor ties with the entry already held and is discarded. Nothing depends on it: the authoritative
+  floor reaches a subscriber in `SubscribeAck.start`, computed live at subscribe time.
 - `signal(2)` is declared with its real signature (`Option<extern "C" fn(i32)>`) rather than a `usize`
   the compiler could not check, and `SIG_DFL` needs no magic constant.
 - **`XCHANNELD_CLIENT_PATH` outside the data dir killed startup.** Binding the client plane chmod'ed

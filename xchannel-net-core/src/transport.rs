@@ -417,9 +417,14 @@ pub struct UnixListener {
 #[cfg(unix)]
 impl UnixListener {
     pub fn bind<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
-        Ok(Self {
-            inner: std::os::unix::net::UnixListener::bind(path)?,
-        })
+        let path = path.as_ref();
+        // Name the path in the error. A Unix socket address has a hard length limit (~104 bytes)
+        // and `bind` reports exceeding it as a bare "path must be shorter than SUN_LEN", which says
+        // nothing about *which* path — and the path is usually derived (data dir + `client.sock`),
+        // so it is not in front of whoever reads the message either.
+        std::os::unix::net::UnixListener::bind(path)
+            .map(|inner| Self { inner })
+            .map_err(|e| io::Error::new(e.kind(), format!("binding {}: {e}", path.display())))
     }
 }
 
