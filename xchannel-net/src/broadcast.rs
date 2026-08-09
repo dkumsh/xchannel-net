@@ -115,7 +115,13 @@ const PEER_SMALL_FRAME_BUDGET: Duration = Duration::from_millis(50);
 /// a member with a 48-character name and a 48-character topic by about 12 %.
 fn burst_deadline(bytes: usize) -> Instant {
     let allowed = Duration::from_micros((bytes as u64).saturating_mul(1_000_000) / MIN_DRAIN_RATE);
-    Instant::now() + allowed.max(PEER_BURST_MIN)
+    // The ceiling is defensive arithmetic, not policy. `Instant + Duration` panics on overflow, and a
+    // saturating multiply feeding it could produce a duration measured in geological time; an hour is
+    // already 14 GB at this rate, far past any registry that fits in memory, so no realistic payload is
+    // affected. The *absence* of a policy ceiling is deliberate and documented on `MIN_DRAIN_RATE`: a
+    // real ceiling would drop healthy peers again, which is the whole thing this shape avoids.
+    let allowed = allowed.clamp(PEER_BURST_MIN, Duration::from_secs(3600));
+    Instant::now() + allowed
 }
 
 /// Identities per control frame.
