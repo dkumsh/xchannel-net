@@ -458,8 +458,11 @@ planes, signed `ChannelIdentity` (don't trust `registered_at_nanos`/`owner`), au
    one reply). The one genuinely open piece of `RegisterRejected`.
 3. **Membership pruning** — `Membership::forget_stale` exists but nothing calls it; the
    maintenance loop could prune dead peers.
-4. **Observability / graceful shutdown** — daemon loops swallow errors (`let _ =`); no
-   logging or clean shutdown.
+4. **Observability** — daemon loops swallow errors (`let _ =`); no logging beyond startup
+   warnings. (Graceful shutdown is done: `shutdown.rs` handles SIGTERM/SIGINT, announces
+   `ControlMsg::Leaving` so peers drop the node without waiting out `LIVENESS_TIMEOUT`, and removes
+   the client socket. It is **courtesy, not safety** — a hard kill was already safe, which the
+   READMEs now advertise as a feature.)
 
 ## Open questions (see DESIGN.md §8)
 

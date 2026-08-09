@@ -107,10 +107,17 @@ const CHANNEL_LOG_FILE: &str = "log";
 
 /// Create a directory (and parents) and restrict it to the owner (`0700` on Unix), so
 /// other local users can't read channel files beneath it.
+///
+/// Only a directory this call **creates** is chmod'ed. Tightening one that already existed is not
+/// ours to do and can fail outright: `XCHANNELD_CLIENT_PATH` may legitimately point at a shared
+/// directory, and chmod'ing e.g. `/tmp` to `0700` fails with `EPERM` and took the whole daemon
+/// down with it. The data dir itself is still restricted explicitly at startup, and every directory
+/// holding channel bytes is created here, so nothing loses protection.
 fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    let existed = path.is_dir();
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]
-    {
+    if !existed {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
@@ -1405,6 +1412,18 @@ impl Node {
     /// (Re)connect to any configured seed peer not currently linked. Called at startup and
     /// each maintenance tick, so a dropped seed link is re-established. Uses a bounded dial
     /// timeout so a down seed doesn't stall the loop.
+    /// Shut down cleanly: tell peers we are leaving so they stop treating this node's channels as
+    /// reachable, and remove the client socket so nothing is left claiming to be a live daemon.
+    ///
+    /// Everything else needs no unwinding. Records already committed are durable in their mmap,
+    /// merge cursors are recomputed from the topic log on the next start rather than saved, a
+    /// subscriber resumes from its own replica head, and the data-dir lock is released by the OS.
+    /// That is why a hard kill is safe, and why this function is short.
+    pub fn shutdown(&self) {
+        self.dissemination.lock_safe().announce_leaving();
+        let _ = std::fs::remove_file(&self.config.client_path);
+    }
+
     /// A node's label for messages a person reads: its name if it advertised one, else its id.
     fn label(&self, node: NodeId) -> String {
         match self.dissemination.lock_safe().name_of(node) {
@@ -2676,6 +2695,35 @@ mod tests {
                 "the surviving link must not be dropped by a later dedup pass"
             );
         }
+    }
+
+    /// A clean shutdown makes a peer drop the departing node from its live set **at once**,
+    /// instead of waiting out `LIVENESS_TIMEOUT`. That is the whole point of announcing it: for ten
+    /// seconds otherwise, a subscriber keeps believing the departed node's channels are reachable
+    /// and keeps trying to replicate from them.
+    #[test]
+    fn a_clean_shutdown_makes_peers_drop_the_node_immediately() {
+        let (a, _a_stream, a_control) = start(96, "leave-a");
+        let (b, _b_stream, _b_control) = start_seeded(97, "leave-b", &[a_control]);
+
+        // B sees A as live once their link is up.
+        poll_until(|| b.dissemination.lock_safe().live_addr_of(NodeId(96)));
+
+        a.shutdown();
+
+        // ...and stops, without ten seconds passing. The address is retained — B still knows where
+        // A was, it just knows A is gone.
+        poll_until(|| {
+            b.dissemination
+                .lock_safe()
+                .live_addr_of(NodeId(96))
+                .is_none()
+                .then_some(())
+        });
+        assert!(
+            b.dissemination.lock_safe().node_at(a_control).is_some(),
+            "a departure forgets liveness, not the address"
+        );
     }
 
     /// Hearsay teaches an address but must never confer liveness. `live_members` has to keep

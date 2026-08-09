@@ -47,6 +47,36 @@ unbuilt (`StreamId` is hardcoded to `0`); and there is no consumer-group or log-
 equivalent. §0 of [`doc/DESIGN.md`](doc/DESIGN.md) is the authoritative
 implemented / partial / not-yet map.
 
+## Crash safety
+
+**Killing a node is not dangerous.** `kill -9`, a panic, a power cut, a reboot mid-write — none of
+them corrupt anything, and none of them lose a record that was committed. That is a property of the
+architecture rather than a recovery procedure, and it is worth stating plainly because it is unusual:
+
+- **The manager is never in the writer's path.** A producer commits into its own memory-mapped log;
+  the daemon only tails it to forward. Kill the daemon and the producer keeps writing at full speed
+  and loses nothing — there is no buffer of yours in its memory, because it never takes custody of
+  your data ([`doc/DESIGN.md`](doc/DESIGN.md) §5).
+- **Nothing important is only in RAM.** Committed records are durable in the mmap. A kill part-way
+  through a commit leaves a slot the reopen path resolves.
+- **Positions are recomputed, not saved.** A topic's per-producer merge cursors are derived from the
+  topic's own log; a subscriber resumes from its replica's own head. There is no cursor file to be
+  stale, torn, or out of step with the data it describes.
+- **Restart rebuilds rather than restores.** A daemon coming back scans its data directory, asks its
+  peers, and lets clients reconnect. The only durable state it owns is its identity and its config,
+  so there is no metadata store to corrupt.
+
+The test suite asserts this rather than assuming it: cross-process tests `SIGKILL` a running daemon
+mid-stream and require every producer to resume contiguously, with no duplicated and no missing
+records.
+
+`SIGTERM` and `SIGINT` are handled too, but only as a courtesy: a departing node tells its peers so
+they stop treating its channels as reachable at once instead of waiting out the ten-second liveness
+timeout. It exists for promptness, not for safety — there is nothing it has to unwind.
+
+What a hard kill *does* cost is time. Peers take up to ten seconds to notice, and a subscriber
+re-sends whatever was in flight. Prefer `SIGTERM`; reach for `SIGKILL` without anxiety.
+
 ## Workspace
 
 | Crate | Role |

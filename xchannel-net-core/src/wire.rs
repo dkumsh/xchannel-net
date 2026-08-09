@@ -82,6 +82,14 @@ pub enum ControlMsg {
         control_addr: SocketAddr,
         name: String,
     },
+    /// The sender is shutting down cleanly. Receivers mark it not-live at once instead of waiting
+    /// out the heartbeat liveness timeout, so subscribers stop trying to replicate from its
+    /// channels a round trip after it leaves rather than ten seconds after.
+    ///
+    /// Purely an optimisation: a node that dies without sending it is discovered by timeout exactly
+    /// as before. Nothing about correctness depends on a departure being announced — the daemon is
+    /// not in its writers' path, so its absence loses nothing (DESIGN.md §5).
+    Leaving { node: NodeId },
     /// Registration was rejected because another registration won the name.
     RegisterRejected { name: ChannelName, winner: NodeId },
 }

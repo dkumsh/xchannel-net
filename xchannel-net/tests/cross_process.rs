@@ -26,6 +26,21 @@ impl Drop for Daemon {
     }
 }
 
+impl Daemon {
+    /// Wait for the daemon to exit of its own accord, up to `timeout`.
+    fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.0.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+}
+
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let mut d = std::env::temp_dir();
     d.push(format!("xchnet-xproc-{name}"));
@@ -405,6 +420,58 @@ fn subscriptions_do_not_cost_the_daemon_a_thread_each() {
          {baseline}) — connections are still costing a thread each"
     );
     eprintln!("daemon threads: {baseline} idle -> {threads} with {SUBSCRIBERS} live subscriptions");
+}
+
+/// `SIGTERM` is handled: the daemon exits of its own accord, successfully, and takes its client
+/// socket with it.
+///
+/// Worth testing end to end because the handler is hand-rolled — the project has no `libc`
+/// dependency, so `signal(2)` is declared against the C runtime directly, and "did the signal
+/// actually reach a handler" is not something a unit test on the flag can answer.
+#[test]
+fn sigterm_shuts_the_daemon_down_cleanly() {
+    let data_dir = temp_dir("sigterm");
+    // A short socket path: a Unix socket address has a hard length limit that the temp dir plus a
+    // long test name can exceed.
+    let client_path = std::path::PathBuf::from("/tmp/xchnet-sigterm.sock");
+    let _ = std::fs::remove_file(&client_path);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xchanneld"))
+        .env("XCHANNELD_DATA_DIR", &data_dir)
+        .env("XCHANNELD_CLIENT_PATH", &client_path)
+        .env("XCHANNELD_STREAM_ADDR", "127.0.0.1:0")
+        .env("XCHANNELD_CONTROL_ADDR", "127.0.0.1:0")
+        .spawn()
+        .expect("spawn xchanneld");
+    let pid = child.id();
+
+    // Wait until it is actually serving, so the signal is not racing startup.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "daemon never bound its client plane"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let sent = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(sent.success());
+
+    let mut daemon = Daemon(child);
+    let status = daemon
+        .wait_for_exit(Duration::from_secs(10))
+        .expect("daemon should exit on SIGTERM rather than needing to be killed");
+    assert!(
+        status.success(),
+        "a requested shutdown is not a failure: {status:?}"
+    );
+    assert!(
+        !client_path.exists(),
+        "a clean shutdown removes its client socket, so nothing is left claiming to be a daemon"
+    );
 }
 
 #[test]

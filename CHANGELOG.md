@@ -7,6 +7,28 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 ## Unreleased
 
 ### Added
+- **Graceful shutdown on `SIGTERM`/`SIGINT`.** The daemon exits of its own accord, tells its peers it
+  is leaving (a new `ControlMsg::Leaving`) so they mark it not-live immediately instead of waiting
+  out the ten-second liveness timeout, and removes its client socket. Hand-rolled against `signal(2)`
+  rather than adding a `libc` dependency, and covered end to end by a test that sends a real
+  `SIGTERM` and requires a successful exit — "did the signal reach a handler" is not something a
+  unit test on the flag can answer.
+
+  Explicitly **courtesy, not safety**: it exists for promptness and has nothing to unwind. A hard
+  kill was already safe and remains so. That property is now stated in the READMEs, where it belongs
+  — it is unusual enough to be worth advertising: the daemon is never in a writer's path, committed
+  records are durable in their mmap, merge cursors and resume positions are recomputed from the logs
+  rather than saved, and a restart reconstructs rather than restores. The cross-process tests
+  `SIGKILL` a running daemon and assert contiguous resume.
+
+### Fixed
+- **`XCHANNELD_CLIENT_PATH` outside the data dir killed startup.** Binding the client plane chmod'ed
+  the socket's *parent* directory to `0700`, so pointing it at a shared directory — `/tmp/x.sock` —
+  tried to chmod `/tmp`, failed with `EPERM`, and took the daemon down. Only a directory the daemon
+  creates is restricted now; the data dir is still tightened explicitly at startup and every
+  directory holding channel bytes is created by that path, so nothing loses protection. Found by the
+  SIGTERM test above.
+
 - **A node generates its own identity; no configuration needed to join.** `XCHANNELD_NODE_ID` used
   to default to `1`, so two unconfigured daemons silently shared an identity — and everything is
   keyed on it: channel ownership, the collision tiebreak, membership, and now peer links. There is

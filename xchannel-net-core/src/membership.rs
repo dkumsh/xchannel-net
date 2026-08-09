@@ -126,6 +126,19 @@ impl Membership {
             .filter(|n| !n.is_empty())
     }
 
+    /// Mark `node` not-live because it said it was leaving, without forgetting where it was.
+    ///
+    /// Clearing `last_seen` rather than removing the entry reuses the existing "known by hearsay,
+    /// never heard from" state, which is exactly the truth: we still know its addresses, we just
+    /// know it is gone. A later heartbeat makes it live again, so a node that leaves and comes back
+    /// needs no special handling. Returns whether this actually changed anything.
+    pub fn retire(&mut self, node: NodeId) -> bool {
+        match self.members.get_mut(&node) {
+            Some(m) => m.last_seen.take().is_some(),
+            None => false,
+        }
+    }
+
     /// Which node is reachable at `control` — the reverse of [`known_peers`](Self::known_peers),
     /// so a dial candidate can be checked against the links we already hold.
     pub fn node_at(&self, control: SocketAddr) -> Option<NodeId> {

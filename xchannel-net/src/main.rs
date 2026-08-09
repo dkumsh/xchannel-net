@@ -159,6 +159,9 @@ fn main() -> std::io::Result<()> {
         }
     };
 
+    // Install before anything else runs, so a signal during startup is not simply fatal.
+    xchannel_net::shutdown::install();
+
     let client_path = config.client_path.clone();
     let node = Node::new(config);
     let stream_listener = node.bind_stream()?;
@@ -242,7 +245,19 @@ fn main() -> std::io::Result<()> {
         let node = node.clone();
         std::thread::spawn(move || node.run_duty_cycle(mux_idle));
     }
-    node.serve_stream(stream_listener)
+    {
+        let node = node.clone();
+        std::thread::spawn(move || {
+            let _ = node.serve_stream(stream_listener);
+        });
+    }
+
+    // Wait for SIGTERM/SIGINT. The planes keep running on their own threads until the process
+    // exits; there is nothing to unwind, because a hard kill is safe (see `shutdown`).
+    xchannel_net::shutdown::wait(Duration::from_millis(100));
+    eprintln!("xchanneld[{node_id}]: shutting down");
+    node.shutdown();
+    Ok(())
 }
 
 enum Plane {

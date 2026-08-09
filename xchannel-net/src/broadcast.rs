@@ -300,6 +300,16 @@ impl BroadcastDissemination {
         }
     }
 
+    /// Tell every peer this node is leaving, so they mark it not-live now rather than waiting out
+    /// the liveness timeout. Best-effort and synchronous: `send_frame` writes before returning, so
+    /// by the time this does the notice is on the wire.
+    pub fn announce_leaving(&mut self) {
+        let frame = encode_control(&ControlMsg::Leaving {
+            node: self.self_node,
+        });
+        self.broadcast(&frame);
+    }
+
     /// Peers we know of but hold no outbound link to, as `(node, control address)`.
     pub fn unconnected_peers(&self) -> Vec<(NodeId, SocketAddr)> {
         let connected = self.connected.lock_safe();
@@ -477,6 +487,13 @@ fn spawn_reader(
                             .lock_safe()
                             .push_back((id, node, addr, control_addr, name));
                     }
+                }
+                // A peer leaving cleanly. Not relayed: the mesh is self-forming, so in the
+                // topology this produces every node is already adjacent to the departing one. A
+                // node that somehow is not adjacent falls back to the liveness timeout, exactly as
+                // it would for a peer that crashed.
+                ControlMsg::Leaving { node } => {
+                    membership.lock_safe().retire(node);
                 }
                 _ => {} // not expected on a peer link
             }

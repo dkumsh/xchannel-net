@@ -56,6 +56,20 @@ The data plane is a single **duty cycle**: replication sources, replication sink
 multiplexers are poll-items in one loop, so a connection costs a poll-item rather than a
 thread.
 
+## Crash safety
+
+`kill -9`, a panic, a power cut or a reboot mid-write corrupt nothing and lose no committed record.
+The daemon is never in a writer's path, so killing it cannot cost a producer anything; committed
+records are durable in their mmap; merge cursors and resume positions are *recomputed* from the logs
+rather than saved, so there is no metadata that can be stale or torn; and a restart reconstructs from
+the data directory, its peers, and reconnecting clients. Cross-process tests `SIGKILL` a running
+daemon and assert every producer resumes contiguously.
+
+`SIGTERM`/`SIGINT` are handled, but as a courtesy rather than for safety — a departing node tells
+its peers so they stop treating its channels as reachable immediately instead of after the
+ten-second liveness timeout, and removes its client socket. Prefer it; use `SIGKILL` without
+anxiety.
+
 ## Security
 
 All network planes are **unauthenticated plaintext**. Anything that can reach them can

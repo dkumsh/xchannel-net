@@ -16,6 +16,7 @@ pub mod broadcast;
 pub mod node;
 pub mod node_identity;
 pub mod registry;
+pub mod shutdown;
 mod util;
 
 /// Node manager configuration.

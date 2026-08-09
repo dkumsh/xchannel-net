@@ -210,6 +210,7 @@ mod control_tag {
     pub const HEARTBEAT: u8 = 4;
     pub const REGISTER_REJECTED: u8 = 5;
     pub const PEER_HINT: u8 = 6;
+    pub const LEAVING: u8 = 7;
 }
 
 /// Encode a control-plane message into `buf` (appended; caller clears for reuse).
@@ -257,6 +258,10 @@ pub fn encode_control_into(buf: &mut Vec<u8>, m: &ControlMsg) {
             w.addr(*control_addr);
             w.str(name);
         }
+        ControlMsg::Leaving { node } => {
+            w.u8(control_tag::LEAVING);
+            w.u64(node.0);
+        }
         ControlMsg::RegisterRejected { name, winner } => {
             w.u8(control_tag::REGISTER_REJECTED);
             w.str(name);
@@ -293,6 +298,9 @@ pub fn decode_control(bytes: &[u8]) -> io::Result<ControlMsg> {
             addr: r.addr()?,
             control_addr: r.addr()?,
             name: r.str()?,
+        },
+        control_tag::LEAVING => ControlMsg::Leaving {
+            node: NodeId(r.u64()?),
         },
         control_tag::REGISTER_REJECTED => ControlMsg::RegisterRejected {
             name: r.str()?,
@@ -775,6 +783,7 @@ mod tests {
             },
             ControlMsg::RegistryDelta(vec![ident("a", 1), ident("b", 2)]),
             ControlMsg::RegistrySync(vec![]),
+            ControlMsg::Leaving { node: NodeId(3) },
             ControlMsg::PeerHint {
                 node: NodeId(7),
                 addr: "10.0.0.4:7000".parse().unwrap(),
