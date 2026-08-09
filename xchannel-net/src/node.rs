@@ -4344,7 +4344,11 @@ mod tests {
     #[test]
     fn force_deregister_refuses_live_owners_own_channels_and_fresh_daemons() {
         let (a, _a_stream, a_control) = start(111, "reclaim-guard-a");
-        let (b, _b_stream, _b_control) = start(112, "reclaim-guard-b");
+        // A floor, so the liveness check is not the only thing standing between this test and a reclaim.
+        let (b, _b_stream, _b_control) = start_with(NodeConfig {
+            reclaim_after: Duration::from_secs(300),
+            ..config(112, temp_dir("reclaim-guard-b"))
+        });
         {
             let mut w = a.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap();
             let buf = w.try_reserve(1).unwrap();
@@ -4361,18 +4365,22 @@ mod tests {
             .then_some(())
         });
 
-        // A live owner is refused however long the configured floor is — B's `reclaim_after` is zero,
-        // so only the liveness check can be stopping this.
+        // **Refusal is the property; which guard refuses is timing.** Liveness is a ten-second window with
+        // no clock control here, so a loaded machine can deschedule this thread long enough for A to fall
+        // out of it, and the refusal then cites silence rather than liveness.
         //
-        // Retried rather than asserted once: liveness is a ten-second window with no clock control here,
-        // so on a loaded machine this thread can be descheduled long enough for A to fall out of it
-        // between the poll above and the call below, and the refusal then cites silence instead. A
-        // retries because A is still heartbeating, so the window reopens.
-        let err = poll_until(|| {
-            let err = b.force_deregister("md.aapl").unwrap_err();
-            err.to_string().contains("live member").then_some(err)
-        });
+        // B's floor is deliberately *not* zero, which is what makes this safe to assert once. With a zero
+        // floor the liveness check is the only guard, so a single unlucky sample would let the reclaim
+        // **succeed** — and an earlier version of this test retried the call to get the message it wanted,
+        // which meant the retry could itself tombstone the channel and destroy the premise. Never retry a
+        // destructive call to make an assertion pass.
+        let err = b.force_deregister("md.aapl").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+        let why = err.to_string();
+        assert!(
+            why.contains("live member") || why.contains("unreachable for"),
+            "a reclaim must be refused while the owner is live or too recently silent: {why}"
+        );
 
         // The owner must use the ordinary owner-only path for its own channels.
         let err = a.force_deregister("md.aapl").unwrap_err();
@@ -4412,16 +4420,41 @@ mod tests {
 
         // An unknown name is simply nothing to do.
         assert!(!fresh.force_deregister("nope").unwrap());
+    }
 
-        // ...but a node that *has* had contact can still reclaim once the owner is gone. Refusing
-        // here too would have made the guard useless: a graceful departure clears liveness, and if
-        // that also erased the record that we ever had contact, no node could ever reclaim a name
-        // from a peer that said goodbye.
+    /// The other half of the reclaim guard: a node that **has** had contact can reclaim once the owner is
+    /// gone. Refusing here too would make the guard useless — a graceful departure clears liveness, and if
+    /// that also erased the record that contact ever happened, no node could reclaim a name from a peer
+    /// that said goodbye.
+    ///
+    /// A is started **without a maintenance loop**: `shutdown()` announces the departure but does not stop
+    /// a node's threads, so a heartbeating A would put itself straight back into B's live set and this
+    /// would be a race rather than a test.
+    #[test]
+    fn a_departed_owners_name_can_be_reclaimed_by_a_node_that_knew_it() {
+        let (a, _a_stream, a_control) = start_quiet(114, "reclaim-departed-a");
+        let (b, _b_stream, _b_control) = start(115, "reclaim-departed-b");
+        {
+            let mut w = a.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap();
+            let buf = w.try_reserve(1).unwrap();
+            buf.copy_from_slice(b"x");
+            w.commit(0, 1, 0).unwrap();
+        }
+        b.connect_control_peer(a_control).unwrap();
+        poll_until(|| {
+            (b.registry.lock_safe().get("md.aapl").is_some()
+                && b.dissemination
+                    .lock_safe()
+                    .live_addr_of(NodeId(114))
+                    .is_some())
+            .then_some(())
+        });
+
         a.shutdown();
         poll_until(|| {
             b.dissemination
                 .lock_safe()
-                .live_addr_of(NodeId(111))
+                .live_addr_of(NodeId(114))
                 .is_none()
                 .then_some(())
         });

@@ -194,9 +194,13 @@ node before starting any new one; see *Upgrading from 0.2.x* in the README.
 Everything from here down was found by pre-release review — four rounds of it, each reviewing the
 previous round's fixes. Three rounds introduced regressions while fixing others, every one of which was
 caught by the next round and is recorded below alongside what it was fixing; the fourth introduced none.
-Two process gaps came out of it as well: `just check` ran clippy without `-D warnings`, so "check clean"
-meant "compiles" (now enforced, and the five warnings it had been hiding are fixed), and one test asserted
-across a ten-second liveness window with no clock control.
+Three process gaps came out of it as well. `just check` ran clippy without `-D warnings`, so "check clean"
+meant "compiles" — now enforced, and the five warnings it had been hiding are fixed. It also never ran
+rustdoc, which is how three deleted symbols went on being linked from comments in a codebase whose design
+record *is* its comments; `just check` now fails on a broken doc link too. And two tests asserted across a
+ten-second liveness window with no clock control — one of which had been "fixed" by retrying a *destructive*
+call until it produced the expected error, which meant the retry could tombstone the channel and destroy the
+test's own premise. Never retry a destructive call to make an assertion pass.
 
 - **A dropped peer link leaked its fd, its thread and its send half — and could silently wedge the
   node.** The reader owns a `try_clone` dup of the socket, so when its loop exited, dropping it left
