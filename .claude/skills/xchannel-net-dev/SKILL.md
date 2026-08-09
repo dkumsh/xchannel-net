@@ -165,7 +165,7 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
 
 ## Current status (update this section as work lands)
 
-_As of 2026-08-09, at tag **v0.2.0**. Its headline is the §4.1 duty cycle (one loop, poll-items,
+_As of 2026-08-09, at tag **v0.2.1** (docs/packaging only; 0.2.0 is the substantive release). Its headline is the §4.1 duty cycle (one loop, poll-items,
 no thread per connection) plus the correctness work found by reviewing everything since 0.0.1 —
 see `CHANGELOG.md`. **0.2.0 breaks on disk**: no migrator, a 0.1.0 data directory is not carried
 forward (slot-table wire version, and channels written before name stamping are refused)._
@@ -200,8 +200,12 @@ forward (slot-table wire version, and channels written before name stamping are 
   - **Cross-process test** spawns the real `xchanneld` and replicates via `Client` across
     processes (reads the replica — only possible cross-process). `Client::subscribe`
     retries the replica open (async creation race).
-- 109 tests across unit + two-node + client-RPC + cross-process, plus one ignored measurement
-  harness (`measure_outbound_high_water_mark`); `just check` clean; release build clean.
+- 110 tests across unit + two-node + client-RPC + cross-process + doctest, plus one ignored
+  measurement harness (`measure_outbound_high_water_mark`); `just check` clean; release build clean.
+- Each crate carries its own README and **symlinks** the root `LICENSE`/`SECURITY.md`/`CHANGELOG.md`/
+  `doc/` into itself — cargo dereferences symlinks when packaging, so the published tarballs hold
+  real files while the repo keeps one source of truth. `include` cannot reach outside a crate dir,
+  which is why copies would otherwise be the only option.
 
 ### Topics (multi-producer fan-in) — design implemented, with documented deviations (`doc/TOPICS.md`)
 
