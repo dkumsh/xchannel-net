@@ -4,7 +4,11 @@ All notable changes to xchannel-net are documented here. Versioning is pre-1.0 a
 experimental: the wire protocol and on-disk layout may change without notice (see
 `SECURITY.md`).
 
-## Unreleased
+## 0.2.1 (2026-08-09)
+
+**Documentation and packaging only — no behaviour change.** 0.2.0's published crates contained
+source and nothing else, so a crates.io page said nothing about the crate and a vendored copy
+carried none of the reasoning behind it. Same code, same wire protocol, same on-disk layout.
 
 ### Added
 - **Per-crate READMEs**, and the workspace docs now ship *inside* each published crate. Until now
