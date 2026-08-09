@@ -165,8 +165,10 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
 
 ## Current status (update this section as work lands)
 
-_As of 2026-08-08. **0.1.0** released 2026-08-07 (all three crates on crates.io); unreleased
-fixes on `main` since — see `CHANGELOG.md` "Unreleased"._
+_As of 2026-08-09, at tag **v0.2.0**. Its headline is the §4.1 duty cycle (one loop, poll-items,
+no thread per connection) plus the correctness work found by reviewing everything since 0.0.1 —
+see `CHANGELOG.md`. **0.2.0 breaks on disk**: no migrator, a 0.1.0 data directory is not carried
+forward (slot-table wire version, and channels written before name stamping are refused)._
 - Dep is published **`xchannel = "5.1.0"`**. `.justfile` present in every commit; every
   commit passes `just check` (cargo check + fmt --check + clippy --all-targets).
 - **v1 complete and hardened.** External client process → `Client` RPC → local `xchanneld`
@@ -198,7 +200,8 @@ fixes on `main` since — see `CHANGELOG.md` "Unreleased"._
   - **Cross-process test** spawns the real `xchanneld` and replicates via `Client` across
     processes (reads the replica — only possible cross-process). `Client::subscribe`
     retries the replica open (async creation race).
-- 92 tests across unit + two-node + client-RPC + cross-process; `just check` clean.
+- 109 tests across unit + two-node + client-RPC + cross-process, plus one ignored measurement
+  harness (`measure_outbound_high_water_mark`); `just check` clean; release build clean.
 
 ### Topics (multi-producer fan-in) — design implemented, with documented deviations (`doc/TOPICS.md`)
 
