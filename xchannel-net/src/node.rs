@@ -118,11 +118,16 @@ fn ensure_private_dir(path: &Path) -> io::Result<()> {
 }
 
 /// Validate a channel name before it is used as a filesystem path component. Allowlist
-/// `[A-Za-z0-9._-]`, length 1..=200, and **no leading dot** — which rejects path traversal
-/// (`/`, `\`, `..`), the current dir (`.`), and collisions with the internal `.replicas`
-/// subtree, none of which can appear.
+/// `[A-Za-z0-9._-]`, length 1..=[`xchannel::CHANNEL_NAME_MAX`], and **no leading dot** — which
+/// rejects path traversal (`/`, `\`, `..`), the current dir (`.`), and collisions with the
+/// internal `.replicas` subtree, none of which can appear.
+///
+/// The length bound is xchannel's header field rather than a number of our own, because every
+/// channel now **stamps its name into that header** — the limit and the field it has to fit are
+/// the same fact, and writing it twice is how they drift. The allowlist is ASCII, so bytes and
+/// chars agree. 48 bytes is roughly five dotted segments (`fills.prod.options-mm` is 21).
 fn validate_channel_name(name: &str) -> io::Result<()> {
-    let valid = (1..=200).contains(&name.len())
+    let valid = (1..=xchannel::CHANNEL_NAME_MAX).contains(&name.len())
         && !name.starts_with('.')
         && name
             .bytes()
@@ -132,7 +137,10 @@ fn validate_channel_name(name: &str) -> io::Result<()> {
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "channel name must be 1..=200 chars of [A-Za-z0-9._-] with no leading dot",
+            format!(
+                "channel name must be 1..={} chars of [A-Za-z0-9._-] with no leading dot",
+                xchannel::CHANNEL_NAME_MAX
+            ),
         ))
     }
 }
@@ -508,6 +516,7 @@ impl Node {
             .mtu(mtu as u64)
             .base_record_index(0)
             .generation(identity.epoch)
+            .channel_name(name)?
             .build()?;
         // The `configure` closure is opaque, so any `file_roll_size`/`keep_files` it sets
         // can't be read back to advertise in the `SubscribeAck`. We therefore announce
@@ -554,7 +563,10 @@ impl Node {
             // what lets a subscriber's replica later say which incarnation it holds. Applied
             // only on creation — reopening keeps the on-disk value, so a restart re-hosting
             // this origin cannot relabel it.
-            .generation(identity.epoch);
+            .generation(identity.epoch)
+            // And the name, for the same reason one level up: it is what makes the log say which
+            // *channel* it is, rather than leaving that to the directory it happens to sit in.
+            .channel_name(name)?;
         if options.keep_files > 0 {
             builder = builder.keep_files(options.keep_files as u64);
         }
@@ -661,6 +673,7 @@ impl Node {
         // would leave the topic growing as one unbounded file.
         let mux = Arc::new(Mutex::new(Mux::open(
             &path,
+            name,
             &mux::TopicGeometry::from(&options.channel),
             batch,
         )?));
@@ -1016,6 +1029,41 @@ impl Node {
         out
     }
 
+    /// The channel name stamped in the log's own header at `path`.
+    ///
+    /// This is what closes the last place the daemon trusted something other than its own files.
+    /// Every other fact about a channel is recovered from its content — geometry from the header,
+    /// absolute indices from `base_record_index`, incarnation from `generation`, a topic's members
+    /// and cursors from its slot table — but the *name* came from the directory the log sat in. A
+    /// data dir that has been migrated, restored, or hand-edited could therefore serve one
+    /// channel's records under another's name, with nothing to catch it: the geometry is valid,
+    /// the log is well formed, and `generation` agrees (it travels with the file, so a renamed
+    /// directory looks perfectly consistent).
+    fn stamped_name(path: &Path) -> io::Result<String> {
+        Ok(xchannel::ReaderBuilder::new(path)
+            .late_join()
+            .build()?
+            .channel_name()
+            .into_owned())
+    }
+
+    /// Refuse a log whose header says it is a different channel from the directory it was found
+    /// in. An unstamped log (all zeros) fails this too, which is deliberate: a guarantee that
+    /// holds only for logs written by a new enough daemon is not one you can rely on.
+    fn verify_stamped_name(path: &Path, expected: &str) -> io::Result<()> {
+        let stamped = Self::stamped_name(path)?;
+        if stamped != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{path:?} holds channel '{stamped}', but its directory says '{expected}' — \
+                     refusing to serve one channel's records under another's name"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Re-register a non-topic origin channel found on disk (helper for
     /// [`reconstruct_from_disk`]): recover its geometry from the channel header via
     /// `xchannel::Reader` and re-register + announce it under this node's ownership. `member_of`
@@ -1028,6 +1076,7 @@ impl Node {
             return Ok(());
         }
         let path = self.channel_path(name)?;
+        Self::verify_stamped_name(&path, name)?;
         let reader = xchannel::ReaderBuilder::new(&path).late_join().build()?;
         let region_size = reader.region_size() as u32;
         let mtu = reader.mtu();
@@ -1047,6 +1096,7 @@ impl Node {
             return Ok(());
         }
         let path = self.channel_path(name)?;
+        Self::verify_stamped_name(&path, name)?;
         let identity = self.claim_name(name, cfg.geometry.region_size, cfg.geometry.mtu, None)?;
         // A topic's disk bounds *are* recoverable (unlike a plain origin's): they ride the slot
         // table. So re-host with them — both on the writer, so the topic keeps rolling and
@@ -1059,6 +1109,7 @@ impl Node {
         )?;
         let mux = Arc::new(Mutex::new(Mux::open(
             &path,
+            name,
             &cfg.geometry,
             MAX_BATCH_PER_MEMBER,
         )?));
@@ -1072,7 +1123,11 @@ impl Node {
             // set — otherwise the detach pass would drain a member that never left. Then attach
             // it from the origin. A member with only a **replica** is remote: attach the replica
             // and let peer anti-entropy restore its `member_of` (it's not ours to register).
-            let origin = self.channel_path(member).ok().filter(|p| p.exists());
+            let origin = self
+                .channel_path(member)
+                .ok()
+                .filter(|p| p.exists())
+                .filter(|p| Self::verify_stamped_name(p, member).is_ok());
             if let Some(op) = &origin
                 && let Ok(reader) = xchannel::ReaderBuilder::new(op).late_join().build()
             {
@@ -3096,6 +3151,73 @@ mod tests {
     /// past its retention window has no file bearing its name. Its directory still does, which
     /// is what lets a restart re-host it instead of inventing channels named after the
     /// surviving segments.
+    /// A channel's log says which channel it is, and reconstruction believes the log over the
+    /// directory it found it in.
+    ///
+    /// The name was the last thing about a channel that did not self-describe — geometry,
+    /// absolute index, incarnation and a topic's whole membership all come from the files, but
+    /// the name came from the directory. So a data dir that had been migrated, restored, or
+    /// hand-edited could serve one channel's records under another's name with nothing to catch
+    /// it: the geometry is valid, the log is well formed, and `generation` agrees, because it
+    /// travels with the file and a renamed directory looks perfectly consistent.
+    #[test]
+    fn a_renamed_channel_directory_is_refused_not_served_under_the_wrong_name() {
+        let dir = temp_dir("renamed");
+        let node = Node::new(config(70, dir.clone()));
+        {
+            let mut w = node.host_channel("md.aapl", 1 << 20, 0, |b| b).unwrap();
+            let buf = w.try_reserve(5).unwrap();
+            buf.copy_from_slice(b"aapl!");
+            w.commit(0, 5, 0).unwrap();
+        }
+        // Someone moves the channel's directory — a migration, a restore, a mistake.
+        std::fs::rename(dir.join("md.aapl"), dir.join("md.msft")).unwrap();
+
+        let restarted = Node::new(config(70, dir));
+        let rebuilt = restarted.reconstruct_from_disk();
+        assert!(
+            restarted.registry.lock_safe().get("md.msft").is_none(),
+            "a log stamped 'md.aapl' must not be served as 'md.msft'"
+        );
+        assert!(
+            restarted.registry.lock_safe().get("md.aapl").is_none(),
+            "nor under its real name, which no directory now claims"
+        );
+        assert_eq!(
+            (rebuilt.origins, rebuilt.skipped),
+            (0, 1),
+            "and the refusal is counted, not silent"
+        );
+    }
+
+    /// The stamp survives what would erase it: rolling past retention. Segment 0 carries the name
+    /// from creation, but it is the *rolled* segments that outlive it — and xchannel takes
+    /// `channel_name` from whoever built the writer when it rolls, so every writer that reopens a
+    /// channel has to supply it or quietly produce blank-named segments.
+    #[test]
+    fn the_name_stamp_survives_rolling_past_retention() {
+        let dir = temp_dir("stamp-rolled");
+        let node = Node::new(config(71, dir.clone()));
+        {
+            let mut w = node
+                .host_channel("md.aapl", 1 << 20, 0, |b| b.keep_files(2))
+                .unwrap();
+            for i in 0..4u64 {
+                let buf = w.try_reserve(4).unwrap();
+                buf.copy_from_slice(b"tick");
+                w.commit(0, 4, i).unwrap();
+                w.roll_file().unwrap();
+            }
+        }
+        assert!(
+            !node.channel_path("md.aapl").unwrap().exists(),
+            "retention should have pruned the original segment, which is the point"
+        );
+        let restarted = Node::new(config(71, dir));
+        assert_eq!(restarted.reconstruct_from_disk().origins, 1);
+        assert!(restarted.registry.lock_safe().get("md.aapl").is_some());
+    }
+
     #[test]
     fn a_rolled_and_pruned_channel_is_rehosted_after_restart() {
         let dir = temp_dir("pruned-restart");

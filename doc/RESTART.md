@@ -23,6 +23,16 @@ no muxes, so a pre-existing topic does not resume merging until a client re-issu
 Reconstruct topics from the data dir itself, with **no new persisted metadata** (keeps the
 layering clean: xchannel stays topic-agnostic; a topic is "just a channel"):
 
+0. **Believe the log, not the directory.** Every channel stamps its name into its own header
+   (`ChannelHeader.channel_name`), and reconstruction refuses a log whose stamp disagrees with the
+   directory it was found in. Without this the name would be the one fact about a channel taken
+   from the filesystem rather than from its content, and a migrated or restored data dir could
+   serve one channel's records under another's name undetected — `generation` travels with the
+   file, so a renamed directory looks entirely consistent. Names are therefore capped at
+   `xchannel::CHANNEL_NAME_MAX` (48 bytes). Note that **every writer reopening a channel must
+   re-supply the name**: xchannel carries `generation` across a roll from disk but takes
+   `channel_name` from the builder, so omitting it blank-stamps exactly the rolled segments that
+   outlive retention.
 1. **Scan** `data_dir` for channel **directories** (skip `.replicas/` and other dot-entries).
    Each channel owns a directory holding its xchannel segments as `log`, `log.1`, … so the scan
    needs no heuristic: it never has to guess whether `md.aapl.4` is a channel or a rolled

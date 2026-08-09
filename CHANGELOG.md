@@ -7,6 +7,30 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 ## Unreleased
 
 ### Changed
+- **A channel's name is now stamped into its log, and reconstruction believes the log over the
+  directory.** The name was the last thing about a channel that did not self-describe: geometry
+  came from the header, absolute indices from `base_record_index`, incarnation from `generation`,
+  and a topic's whole membership from its slot table — but the name came from the *directory the
+  files sat in*. A data dir that had been migrated, restored or hand-edited could therefore serve
+  one channel's records under another's name with nothing to catch it, since the geometry is valid,
+  the log is well formed, and `generation` agrees (it travels with the file, so a renamed directory
+  looks perfectly consistent). `reconstruct_from_disk` now refuses a mismatch and counts it as
+  `skipped`; replicas are stamped and checked the same way.
+
+  **Channel names are capped at 48 bytes** (`xchannel::CHANNEL_NAME_MAX`), down from 200 — the
+  limit is now that constant rather than a number of ours, so the bound and the field it must fit
+  cannot drift. This is what xchannel 5.0.0's `format_version = 3` widened the field for; until now
+  nothing wrote it. 48 bytes is roughly five dotted segments (`fills.prod.options-mm` is 21).
+  **On-disk change**: a channel written before this carries no stamp and is refused rather than
+  re-hosted — a guarantee that held only for logs written by a new enough daemon would not be one
+  you could rely on.
+
+  Every writer that *reopens* a channel has to supply the name, not just the one that creates it:
+  xchannel carries `generation` across a roll from the on-disk header but takes `channel_name` from
+  whoever built the writer, so a writer that omits it silently produces blank-named segments — and
+  those are the ones that outlive retention. Fixed in all three: the client's writer (which is the
+  writer for every plain origin and topic member), the mux's topic writer, and the replication sink.
+
 - **`MAX_PENDING_OUT` reduced 8 MiB → 1 MiB, from measurement.** The 8 MiB was a guess made while
   building the duty cycle. `stream::bench::measure_outbound_high_water_mark` (an ignored harness;
   `cargo test -p xchannel-net-core --release -- --ignored --nocapture measure_`) sweeps the cap

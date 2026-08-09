@@ -288,6 +288,7 @@ pub fn subscribe<T: Transport>(
         } => {
             let sink = ReplicationSink::open(
                 replica_path,
+                name,
                 region_size,
                 mtu,
                 file_roll_size,

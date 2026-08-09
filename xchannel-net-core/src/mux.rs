@@ -473,8 +473,15 @@ impl Mux {
     /// omits them produces a topic that never rolls and never prunes however it was created. They
     /// ride the slot table precisely so a restart can supply them again
     /// ([`topic_config`]).
+    /// `name` is the topic's channel name, stamped into every segment this writer creates.
+    /// Required on **every** open, not just the first: xchannel carries `generation` across a roll
+    /// from the on-disk header but takes `channel_name` from whoever built the writer, so a mux
+    /// that omitted it would blank-stamp each segment it rolled — and the daemon identifies a
+    /// channel on disk by that stamp, so the topic would stop being re-hostable as soon as
+    /// retention pruned the original segment.
     pub fn open(
         path: &Path,
+        name: &str,
         geometry: &TopicGeometry,
         max_batch_per_member: usize,
     ) -> io::Result<Self> {
@@ -488,7 +495,8 @@ impl Mux {
         // the writer's job — retention sweeps on roll, whoever triggered it.
         let mut builder = WriterBuilder::new(path)
             .region_size(geometry.region_size as usize)
-            .mtu(geometry.mtu as u64);
+            .mtu(geometry.mtu as u64)
+            .channel_name(name)?;
         if geometry.keep_files > 0 {
             builder = builder.keep_files(geometry.keep_files as u64);
         }
@@ -1109,7 +1117,7 @@ mod tests {
         write_member(&m_a, &[(1, 100, b"a0"), (1, 101, b"a1")]);
         write_member(&m_b, &[(2, 200, b"b0")]);
 
-        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 16).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 16).unwrap();
         mux.add_member("a", 0, &m_a).unwrap();
         mux.add_member("b", 0, &m_b).unwrap();
         assert_eq!(mux.poll().unwrap(), 3);
@@ -1205,7 +1213,7 @@ mod tests {
         }
 
         let (region, mtu) = (REGION_U32, 4096u32);
-        let mut mux = Mux::open(&topic, &geom(region, mtu), 4096).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &geom(region, mtu), 4096).unwrap();
         mux.add_member("m", 0, &m).unwrap();
         mux.poll().unwrap();
         assert_eq!(
@@ -1245,7 +1253,7 @@ mod tests {
         // Session 1: "a" (ref 0) merges 100 records (member_index 0..99).
         append_records(&a, "a", 100);
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("a", 0, &a).unwrap();
             assert_eq!(mux.poll().unwrap(), 100);
         }
@@ -1254,7 +1262,7 @@ mod tests {
         // its first 10 records (member_index 0..9).
         append_records(&b, "b", 10);
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("b", 0, &b).unwrap();
             assert_eq!(mux.poll().unwrap(), 10);
         }
@@ -1265,7 +1273,7 @@ mod tests {
         // Session 3: reopen and resume "b". Correct recovery resumes at 10; the bug resumes at
         // 100 (inheriting "a"'s max under ref 0) and skips b's records 10..99.
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("b", 0, &b).unwrap();
             mux.poll().unwrap();
         }
@@ -1296,7 +1304,7 @@ mod tests {
         let (topic, m) = (dir.join("topic"), dir.join("m"));
         append_records(&m, "m", 100); // indices 0..99
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("m", 0, &m).unwrap();
             assert_eq!(mux.poll().unwrap(), 100);
         }
@@ -1309,7 +1317,7 @@ mod tests {
         assert_eq!(head, 5);
 
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("m", 0, &m).unwrap();
             assert_eq!(
                 mux.members()[0].2,
@@ -1341,7 +1349,7 @@ mod tests {
         let (topic, m) = (dir.join("topic"), dir.join("m"));
         write_member(&m, &[(1, 0, b"m0"), (1, 1, b"m1")]);
 
-        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 1).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 1).unwrap();
         mux.add_member("m", 0, &m).unwrap();
         assert_eq!(mux.poll().unwrap(), 1); // batch=1, one merged, one pending
         mux.finish().unwrap();
@@ -1385,7 +1393,7 @@ mod tests {
             file_roll_size: 0,
             keep_files: 0,
         };
-        let mut mux = Mux::open(&topic, &geometry, 64).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &geometry, 64).unwrap();
         mux.add_member("m", 0, &m).unwrap();
         assert_eq!(mux.poll().unwrap(), 2, "the two that fit are merged");
 
@@ -1424,7 +1432,7 @@ mod tests {
         let (topic, m) = (dir.join("topic"), dir.join("m"));
         write_member(&m, &[(1, 0, b"before")]);
 
-        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 64).unwrap();
         mux.add_member("m", 0, &m).unwrap();
         assert_eq!(mux.poll().unwrap(), 1);
         mux.finish().unwrap();
@@ -1459,7 +1467,7 @@ mod tests {
         let (topic, member) = (dir.join("topic"), dir.join("m"));
         write_member(&member, &[(1, 0, b"m0"), (1, 1, b"m1"), (1, 2, b"m2")]);
 
-        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 1).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 1).unwrap();
         mux.add_member("m", 0, &member).unwrap();
         // Merge only one (bounded batch = 1), leaving records behind.
         assert_eq!(mux.poll().unwrap(), 1);
@@ -1497,7 +1505,7 @@ mod tests {
         // Member writes a few records; the mux merges them (cursor → 3).
         write_member_rolling(&member, 3, roll, keep);
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 64).unwrap();
             mux.add_member("m", 0, &member).unwrap();
             assert_eq!(mux.poll().unwrap(), 3);
             assert_eq!(mux.members()[0].2, 3);
@@ -1513,7 +1521,7 @@ mod tests {
         );
 
         // Reopen: the mux can't resume contiguously, so it records a TopicGap and skips ahead.
-        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 64).unwrap();
         mux.add_member("m", 0, &member).unwrap();
         assert_eq!(
             mux.members()[0].2,
@@ -1548,7 +1556,7 @@ mod tests {
 
         // Session 1: both members merged.
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("a", 0, &a).unwrap();
             mux.add_member("b", 0, &b).unwrap();
             assert_eq!(mux.poll().unwrap(), 10);
@@ -1556,14 +1564,14 @@ mod tests {
         // "b" produces a long tail while "a" stays quiet.
         append_records(&b, "b", 2000);
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("a", 0, &a).unwrap();
             mux.add_member("b", 0, &b).unwrap();
             mux.poll().unwrap();
         }
         // Session 3: reopen. "a" (records far behind the tail) must resume at 5, not re-merge.
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 4096).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 4096).unwrap();
             mux.add_member("a", 0, &a).unwrap();
             assert_eq!(
                 mux.members()[0].2,
@@ -1603,7 +1611,7 @@ mod tests {
             "genesis should have pruned (earliest={earliest})"
         );
 
-        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap(); // fresh topic, no cursor
+        let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 64).unwrap(); // fresh topic, no cursor
         mux.add_member("m", 0, &m).unwrap();
         assert_eq!(
             mux.members()[0].2,
@@ -1644,7 +1652,7 @@ mod tests {
         // Session 1 creates the topic and merges enough to roll at least once.
         write_member_rolling(&m, 3000, (REGION as u64) * 2, 0);
         {
-            let mut mux = Mux::open(&topic, &bounded, 100_000).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &bounded, 100_000).unwrap();
             mux.add_member("m", 0, &m).unwrap();
             assert_eq!(mux.poll().unwrap(), 3000);
         }
@@ -1652,7 +1660,7 @@ mod tests {
         // below lands in one file that is never pruned.
         write_member_rolling(&m, 3000, (REGION as u64) * 2, 0);
         {
-            let mut mux = Mux::open(&topic, &bounded, 100_000).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &bounded, 100_000).unwrap();
             mux.add_member("m", 0, &m).unwrap();
             assert_eq!(mux.poll().unwrap(), 3000);
         }
@@ -1702,7 +1710,7 @@ mod tests {
         append_records(&a, "a", 5);
         write_member_rolling(&b, 12_000, (REGION as u64) * 2, 0);
         {
-            let mut mux = Mux::open(&topic, &bounded, 1_000_000).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &bounded, 1_000_000).unwrap();
             mux.add_member("a", 0, &a).unwrap();
             mux.add_member("b", 0, &b).unwrap();
             assert_eq!(mux.poll().unwrap(), 5 + 12_000);
@@ -1738,7 +1746,7 @@ mod tests {
         );
 
         // Reopen: "a" must resume at 5 from that table, not re-merge its 5 records.
-        let mut mux = Mux::open(&topic, &bounded, 1_000_000).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &bounded, 1_000_000).unwrap();
         mux.add_member("a", 0, &a).unwrap();
         assert_eq!(
             mux.members()[0].2,
@@ -1759,7 +1767,7 @@ mod tests {
         write_member(&m_a, &[(1, 0, b"a0"), (1, 1, b"a1")]);
 
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 16).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 16).unwrap();
             mux.add_member("a", 0, &m_a).unwrap();
             assert_eq!(mux.poll().unwrap(), 2);
         }
@@ -1767,7 +1775,7 @@ mod tests {
         write_member(&m_a, &[(1, 2, b"a2")]);
 
         // Reopen: recovery must resume "a" at index 2, not re-merge 0,1.
-        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 16).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 16).unwrap();
         mux.add_member("a", 0, &m_a).unwrap();
         assert_eq!(mux.members()[0].2, 2, "resumes at recovered cursor");
         assert_eq!(mux.poll().unwrap(), 1, "only the new record merges");
@@ -1818,7 +1826,7 @@ mod tests {
             ],
         );
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 64).unwrap();
             mux.add_member("a", 1, &a1).unwrap();
             assert_eq!(mux.poll().unwrap(), 5);
         }
@@ -1828,7 +1836,7 @@ mod tests {
         // from BOTH incarnations, and the latest slot table maps ref 0 → (a, epoch 2).
         write_member(&a2, &[(1, 0, b"e2-0"), (1, 1, b"e2-1")]);
         {
-            let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
+            let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 64).unwrap();
             mux.add_member("a", 2, &a2).unwrap();
             assert_eq!(
                 mux.poll().unwrap(),
@@ -1858,7 +1866,7 @@ mod tests {
         // Boot 3: recover "a"@epoch2's cursor. It truly merged through index 1, so it must
         // resume at 2 and merge 2..=7. The bug: recovery maxes ref-0 across BOTH incarnations
         // (max = 4, from epoch1) and resumes epoch2 at 5, silently dropping indices 2,3,4.
-        let mut mux = Mux::open(&topic, &geom(REGION_U32, 0), 64).unwrap();
+        let mut mux = Mux::open(&topic, "topic", &geom(REGION_U32, 0), 64).unwrap();
         mux.add_member("a", 2, &a2).unwrap();
         assert_eq!(
             mux.members()[0].2,

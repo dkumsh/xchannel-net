@@ -349,7 +349,8 @@ A node persists **no separate registry/subscription database.** On restart it re
 from three authoritative sources:
 
 1. **Scan its own data directory** → re-register the master channels it hosts and
-   re-attach replicas. Files are self-describing (channel name in the xchannel
+   re-attach replicas, believing each log's own stamped name over the directory it sits in
+   (`doc/RESTART.md`). Files are self-describing (channel name in the xchannel
    `ChannelHeader`); a replica's resume index is recovered by reading the replica (count
    its `User` records). *This is the persistence — but of the data the owner is
    responsible for, not node bookkeeping.*

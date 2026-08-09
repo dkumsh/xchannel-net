@@ -147,9 +147,9 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
   `Reader::base_record_index()`, `WriterBuilder::base_record_index()`. `format_version = 3`
   (5.0.0) widened `channel_name` 20 → 48 bytes. Greenfield at every step: the current build
   refuses v0/v1/v2 files, no migrator. See the xchannel repo's `FORMAT.md` §3 + `CHANGELOG`.
-  (`channel_name` is **never set** by this project — `WriterBuilder::channel_name` is uncalled,
-  and our names run to 200 chars, so the 48-byte field could not hold them anyway. Stamping it
-  would let `reconstruct_from_disk` stop trusting the *directory* name; open question.)
+  (`channel_name` **is** now set on every channel, and `validate_channel_name` caps names at
+  `xchannel::CHANNEL_NAME_MAX` = 48 so the bound and the field cannot drift — see *Name stamping*
+  below.)
 
 ## Conventions
 
@@ -279,6 +279,18 @@ table is emitted at the **head of every segment**, so one is always inside the r
 (§6.3's late-consumer-decode promise, the restart sniff, and cursor recovery for a quiet member).
 Proven by a cross-process daemon-restart test. Chose option (a) content-sniff over (b) an
 xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
+
+**Name stamping** (post-0.1.0): a channel's log carries its own name (`ChannelHeader.channel_name`),
+and `reconstruct_from_disk` believes the log over the directory — refusing a mismatch (counted in
+`Reconstructed::skipped`) rather than serving one channel's records under another's name. Closes
+the last hole in "the files are authoritative": geometry, absolute index, incarnation and topic
+membership all self-described already; the *name* came from the directory. `generation` does not
+help — it travels with the file, so a renamed directory looks consistent. Names capped at 48 bytes.
+**Trap:** xchannel carries `generation` across a roll from the on-disk header but takes
+`channel_name` from whoever built the `Writer`, so **every** writer that reopens a channel must
+re-supply the name or it blank-stamps the segments it rolls — and those outlive retention. Three
+writers do: the client's (most segments are written there), the mux's topic writer, the replication
+sink.
 
 **`MAX_PENDING_OUT` = 1 MiB, measured** (was a guessed 8 MiB). `stream::bench::measure_outbound_high_water_mark`
 (ignored; `--release -- --ignored --nocapture measure_`) sweeps cap × record size: **throughput is

@@ -102,7 +102,7 @@ impl Client {
             name: name.to_string(),
             options: *options,
         })? {
-            ClientReply::Created { path } => open_writer(&path, options),
+            ClientReply::Created { path } => open_writer(&path, name, options),
             ClientReply::Error { message } => Err(rpc_error(message)),
             _ => Err(unexpected()),
         }
@@ -136,7 +136,8 @@ impl Client {
             member: member.to_string(),
             options: *options,
         })? {
-            ClientReply::Created { path } => open_writer(&path, options),
+            // The member's own name — this writer is the member channel's, not the topic's.
+            ClientReply::Created { path } => open_writer(&path, member, options),
             ClientReply::Error { message } => Err(rpc_error(message)),
             _ => Err(unexpected()),
         }
@@ -321,11 +322,21 @@ impl ChannelWatch {
     }
 }
 
-fn open_writer(path: &str, options: &ChannelOptions) -> io::Result<Writer> {
+/// Open the single `Writer` for a channel the daemon has created.
+///
+/// `name` is stamped so that **every segment this writer rolls** says which channel it belongs to.
+/// It cannot be left to the reopen to carry: xchannel takes `generation` from the on-disk header
+/// when it rolls but takes `channel_name` from whoever built the writer, so a writer that omits it
+/// silently produces blank-named segments — and the daemon, which identifies channels on disk by
+/// that stamp, would then refuse to re-host the channel after retention pruned the original
+/// segment. The client holds the writer for every plain origin and topic member, so this is where
+/// most of a channel's segments are actually written.
+fn open_writer(path: &str, name: &str, options: &ChannelOptions) -> io::Result<Writer> {
     let mut builder = WriterBuilder::new(path)
         .region_size(options.region_size as usize)
         .mtu(options.mtu as u64)
-        .file_roll_size(options.file_roll_size);
+        .file_roll_size(options.file_roll_size)
+        .channel_name(name)?;
     if options.keep_files > 0 {
         builder = builder.keep_files(options.keep_files as u64);
     }

@@ -170,8 +170,15 @@ impl ReplicationSink {
     /// — the origin rejects such a resume during the handshake — but an *empty* replica
     /// resumes at index 0, which the origin's check deliberately waves through, so this is
     /// the backstop for that case.
+    ///
+    /// `name` is stamped the same way, and checked the same way, so a replica's own files say
+    /// *which channel* they hold and not merely which incarnation. Without it the only thing
+    /// identifying a replica is the directory it sits in, and a replica directory that has been
+    /// renamed or moved would be extended with another channel's records — with the generation
+    /// check none the wiser, since two never-reclaimed channels both carry generation 0.
     pub fn open(
         path: &Path,
+        name: &str,
         region_size: u32,
         mtu: u32,
         file_roll_size: u64,
@@ -184,7 +191,8 @@ impl ReplicationSink {
             .mtu(mtu as u64)
             .file_roll_size(file_roll_size)
             .base_record_index(start.0)
-            .generation(generation);
+            .generation(generation)
+            .channel_name(name)?;
         if keep_files > 0 {
             builder = builder.keep_files(keep_files as u64);
         }
@@ -197,6 +205,22 @@ impl ReplicationSink {
                      previous incarnation of this channel",
                     writer.generation(),
                     generation
+                ),
+            ));
+        }
+        // The writer has no name accessor, so read the stamp back through a reader. Only on
+        // (re)connect, never on the record path.
+        let stamped = ReaderBuilder::new(path)
+            .late_join()
+            .build()?
+            .channel_name()
+            .into_owned();
+        if stamped != name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replica at {path:?} holds channel '{stamped}', not '{name}' — refusing to \
+                     extend one channel's replica with another's records"
                 ),
             ));
         }
@@ -326,6 +350,28 @@ mod tests {
     /// The origin's segmentation must survive replication: a roll rides on the first record of
     /// the new segment, and the sink reproduces the boundary. Without it, a replica whose
     /// `file_roll_size` is 0 never rolls at all.
+    /// A replica's files say which channel they hold, so a replica directory that has been
+    /// renamed or moved is refused rather than extended with another channel's records. The
+    /// `generation` check cannot catch this on its own: two never-reclaimed channels both carry
+    /// generation 0, so nothing about the mismatch looks wrong.
+    #[test]
+    fn a_replica_refuses_to_be_extended_by_a_different_channel() {
+        let replica = temp_base("wrong-name-replica");
+        {
+            let sink =
+                ReplicationSink::open(&replica, "md.aapl", REGION_U32, 0, 0, 0, RecordIndex(0), 0)
+                    .unwrap();
+            drop(sink);
+        }
+        let Err(err) =
+            ReplicationSink::open(&replica, "md.msft", REGION_U32, 0, 0, 0, RecordIndex(0), 0)
+        else {
+            panic!("a replica of md.aapl must not be extended as md.msft");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("md.aapl"), "{err}");
+    }
+
     #[test]
     fn roll_boundaries_replicate() {
         let origin = temp_base("roll-origin");
@@ -351,7 +397,8 @@ mod tests {
 
         {
             let mut sink =
-                ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, RecordIndex(0), 0).unwrap();
+                ReplicationSink::open(&replica, "chan", REGION_U32, 0, 0, 0, RecordIndex(0), 0)
+                    .unwrap();
             for f in &frames {
                 sink.apply(f).unwrap();
             }
@@ -377,7 +424,7 @@ mod tests {
 
         {
             let mut sink =
-                ReplicationSink::open(&replica, REGION_U32, 0, 0, 2, earliest, 0).unwrap();
+                ReplicationSink::open(&replica, "chan", REGION_U32, 0, 0, 2, earliest, 0).unwrap();
             while let Some(f) = source.try_next_frame().unwrap() {
                 sink.apply(&f).unwrap();
             }
@@ -440,7 +487,7 @@ mod tests {
         // Apply into the replica.
         {
             let mut sink =
-                ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, earliest, 0).unwrap();
+                ReplicationSink::open(&replica, "chan", REGION_U32, 0, 0, 0, earliest, 0).unwrap();
             for f in &frames {
                 sink.apply(f).unwrap();
             }
@@ -475,6 +522,7 @@ mod tests {
         {
             let mut sink = ReplicationSink::open(
                 &replica,
+                "chan",
                 region,
                 0,
                 file_roll_size,
@@ -513,7 +561,8 @@ mod tests {
     fn sink_rejects_non_contiguous_frame() {
         let replica = temp_base("noncontig");
         let mut sink =
-            ReplicationSink::open(&replica, REGION_U32, 0, 0, 0, RecordIndex(0), 0).unwrap();
+            ReplicationSink::open(&replica, "chan", REGION_U32, 0, 0, 0, RecordIndex(0), 0)
+                .unwrap();
 
         sink.apply(&RecordFrame {
             index: RecordIndex(0),
