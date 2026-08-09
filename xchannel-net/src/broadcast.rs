@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use xchannel_net_core::NodeId;
 use xchannel_net_core::codec::{decode_control, encode_control};
 use xchannel_net_core::dissemination::{Dissemination, NO_PEER, PeerId};
@@ -92,6 +92,15 @@ pub(crate) const PEER_FRAME_BUDGET: Duration = Duration::from_millis(250);
 /// Per-syscall slice, so no single `write` parks indefinitely. The frame budget above is what actually
 /// decides; this only keeps a blocked syscall from outliving it.
 const PEER_WRITE_SLICE: Duration = Duration::from_millis(100);
+
+/// Total budget for one peer's whole join-time exchange — the chunked registry sync, the heartbeat and
+/// the directory — sharing a single deadline.
+///
+/// Per-frame budgets do not compose: the sync is hundreds of frames, so a peer draining just fast enough
+/// to pass each frame individually could hold the dissemination lock for the sum of them. This is the
+/// number the tick's dial budget is charged (see the build-time assertion in `node.rs`), because a
+/// successful dial performs a join before it returns.
+pub(crate) const PEER_JOIN_BUDGET: Duration = Duration::from_millis(500);
 
 /// Identities per control frame.
 ///
@@ -213,14 +222,18 @@ impl BroadcastDissemination {
     /// Send the join-time `RegistrySync` + `Heartbeat` + directory, then spawn the reader thread and
     /// retain the send half. `addr` is `Some` for outbound links (tracked for reconnection).
     ///
-    /// **Writes first, reader second.** The reader owns a `try_clone` dup of the socket, so spawning it
-    /// before these writes meant an early return dropped only the send half: the connection stayed
-    /// ESTABLISHED with a thread parked in `recv_frame` forever, and callers discard this error, so the
-    /// dialler retried the same address on the next tick and leaked again — measured at one thread, one
-    /// descriptor and one orphaned socket per failed adopt. Before the writes were bounded they could
-    /// not fail at all, which is how that went unnoticed; bounding them made it reachable. In this order
-    /// a failure has nothing to clean up, because dropping `transport` is the last reference and closes
-    /// the connection.
+    /// **Reader first, and shut the socket down on every failure.** A failed adopt used to leak: the
+    /// reader owns a `try_clone` dup, so returning early dropped only the send half and left the
+    /// connection ESTABLISHED with a thread parked in `recv_frame` forever — one thread, one descriptor
+    /// and one orphaned socket per attempt, and callers discard this error, so the dialler retried the
+    /// same address next tick and leaked again.
+    ///
+    /// The tidier-looking repair — do the writes first, so a failure has nothing to unwind — is wrong,
+    /// and worth recording so it is not tried again. **Both ends of a pair dial**, so both adopt at the
+    /// same time; if neither reads until its own writes finish, two nodes with a large registry each
+    /// write megabytes into a socket nobody is draining, both fill, both time out, and both drop the
+    /// link — for ever, because they retry identically. Spawning the reader first means each end drains
+    /// the other's join while sending its own, which is what makes a simultaneous adopt work at all.
     fn adopt(
         &mut self,
         mut transport: TcpTransport,
@@ -234,42 +247,9 @@ impl BroadcastDissemination {
         let _ = transport.set_write_timeout(Some(PEER_WRITE_SLICE));
         let (local, peer) = transport.endpoints()?;
         let key = link_key(local, peer);
-
-        // Chunked, because anti-entropy carries the entire registry and one frame of it was measured
-        // at 10.6 MB taking 6.1 s to write to a stalled peer. The receiver merges each frame
-        // independently and the merge is idempotent and order-free, so splitting is invisible to it.
-        for batch in initial_sync.chunks(MAX_IDENTITIES_PER_FRAME) {
-            transport.send_frame_within(
-                &encode_control(&ControlMsg::RegistrySync(batch.to_vec())),
-                PEER_FRAME_BUDGET,
-            )?;
-        }
-        transport.send_frame_within(&encode_control(&self.heartbeat()), PEER_FRAME_BUDGET)?;
-        // Introduce everyone we already know, so a joiner learns the whole mesh from one link instead
-        // of only its seed. Sent once per link, not periodically.
-        //
-        // Bind the directory *before* the loop: a guard temporary in a `for` head lives to the end of
-        // the loop, so this held the membership lock across every blocking send. One peer that stopped
-        // reading would stall every reader thread waiting on that lock.
-        let directory = self.membership.lock_safe().directory();
-        for (node, addr, control_addr, name) in directory {
-            if node == self.self_node {
-                continue;
-            }
-            transport.send_frame_within(
-                &encode_control(&ControlMsg::PeerHint {
-                    node,
-                    addr,
-                    control_addr,
-                    name,
-                }),
-                PEER_FRAME_BUDGET,
-            )?;
-        }
-
+        let reader = transport.try_clone()?;
         let id = self.next_peer_id;
         self.next_peer_id += 1;
-        let reader = transport.try_clone()?;
         spawn_reader(
             reader,
             id,
@@ -285,12 +265,66 @@ impl BroadcastDissemination {
             Arc::clone(&self.same_id_addrs),
             Arc::clone(&self.dial_identity),
         );
-        self.peers.push(Peer {
-            id,
-            conn: transport,
-            key,
-            outbound: addr.is_some(),
-        });
+
+        // One deadline for the whole exchange, not one per frame — see `PEER_JOIN_BUDGET`. On any
+        // failure the socket is shut down, which is what stops the reader thread above from outliving
+        // this call.
+        match self.write_join(&mut transport, initial_sync) {
+            Ok(()) => {
+                self.peers.push(Peer {
+                    id,
+                    conn: transport,
+                    key,
+                    outbound: addr.is_some(),
+                });
+                Ok(())
+            }
+            Err(e) => {
+                let _ = transport.shutdown();
+                Err(e)
+            }
+        }
+    }
+
+    /// The join-time exchange: the chunked registry, a heartbeat, and the directory. Split out so
+    /// `adopt` has exactly one error path to clean up.
+    fn write_join(
+        &self,
+        transport: &mut TcpTransport,
+        initial_sync: &[ChannelIdentity],
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + PEER_JOIN_BUDGET;
+        // Chunked, because anti-entropy carries the entire registry and one frame of it was measured at
+        // 10.6 MB taking 6.1 s to write to a stalled peer. The receiver merges each frame independently
+        // and the merge is idempotent and order-free, so splitting is invisible to it.
+        for batch in initial_sync.chunks(MAX_IDENTITIES_PER_FRAME) {
+            transport.send_frame_by(
+                &encode_control(&ControlMsg::RegistrySync(batch.to_vec())),
+                deadline,
+            )?;
+        }
+        transport.send_frame_by(&encode_control(&self.heartbeat()), deadline)?;
+        // Introduce everyone we already know, so a joiner learns the whole mesh from one link instead of
+        // only its seed. Sent once per link, not periodically.
+        //
+        // Bind the directory *before* the loop: a guard temporary in a `for` head lives to the end of the
+        // loop, so this held the membership lock across every blocking send. One peer that stopped
+        // reading would stall every reader thread waiting on that lock.
+        let directory = self.membership.lock_safe().directory();
+        for (node, addr, control_addr, name) in directory {
+            if node == self.self_node {
+                continue;
+            }
+            transport.send_frame_by(
+                &encode_control(&ControlMsg::PeerHint {
+                    node,
+                    addr,
+                    control_addr,
+                    name,
+                }),
+                deadline,
+            )?;
+        }
         Ok(())
     }
 
@@ -782,6 +816,58 @@ mod tests {
             deleted: false,
             member_of: None,
         }
+    }
+
+    /// **Both ends adopt at the same time, and a large registry must not deadlock them.** Both ends of a
+    /// pair dial, so simultaneous adoption is the normal case rather than a race — and if a node did not
+    /// drain its peer's join while sending its own, two nodes with a big registry would each write into a
+    /// socket nobody is reading, both fill, both hit the join deadline, and both drop the link. They
+    /// would then retry identically, for ever. This is why the reader is spawned *before* the join writes
+    /// and not after, however much tidier the other order looks.
+    #[test]
+    fn two_nodes_adopting_each_other_at_once_survive_a_large_registry() {
+        // Sized to exceed the socket buffers rather than to model a realistic registry: at this size
+        // (~18 MB each way) the wrong ordering makes *both* sides time out, and this one completes in a
+        // fifth of a second. Below roughly a megabyte the buffers absorb the whole join and the hazard
+        // is invisible, which is why the number is this large.
+        let registry: Vec<ChannelIdentity> =
+            (0..300_000).map(|i| ident(&format!("c.{i}"), 1)).collect();
+
+        let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap());
+        let a_to_b = TcpTransport::connect(listen_addr).unwrap();
+        let b_to_a = accept.join().unwrap();
+
+        // Adopt from both sides at once, each pushing its whole registry at the other.
+        let sync = registry.clone();
+        let a = std::thread::spawn(move || {
+            let mut a = BroadcastDissemination::new(
+                NodeId(1),
+                "127.0.0.1:9401".parse().unwrap(),
+                Duration::from_secs(60),
+            );
+            a.add_peer(a_to_b, &sync).map(|()| a.peer_count())
+        });
+        let b = std::thread::spawn(move || {
+            let mut b = BroadcastDissemination::new(
+                NodeId(2),
+                "127.0.0.1:9402".parse().unwrap(),
+                Duration::from_secs(60),
+            );
+            b.add_peer(b_to_a, &registry).map(|()| b.peer_count())
+        });
+
+        assert_eq!(
+            a.join().unwrap().expect("A's join must complete"),
+            1,
+            "A dropped the link during a simultaneous adopt"
+        );
+        assert_eq!(
+            b.join().unwrap().expect("B's join must complete"),
+            1,
+            "B dropped the link during a simultaneous adopt"
+        );
     }
 
     /// **Hearsay about our own id has to survive as a dial candidate, or the golden-image case is

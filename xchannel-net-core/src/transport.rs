@@ -172,13 +172,23 @@ impl TcpTransport {
         bytes: &[u8],
         budget: std::time::Duration,
     ) -> io::Result<()> {
+        self.send_frame_by(bytes, std::time::Instant::now() + budget)
+    }
+
+    /// [`send_frame_within`](Self::send_frame_within) against an **absolute** deadline, so a sequence of
+    /// frames can share one.
+    ///
+    /// A per-frame budget is the wrong bound for a burst: the join-time handshake chunks the whole
+    /// registry, so a peer draining just fast enough to pass each frame's check individually could stall
+    /// the sequence for as long as it had frames — a minute and a half for a large registry, all of it
+    /// under the dissemination lock. One deadline for the whole exchange is what actually bounds it.
+    pub fn send_frame_by(&mut self, bytes: &[u8], deadline: std::time::Instant) -> io::Result<()> {
         if bytes.len() > MAX_FRAME_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "frame exceeds MAX_FRAME_LEN",
             ));
         }
-        let deadline = std::time::Instant::now() + budget;
         let len = (bytes.len() as u32).to_le_bytes();
         write_all_by(&mut self.stream, &len, deadline)?;
         write_all_by(&mut self.stream, bytes, deadline)

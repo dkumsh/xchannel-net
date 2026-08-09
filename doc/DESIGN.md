@@ -286,7 +286,14 @@ node-wide stall — and a socket send timeout is *not* such a bound: `write_all`
 syscall moved a byte, so three unresponsive peers produced a 15 s heartbeat gap against a 10 s liveness
 timeout, and a peer merely draining at 128 KiB/s produced 19 s without the timeout ever firing.
 Registry frames are therefore capped at a few hundred identities (anti-entropy, which sends the whole
-registry, is chunked), and each frame is given a deadline after which the peer is dropped. Relays and
+registry, is chunked), and writes are given deadlines after which the peer is dropped — one deadline for
+the entire join-time exchange rather than one per frame, because hundreds of frames each passing their
+own check individually still add up to a stalled lock.
+
+A related ordering is load-bearing and easy to get backwards: a node **spawns its reader before** sending
+its own join, so that it drains its peer while writing. Both ends of a pair dial, so both adopt at once;
+without that, two nodes with a large registry fill each other's socket buffers, both hit the deadline,
+and both drop the link — then retry identically for ever. Relays and
 replies are coalesced to one frame per *source link* per pump cycle rather than one per identity: that
 alone took a 200 000-identity delta from a 40 s heartbeat gap to 0.7 s.
 

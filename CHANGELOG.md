@@ -242,7 +242,8 @@ Everything from here down was found by a pre-release review of the four changes 
     real peer whose link merely dropped.
   - **Seeds, learned peers and same-id candidates carry separate budgets**, so a tick's worst-case dial
     spend is their sum, not the one budget the constant's own doc claimed. A build-time assertion ties
-    that spend — count × (connect timeout + frame budget) — to `LIVENESS_TIMEOUT` with a fixed reserve
+    that spend — count × (connect timeout + join budget, since a successful dial performs a whole join
+    before returning) — to `LIVENESS_TIMEOUT` with a fixed reserve
     held back for the rest of the tick, because a heartbeat period that quietly grows past it looks
     healthy right until every peer declares this node dead. It is a bound on *dialling*, not on the
     tick; the first version of it was written in truncating whole seconds and omitted the frame budget,
@@ -270,7 +271,10 @@ Everything from here down was found by a pre-release review of the four changes 
   - Registry frames are **chunked** to a few hundred identities. Anti-entropy sends the whole registry
     on every reconnect, and one frame of it was measured at 10.6 MB taking 6.1 s to write to a stalled
     peer — all of it under the lock.
-  - Each frame carries a **deadline**, after which the peer is dropped. A socket send timeout is not a
+  - The join-time exchange carries **one deadline for the whole thing**, and every other frame its own;
+    past the deadline the peer is dropped. A per-frame budget does not compose over a burst: the chunked
+    sync is hundreds of frames, so a peer draining just fast enough to pass each check individually could
+    hold the lock for the sum of them. A socket send timeout is not a
     substitute and it was a mistake to ship one as if it were: `write_all` retries whenever a syscall
     moved a byte, so three unresponsive peers produced a **15.03 s** heartbeat gap against a 2 s
     setting, and a peer draining at 128 KiB/s produced **19.37 s** with the timeout never firing at all.
@@ -299,9 +303,13 @@ Everything from here down was found by a pre-release review of the four changes 
   spawned on a duplicate of the socket, so returning early dropped only the send half and left the
   connection ESTABLISHED with a thread parked on it forever — and callers discard that error, so the
   dialler retried the same address next tick and leaked again. Measured at one of each per attempt.
-  Bounding the writes above is what made the path reachable at all, which is how it arrived and got
-  fixed in the same release: the writes now happen *before* the reader is spawned, so a failure has
-  nothing to unwind.
+  Bounding the writes above is what made the path reachable at all, which is how it arrived and got fixed
+  in the same release. The fix is a `shutdown()` on the failure path, with the reader left where it was.
+  The tidier-looking alternative — write first, so a failure has nothing to unwind — is a trap worth
+  recording: **both ends of a pair dial, so both adopt simultaneously**, and if neither drains while both
+  write, two nodes with a large registry fill each other's buffers, both hit the deadline, and both drop
+  the link — then retry identically, for ever. Measured: at 18 MB of join sync each way, that ordering
+  times out both sides; the shipped ordering completes in 0.22 s. A test pins it.
 
 - **A node listing itself among its seeds kept a permanent link to itself** — a thread, two descriptors
   and a heartbeat exchanged with nobody, held forever because a self-link never learns an identity and

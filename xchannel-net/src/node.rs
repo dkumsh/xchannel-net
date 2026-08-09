@@ -59,7 +59,12 @@ const MAX_BATCH_PER_POLL_ITEM: usize = 256;
 const RESOLVE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Bounded dial, so an unreachable owner costs one establishment thread a moment, not minutes.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+///
+/// Half a second rather than a full one, because it is charged five times per maintenance tick and the
+/// tick has a liveness budget to fit inside (see the assertion below). The target is a LAN, where a
+/// reachable host completes a connect in well under a millisecond; what this really sizes is how long a
+/// *blackholed* address costs, and shortening it makes those cheaper to discover, not harder.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Peer dials attempted per maintenance tick, **per candidate list**.
 ///
@@ -121,7 +126,7 @@ const MAX_TWIN_DIALS_PER_TICK: usize = 1;
 /// bound on *dialling*, which is what it says, not as a bound on the tick.
 const _: () = assert!(
     (2 * MAX_DIALS_PER_TICK + MAX_TWIN_DIALS_PER_TICK) as u128
-        * (CONNECT_TIMEOUT.as_millis() + crate::broadcast::PEER_FRAME_BUDGET.as_millis())
+        * (CONNECT_TIMEOUT.as_millis() + crate::broadcast::PEER_JOIN_BUDGET.as_millis())
         + TICK_RESERVE.as_millis()
         <= LIVENESS_TIMEOUT.as_millis(),
     "the worst-case dial spend leaves less than TICK_RESERVE of LIVENESS_TIMEOUT for the rest of the \
