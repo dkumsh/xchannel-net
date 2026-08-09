@@ -51,6 +51,11 @@ type DialIdentity = Arc<Mutex<HashMap<SocketAddr, NodeId>>>;
 /// way to tell a *twin* (another machine claiming our `NodeId`) from a *self-link* (a seed list that
 /// names this node), and it is not known until the control listener has bound.
 type SelfControl = Arc<Mutex<SocketAddr>>;
+/// Addresses at which *our own* `NodeId` has been reported by a third party.
+///
+/// Kept apart from membership on purpose: this is a **dial candidate**, not a member. Recording it as
+/// a member would put a twin's addresses under our own id, and hearsay must never confer liveness.
+type SameIdAddrs = Arc<Mutex<HashSet<SocketAddr>>>;
 /// `NodeId`s a reader has caught being used by more than one machine, including our own. Reader
 /// threads cannot resolve this — they have no send halves and no access to the data directory — so
 /// they record it and [`BroadcastDissemination::dedup_links`] hands it to the node.
@@ -68,6 +73,17 @@ fn link_key(local: SocketAddr, peer: SocketAddr) -> LinkKey {
         (peer, local)
     }
 }
+
+/// How long a blocking write to a peer may stall before that peer is treated as dead.
+///
+/// The control plane writes under the dissemination lock, so this is the bound on how long one
+/// unresponsive peer can stop *everything* — including the heartbeat that keeps this node in every
+/// other peer's live set. Comfortably under `LIVENESS_TIMEOUT` for that reason.
+const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Cap on remembered addresses claiming our own id. A genuine duplicate is one or two; the bound is
+/// there because the source is unauthenticated gossip.
+const MAX_SAME_ID_ADDRS: usize = 8;
 
 /// One peer link: the send half, plus what is needed to resolve a duplicate deterministically.
 struct Peer {
@@ -107,6 +123,8 @@ pub struct BroadcastDissemination {
     link_peers: LinkPeers,
     /// `NodeId`s seen on two machines, as detected by the reader threads.
     conflicts: Conflicts,
+    /// Addresses where a third party has reported *our* id — the twin dial candidates.
+    same_id_addrs: SameIdAddrs,
     /// Filled by per-peer reader threads; drained by [`pump`](Self::pump).
     inbox: Inbox,
     membership: SharedMembership,
@@ -127,6 +145,7 @@ impl BroadcastDissemination {
             hints: Arc::new(Mutex::new(VecDeque::new())),
             link_peers: Arc::new(Mutex::new(HashMap::new())),
             conflicts: Arc::new(Mutex::new(HashSet::new())),
+            same_id_addrs: Arc::new(Mutex::new(HashSet::new())),
             inbox: Arc::new(Mutex::new(VecDeque::new())),
             membership: Arc::new(Mutex::new(Membership::new())),
             connected: Arc::new(Mutex::new(HashSet::new())),
@@ -179,6 +198,13 @@ impl BroadcastDissemination {
         initial_sync: &[ChannelIdentity],
     ) -> io::Result<()> {
         let reader = transport.try_clone()?;
+        // **Bound the send side.** Every control-plane write — heartbeat, announce, relay, reply, and
+        // the directory below — is a blocking `write_all` made while holding the dissemination lock.
+        // A peer that is alive but not draining (stopped, swapping, or wedged itself) therefore stalls
+        // this node's entire control plane, silently and indefinitely. With a timeout the write fails
+        // instead, and a failed write is already how a dead peer is reaped. Chosen long enough that
+        // it can only mean malfunction: a healthy LAN peer drains a frame in microseconds.
+        let _ = transport.set_write_timeout(Some(PEER_WRITE_TIMEOUT));
         let (local, peer) = transport.endpoints()?;
         let key = link_key(local, peer);
         let id = self.next_peer_id;
@@ -195,6 +221,7 @@ impl BroadcastDissemination {
             self.self_node,
             Arc::clone(&self.self_control_addr),
             Arc::clone(&self.conflicts),
+            Arc::clone(&self.same_id_addrs),
             Arc::clone(&self.dial_identity),
         );
 
@@ -322,6 +349,15 @@ impl BroadcastDissemination {
             .collect()
     }
 
+    /// Which node has ever identified itself over a link **we dialled at this exact address** —
+    /// proof that the address is a working peer rather than merely one that accepts connections.
+    ///
+    /// Deliberately not `node_at`: that consults membership, where every learned candidate address
+    /// already appears, so it would call an address proven before anything was ever heard from it.
+    pub fn dialled_identity(&self, addr: SocketAddr) -> Option<NodeId> {
+        self.dial_identity.lock_safe().get(&addr).copied()
+    }
+
     /// Which node is known to sit at `addr`, if any — by its advertised control address first, and
     /// otherwise by what a previous dial to that exact address turned out to reach.
     ///
@@ -372,6 +408,21 @@ impl BroadcastDissemination {
             node: self.self_node,
         });
         self.broadcast(&frame);
+    }
+
+    /// Addresses a third party has reported *our own* `NodeId` at, and which we hold no link to.
+    ///
+    /// These are the twin candidates. Dialling one is how a clone meets its sibling — see the
+    /// `PeerHint` arm of the reader — and the heartbeat that arrives over the resulting link is what
+    /// turns suspicion into the exact comparison `dedup_links` reports.
+    pub fn same_id_candidates(&self) -> Vec<SocketAddr> {
+        let connected = self.connected.lock_safe();
+        self.same_id_addrs
+            .lock_safe()
+            .iter()
+            .filter(|addr| !connected.contains(addr))
+            .copied()
+            .collect()
     }
 
     /// Peers we know of but hold no outbound link to, as `(node, control address)`.
@@ -522,6 +573,7 @@ fn spawn_reader(
     self_node: NodeId,
     self_control: SelfControl,
     conflicts: Conflicts,
+    same_id_addrs: SameIdAddrs,
     dial_identity: DialIdentity,
 ) {
     let dial_addr = addr;
@@ -553,12 +605,16 @@ fn spawn_reader(
                             conflicts.lock_safe().insert(node);
                         }
                         // **Never `record` under our own id, in either case.** Doing so overwrote
-                        // our own membership entry with the twin's addresses, and since
-                        // `unconnected_peers` skips `self_node`, the twin was then permanently
-                        // excluded from the dial candidates — the two would never meet again, and
-                        // the duplicate could not be resolved even in principle. Leaving the link's
+                        // our own membership entry with the twin's addresses — and membership is what
+                        // `live_addr_of` answers from, so a third party's subscribers were handed
+                        // whichever of the two machines heartbeated most recently. Leaving the link's
                         // identity unclaimed also keeps a self-link out of the tie-break, where it
                         // would compete with a real peer's link.
+                        //
+                        // Note what this is *not*: it is not what kept two clones from meeting. Dial
+                        // candidates exclude our own id by construction, in `unconnected_peers`, so
+                        // they could not have met whatever this entry said. The `PeerHint` arm below
+                        // is where that is repaired.
                         continue;
                     }
                     // A heartbeat is the only thing that says who is on the far end of this link,
@@ -588,11 +644,32 @@ fn spawn_reader(
                     name,
                 } => {
                     if node == self_node {
-                        // Hearsay about ourselves. Our own heartbeat is the authority on our
-                        // addresses, and `learn`ing them from a third party would overwrite that
-                        // entry with a twin's — the same trap as above, reached from the other side.
-                        // A twin's *existence* is still detected, but only by the heartbeat path,
-                        // which is the only one that can distinguish it from a self-link.
+                        // Hearsay about ourselves. It must not enter membership — our own heartbeat
+                        // is the authority on our addresses, and `learn`ing them from a third party
+                        // would overwrite that entry with a twin's.
+                        //
+                        // But it must not be discarded either, because **this is the only way two
+                        // clones of one data directory ever hear of each other.** Neither dials the
+                        // other: dial candidates come from membership, which excludes our own id by
+                        // construction. So a fleet of clones seeded at a common bootstrap stayed
+                        // undetected forever — each clone linked only to the bootstrap, which saw the
+                        // duplicate plainly and could do nothing about it. That is the golden-image
+                        // case the step-aside exists for, and it was unreachable.
+                        //
+                        // Keep the address as a *dial candidate*. Hearsay alone must not condemn an
+                        // identity — a node that restarted on an ephemeral port would find peers
+                        // relaying its own stale address and delete its identity over it — so the
+                        // hint only earns a dial, and the heartbeat that comes back over that link is
+                        // what decides twin-versus-self-link, on direct evidence, as always.
+                        if control_addr != *self_control.lock_safe() {
+                            let mut same = same_id_addrs.lock_safe();
+                            // A real duplicate is one or two addresses. Cap it: this is fed by
+                            // unauthenticated gossip, and an unbounded dial-candidate set that any
+                            // peer can grow is a way to spend this node's whole dial budget.
+                            if same.len() < MAX_SAME_ID_ADDRS {
+                                same.insert(control_addr);
+                            }
+                        }
                         continue;
                     }
                     if membership
@@ -644,6 +721,18 @@ mod tests {
     use xchannel_net_core::RecordIndex;
     use xchannel_net_core::transport::{Listener, TcpListener};
 
+    /// Poll a condition for up to two seconds. The reader runs on its own thread, so anything it
+    /// records is observed rather than awaited.
+    fn poll_for<R>(mut f: impl FnMut() -> Option<R>) -> R {
+        for _ in 0..2000 {
+            if let Some(r) = f() {
+                return r;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("condition not met within timeout");
+    }
+
     fn ident(name: &str, owner: u64) -> ChannelIdentity {
         ChannelIdentity {
             name: name.to_string(),
@@ -656,6 +745,66 @@ mod tests {
             deleted: false,
             member_of: None,
         }
+    }
+
+    /// **Hearsay about our own id has to survive as a dial candidate, or the golden-image case is
+    /// undetectable.** Two clones of one data directory seeded at a common bootstrap link only to the
+    /// bootstrap; neither dials the other, because dial candidates come from membership and membership
+    /// excludes our own id by construction. The bootstrap sees the duplicate plainly and can do
+    /// nothing about it. The `PeerHint` naming our own id at the sibling's address is the only thread
+    /// back to the sibling, and dropping it made the step-aside unreachable in exactly the deployment
+    /// it was written for.
+    ///
+    /// The hint must earn a *dial* and nothing more: it must not become a member (hearsay confers no
+    /// liveness) and it must not by itself condemn the identity, because a node restarted on an
+    /// ephemeral port would find peers relaying its own stale address.
+    #[test]
+    fn hearsay_about_our_own_id_becomes_a_dial_candidate_and_not_a_member() {
+        let ours: SocketAddr = "127.0.0.1:9201".parse().unwrap();
+        let sibling: SocketAddr = "127.0.0.1:9202".parse().unwrap();
+
+        let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap());
+        let mut bootstrap = TcpTransport::connect(listen_addr).unwrap();
+        let near = accept.join().unwrap();
+
+        let mut us = BroadcastDissemination::new(NodeId(7), ours, Duration::from_secs(60));
+        us.set_self_control_addr(ours);
+        us.add_peer(near, &[]).unwrap();
+
+        // What a bootstrap relays when two clones share an id: our own id, at an address that is not
+        // ours. Plus a hint carrying our *own* address, which must be ignored — that is just the
+        // bootstrap telling us about ourselves.
+        for addr in [sibling, ours] {
+            bootstrap
+                .send_frame(&encode_control(&ControlMsg::PeerHint {
+                    node: NodeId(7),
+                    addr,
+                    control_addr: addr,
+                    name: "clone".into(),
+                }))
+                .unwrap();
+        }
+
+        let candidates = poll_for(|| {
+            let c = us.same_id_candidates();
+            (!c.is_empty()).then_some(c)
+        });
+        assert_eq!(
+            candidates,
+            vec![sibling],
+            "the sibling's address must be a dial candidate, and our own must not"
+        );
+        assert_eq!(
+            us.addr_of(NodeId(7)),
+            None,
+            "hearsay about our own id must never enter membership"
+        );
+        assert!(
+            us.dedup_links().is_empty(),
+            "a hint is not evidence of a twin — only a heartbeat over a real link is"
+        );
     }
 
     /// **The duplicate that matters is the one where the duplicated id is ours**, and it is invisible
@@ -709,10 +858,9 @@ mod tests {
             );
 
             // Either way, our own membership entry must not have been overwritten with the far
-            // end's addresses. It was: `record` was called under our own id, and since
-            // `unconnected_peers` skips `self_node`, the twin was then permanently excluded from the
-            // dial candidates — the two could never meet again, so the duplicate could not be
-            // resolved even in principle.
+            // end's addresses. It was — `record` was called under our own id — and membership is what
+            // `live_addr_of` answers from, so a third party's subscribers were sent to whichever of
+            // the two machines had heartbeated last.
             assert_eq!(
                 us.addr_of(NodeId(7)),
                 None,

@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use xchannel::{Writer, WriterBuilder};
 use xchannel_net_core::codec::{self, decode_client_request, encode_client_reply};
-use xchannel_net_core::dissemination::Dissemination;
+use xchannel_net_core::dissemination::{Dissemination, PeerId};
 use xchannel_net_core::identity::ChannelIdentity;
 use xchannel_net_core::mux::{self, Mux};
 use xchannel_net_core::stream::{
@@ -61,7 +61,7 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_millis(200);
 /// Bounded dial, so an unreachable owner costs one establishment thread a moment, not minutes.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Peer dials attempted per maintenance tick.
+/// Peer dials attempted per maintenance tick, **per candidate list**.
 ///
 /// The maintenance loop is also the heartbeat loop, and a dial to a blackholed address costs a
 /// full `CONNECT_TIMEOUT`. Unbounded dialling therefore let the *number of addresses this node has
@@ -69,7 +69,30 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// `LIVENESS_TIMEOUT` and every peer declared this healthy node dead. Two dials per 500 ms tick
 /// still closes a fresh mesh in well under a second per peer, while keeping the worst-case tick
 /// far below the liveness budget.
+///
+/// Seeds and learned peers carry **separate** budgets, so a tick's worst case is the sum across
+/// lists, not this number. Sharing one budget would let a long list of learned ghosts crowd out the
+/// seeds, and the seeds are the only addresses an operator actually chose: they are how a partitioned
+/// node finds its way back.
 const MAX_DIALS_PER_TICK: usize = 2;
+
+/// Dials per tick spent on addresses claiming this node's own id.
+///
+/// Smaller than the others because a duplicate identity is a misconfiguration, not a topology: there
+/// are one or two such addresses, they are worth reaching promptly, and they must never be able to
+/// slow ordinary mesh formation. One per tick reaches a twin inside a second.
+const MAX_TWIN_DIALS_PER_TICK: usize = 1;
+
+/// The coupling that makes the cap worth having: a tick must fit inside the liveness budget with
+/// room to spare, since dialling is only part of what a tick does. Stated as a build-time check
+/// because the failure it guards against is invisible — a heartbeat period that quietly exceeds
+/// `LIVENESS_TIMEOUT` gets this node declared dead by every peer, and the topic member reaper then
+/// tombstones its live members' names.
+const _: () = assert!(
+    (2 * MAX_DIALS_PER_TICK + MAX_TWIN_DIALS_PER_TICK) as u64 * CONNECT_TIMEOUT.as_secs() * 2
+        <= LIVENESS_TIMEOUT.as_secs(),
+    "the worst-case dial budget leaves too little of LIVENESS_TIMEOUT for the rest of the tick"
+);
 
 /// First retry gap after a failed dial, doubling to [`DIAL_BACKOFF_MAX`].
 ///
@@ -350,6 +373,27 @@ pub struct TopicStatus {
     pub promoted: bool,
 }
 
+/// **Lock order — acquire in this sequence, never against it:**
+///
+/// ```text
+/// dissemination → registry → {hosted, subscriptions, muxes, discovery, topic_reap, ...}
+/// ```
+///
+/// `dissemination` outranks `registry` because a peer being adopted must be handed a registry
+/// snapshot that cannot have moved since the delta broadcast that preceded it, which means taking
+/// the snapshot *inside* the dissemination lock. The leaf locks are unordered among themselves; no
+/// path holds two of them and reaches back up.
+///
+/// This is a documented invariant with nothing enforcing it, and it has been violated once, so the
+/// hazard is worth naming precisely: **a `MutexGuard` in an `if let` / `match` scrutinee is held for
+/// the whole body.** Rust 2024 moved that drop point ahead of the `else` arm only. So
+///
+/// ```ignore
+/// if let Some(t) = self.registry.lock_safe().deregister(name, id) { self.announce(&t)?; }
+/// ```
+///
+/// holds the registry lock across the announce and deadlocks against any thread taking the locks in
+/// the documented order. Bind the value to a `let` first; the guard then drops at the semicolon.
 #[derive(Clone)]
 pub struct Node {
     config: Arc<NodeConfig>,
@@ -359,11 +403,9 @@ pub struct Node {
     /// Incarnation of this daemon's discovery log — fresh per process, so a client's cursor
     /// from a previous run is recognisably stale.
     discovery_generation: u64,
-    /// When this node started. Bounds how long an owner can be *known* to have been silent:
-    /// a daemon that just came up has heard from nobody, and must not conclude every channel
-    /// in the registry is abandoned.
     /// `NodeId`s already complained about, so a permanent duplicate produces one warning rather
-    /// than one per maintenance tick.
+    /// than one per maintenance tick. Gates the *message* only — never the decision to stand
+    /// aside, which has to be re-evaluated as often as it is detected.
     dup_reported: Arc<Mutex<HashSet<NodeId>>>,
     /// Per-owner "unreachable from here since" clock, for owners we have never had contact with.
     /// Bounded by the registry's owner set, which `note_unreachable_owners` prunes it to.
@@ -372,9 +414,18 @@ pub struct Node {
     /// that instant. Bounded by the candidate set, and only ever holding addresses we have failed
     /// to reach.
     dial_backoff: Arc<Mutex<HashMap<SocketAddr, (Instant, Duration)>>>,
-    /// Where the last tick's dial budget stopped, so the candidate list is walked round-robin
-    /// rather than always from its head.
-    dial_cursor: Arc<Mutex<usize>>,
+    /// Where the last tick's dial budget stopped in each candidate list, so a list is walked
+    /// round-robin rather than always from its head.
+    ///
+    /// **One cursor per list, because they have different lengths.** A single shared cursor was
+    /// reduced modulo each list in turn, so the seed walk — usually one or two entries — reset it
+    /// into `0..=S` on every tick and the learned walk started at a constant index forever. With one
+    /// seed it was pinned to index 1 permanently, which is precisely the behaviour the rotation was
+    /// added to prevent.
+    dial_cursor_seeds: Arc<Mutex<usize>>,
+    dial_cursor_learned: Arc<Mutex<usize>>,
+    /// Walk position over addresses claiming this node's own id (the twin candidates).
+    dial_cursor_twins: Arc<Mutex<usize>>,
     /// Channels this node hosts (is the origin for): name → where + geometry to serve.
     hosted: Arc<Mutex<HashMap<String, ChannelSource>>>,
     /// Network-wide channel directory (CRDT), converged via dissemination.
@@ -442,7 +493,9 @@ impl Node {
             dup_reported: Arc::new(Mutex::new(HashSet::new())),
             owner_unreachable_since: Arc::new(Mutex::new(HashMap::new())),
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
-            dial_cursor: Arc::new(Mutex::new(0)),
+            dial_cursor_seeds: Arc::new(Mutex::new(0)),
+            dial_cursor_learned: Arc::new(Mutex::new(0)),
+            dial_cursor_twins: Arc::new(Mutex::new(0)),
             config: Arc::new(config),
         }
     }
@@ -1290,11 +1343,20 @@ impl Node {
         }
 
         // Tombstone the topic channel itself so it's no longer discoverable.
-        if let Some(tombstone) = self
+        //
+        // **Bound before the `if let`.** A guard in the scrutinee lives for the whole body, so
+        // writing this as `if let Some(t) = self.registry.lock_safe().deregister(..)` held the
+        // registry lock across both the `hosted` lock and the announce — the exact inversion of this
+        // type's documented lock order, and a hard deadlock against any thread dialling a peer or
+        // accepting one (both of which take dissemination, then registry). It hung within a couple of
+        // hundred retirements when a single inbound control connection arrived every 5 ms, and it hung
+        // silently: the dissemination lock is the whole control plane, so the node stops heartbeating
+        // and every peer declares it dead.
+        let tombstone = self
             .registry
             .lock_safe()
-            .deregister(topic, self.config.node_id)
-        {
+            .deregister(topic, self.config.node_id);
+        if let Some(tombstone) = tombstone {
             self.hosted.lock_safe().remove(topic);
             self.disseminate_tombstone(&tombstone)?;
         }
@@ -1480,9 +1542,15 @@ impl Node {
     ///
     /// Direct silence is preferred when we have it. When we do not — and relay plus `PeerHint` have
     /// made that the ordinary case, since a registry entry routinely arrives second-hand for a node
-    /// we hold no link to — the answer is how long this node has known of the owner and failed to
-    /// reach it, tracked by `note_unreachable_owners` on the maintenance tick and reset the instant
+    /// we hold no link to — the answer is how long this node has known of the owner *while unable to
+    /// reach it*, tracked by `note_unreachable_owners` on the maintenance tick and reset the instant
     /// contact is made.
+    ///
+    /// Be precise about what that second quantity is **not**: it is not a record of failed dials. An
+    /// owner whose control address this node has never learned cannot be dialled at all, and its clock
+    /// runs regardless. What the floor establishes is "known here, and not reachable from here, for
+    /// this long" — the observation window behind an operator's assertion that a host is gone, not
+    /// evidence that this node tried and failed.
     ///
     /// What it must **never** be is this node's own uptime, which is what it used to fall back to.
     /// That is not an observation about the owner at all: every daemon older than `reclaim_after`
@@ -1543,9 +1611,11 @@ impl Node {
     /// peers keep the earlier registration, it wins the merge, and the channels are frozen until
     /// an operator reclaims the names. So past that point this can only warn.
     ///
-    /// The case this actually rescues is a golden image snapshotted after the daemon's first start
-    /// — every clone carries the same `.node_id` and owns nothing, so every clone but one steps
-    /// aside on its own.
+    /// The case this actually rescues is a golden image snapshotted after the daemon's first start —
+    /// every clone carries the same `.node_id` and owns nothing. **Every clone stands aside, not all
+    /// but one**: they detect each other simultaneously and none has grounds to consider itself the
+    /// original. That is harmless, because none of them owned anything, and each comes back with a
+    /// fresh id.
     fn report_duplicate_identity(&self, conflicts: &[NodeId]) -> OnDuplicateIdentity {
         // Once per id, not once per tick. Detection is a standing condition, not an event: for the
         // cases below that can only warn, the maintenance loop re-detects the same duplicate twice a
@@ -1571,25 +1641,29 @@ impl Node {
             // Someone else's collision; nothing safe for us to do about it.
             return OnDuplicateIdentity::Continue;
         }
-        // Below this point the id is ours. Either we step aside — which happens once, because it
-        // stops the daemon — or we can only advise, and that advice is worth printing once.
-        if !fresh.contains(&self.config.node_id) {
-            return OnDuplicateIdentity::Continue;
-        }
+        // Below this point the id is ours. **The rate limit gates the message, never the verdict.**
+        // Returning early for a repeat detection latched the first tick's answer forever: a node that
+        // happened to own a channel when it first noticed could not stand aside later, once it owned
+        // nothing — and standing aside is only ever safe in that later state.
+        let say = fresh.contains(&self.config.node_id);
         if !self.config.id_generated {
-            eprintln!(
-                "xchanneld[{}]: its id was set explicitly (XCHANNELD_NODE_ID), so this daemon \
-                 will not change it — resolve the duplicate and restart.",
-                self.config.node_id.0
-            );
+            if say {
+                eprintln!(
+                    "xchanneld[{}]: its id was set explicitly (XCHANNELD_NODE_ID), so this daemon \
+                     will not change it — resolve the duplicate and restart.",
+                    self.config.node_id.0
+                );
+            }
             return OnDuplicateIdentity::Continue;
         }
         if !self.hosted.lock_safe().is_empty() {
-            eprintln!(
-                "xchanneld[{}]: this daemon already owns channels, so changing its id would \
-                 orphan them — resolve the duplicate manually.",
-                self.config.node_id.0
-            );
+            if say {
+                eprintln!(
+                    "xchanneld[{}]: this daemon already owns channels, so changing its id would \
+                     orphan them — resolve the duplicate manually.",
+                    self.config.node_id.0
+                );
+            }
             return OnDuplicateIdentity::Continue;
         }
         match crate::node_identity::discard(&self.config.data_dir) {
@@ -1631,64 +1705,99 @@ impl Node {
         if d.is_connected(addr) {
             return false;
         }
+        // Never dial our own advertised control address. A seed list naming every node in the mesh —
+        // including this one — is the ordinary way an operator writes one, and it produced a permanent
+        // link from this node to itself: a thread, two file descriptors and a heartbeat exchanged with
+        // nobody, kept forever because a self-link never learns an identity and `dedup_links`
+        // deliberately keeps a link whose peer it does not know.
+        if addr == d.self_control_addr() {
+            return false;
+        }
         match d.node_at(addr) {
             Some(node) => !d.linked_nodes().contains(&node),
             None => true,
         }
     }
 
-    /// Dial `addr` as a peer, best-effort, recording the outcome so a repeatedly unreachable
-    /// address backs off instead of costing a full `CONNECT_TIMEOUT` every tick.
+    /// Dial `addr` as a peer, best-effort.
+    ///
+    /// **The attempt is charged, not the failure.** Clearing the penalty on a successful *connect*
+    /// looked right and let one address consume the budget forever: an address can accept a TCP
+    /// connection and then drop the link — a seed or hint naming a peer's stream port instead of its
+    /// control port, or a peer on a release whose control frames this one cannot decode — and that
+    /// costs a full dial while recording nothing. The reader clears `connected` when the link dies,
+    /// so the next tick found it unlinked, un-penalised, and due, and spent a dial on it again. Two
+    /// such addresses starved every live peer behind them permanently.
+    ///
+    /// The refund is in [`dial_due`](Self::dial_due), and it is granted for having *identified
+    /// itself* rather than for having accepted a connection.
     fn dial_peer(&self, addr: SocketAddr) {
-        let outcome = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT).and_then(|conn| {
+        {
+            let mut backoff = self.dial_backoff.lock_safe();
+            let gap = backoff
+                .get(&addr)
+                .map_or(DIAL_BACKOFF_MIN, |(_, g)| (*g * 2).min(DIAL_BACKOFF_MAX));
+            backoff.insert(addr, (Instant::now() + gap, gap));
+        }
+        if let Ok(conn) = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT) {
             let mut d = self.dissemination.lock_safe();
             let snapshot = self.registry_snapshot();
-            d.add_outbound_peer(conn, addr, &snapshot)
-        });
-        let mut backoff = self.dial_backoff.lock_safe();
-        match outcome {
-            // Reached it: forget the penalty entirely, so a peer that flaps is dialled promptly
-            // the next time rather than serving out a gap it earned an hour ago.
-            Ok(()) => {
-                backoff.remove(&addr);
-            }
-            Err(_) => {
-                let gap = backoff
-                    .get(&addr)
-                    .map_or(DIAL_BACKOFF_MIN, |(_, g)| (*g * 2).min(DIAL_BACKOFF_MAX));
-                backoff.insert(addr, (Instant::now() + gap, gap));
-            }
+            let _ = d.add_outbound_peer(conn, addr, &snapshot);
         }
     }
 
-    /// Whether `addr` has served out its backoff. Unknown addresses are always due — the first
-    /// attempt is never delayed.
+    /// Whether `addr` may be dialled now. Unknown addresses are always due — a first attempt is
+    /// never delayed.
+    ///
+    /// An address that has served out its gap is due, and so is one that has **identified itself**
+    /// over a link we dialled there: that is a real peer whose link merely dropped, and re-dialling
+    /// it promptly is the entire point of reconnection. An address that has only ever *accepted* gets
+    /// no such credit.
+    ///
+    /// Takes the two locks one at a time rather than nesting them — `dial_backoff` is a leaf lock and
+    /// `dissemination` outranks it, so holding the leaf across the acquisition would invert this
+    /// type's documented lock order.
     fn dial_due(&self, addr: SocketAddr) -> bool {
-        self.dial_backoff
+        let Some(next) = self
+            .dial_backoff
             .lock_safe()
             .get(&addr)
-            .is_none_or(|(next, _)| Instant::now() >= *next)
+            .map(|(next, _)| *next)
+        else {
+            return true;
+        };
+        if Instant::now() >= next {
+            return true;
+        }
+        if self
+            .dissemination
+            .lock_safe()
+            .dialled_identity(addr)
+            .is_some()
+        {
+            self.dial_backoff.lock_safe().remove(&addr);
+            return true;
+        }
+        false
     }
 
-    /// Dial at most [`MAX_DIALS_PER_TICK`] of `candidates`, skipping those already linked, those
-    /// still in backoff, and those with no dialable address.
+    /// Dial at most `budget` of `candidates`, skipping those already linked, those still in backoff,
+    /// and those with no dialable address.
     ///
     /// Rotating rather than restarting is what keeps a long candidate list fair: taking the first
     /// two every time would let two permanently-dead addresses at the head of the list starve
     /// every live peer behind them, which is the same starvation the cap was added to prevent.
-    fn dial_some(&self, candidates: &[SocketAddr]) {
+    fn dial_some(&self, candidates: &[SocketAddr], cursor: &Mutex<usize>, budget: usize) {
         if candidates.is_empty() {
             return;
         }
         let start = {
-            let mut c = self.dial_cursor.lock_safe();
-            let start = *c % candidates.len();
-            *c = start + 1;
-            start
+            let c = cursor.lock_safe();
+            *c % candidates.len()
         };
         let mut spent = 0;
         for i in 0..candidates.len() {
-            if spent == MAX_DIALS_PER_TICK {
+            if spent == budget {
                 break;
             }
             let addr = candidates[(start + i) % candidates.len()];
@@ -1701,6 +1810,10 @@ impl Node {
             self.dial_peer(addr);
             spent += 1;
         }
+        // Advance by what was actually consumed, so the next tick resumes past the addresses this
+        // one spent its budget on. Setting the cursor to a fixed offset from `start` instead —
+        // `start + 1` — discarded the walk and left it re-entering the list at the same place.
+        *cursor.lock_safe() = start + spent;
     }
 
     /// Dial peers we have *learned about* but hold no link to, so a seed graph closes itself into
@@ -1713,14 +1826,21 @@ impl Node {
     /// have worked first time. So both dial, and the resulting duplicate is collapsed afterwards
     /// by `dedup_links`, which can decide it knowing who is actually reachable.
     pub fn connect_learned_peers(&self) {
-        let candidates: Vec<SocketAddr> = self
-            .dissemination
-            .lock_safe()
-            .unconnected_peers()
-            .into_iter()
-            .map(|(_, control_addr)| control_addr)
-            .collect();
-        self.dial_some(&candidates);
+        let (candidates, twins) = {
+            let d = self.dissemination.lock_safe();
+            let candidates: Vec<SocketAddr> = d
+                .unconnected_peers()
+                .into_iter()
+                .map(|(_, control_addr)| control_addr)
+                .collect();
+            (candidates, d.same_id_candidates())
+        };
+        self.dial_some(&candidates, &self.dial_cursor_learned, MAX_DIALS_PER_TICK);
+        // Addresses where a third party has reported *our own* id, on their own budget. They cannot
+        // ride the learned-peer list: that list excludes our id by construction, which is exactly why
+        // two clones of one data directory never met. Giving them a separate budget also keeps a
+        // duplicate — a misconfiguration — from crowding out ordinary mesh formation.
+        self.dial_some(&twins, &self.dial_cursor_twins, MAX_TWIN_DIALS_PER_TICK);
     }
 
     /// (Re)connect to configured seeds not currently linked. Called each maintenance tick, so a
@@ -1733,7 +1853,7 @@ impl Node {
         // Same identity check as a learned peer (inside `dial_some`). Without it, a seed link that
         // lost the duplicate tie-break would be re-dialled every tick and dropped again every tick.
         let seeds = self.config.seeds.clone();
-        self.dial_some(&seeds);
+        self.dial_some(&seeds, &self.dial_cursor_seeds, MAX_DIALS_PER_TICK);
     }
 
     fn registry_snapshot(&self) -> Vec<ChannelIdentity> {
@@ -1775,6 +1895,16 @@ impl Node {
             };
             if !pumped.is_empty() {
                 let mut retired = Vec::new();
+                // **Accumulate, then send once per source.** One frame per identity meant one
+                // dissemination-lock acquisition and one blocking write per identity, and a peer can
+                // deliver any number of identities in a single frame: 200 000 of them produced a
+                // forty-second heartbeat gap, four times `LIVENESS_TIMEOUT`, so every peer declared
+                // this node dead and the topic member reaper began tombstoning its live members'
+                // names. Coalescing bounds the whole pump to one acquisition and one write per peer,
+                // whatever arrives. (The write itself is bounded separately, by the peer write
+                // timeout — a peer that has stopped reading must not be able to stall the lock.)
+                let mut to_relay: HashMap<PeerId, Vec<ChannelIdentity>> = HashMap::new();
+                let mut to_reply: HashMap<PeerId, Vec<ChannelIdentity>> = HashMap::new();
                 for (from, id) in pumped {
                     let name = id.name.clone();
                     let incoming = id.clone();
@@ -1786,11 +1916,11 @@ impl Node {
                     // winning state can change a given node's map at most once, whatever cycles
                     // the topology has.
                     if merged.changed {
-                        let _ = self
-                            .dissemination
-                            .lock_safe()
-                            .relay(from, std::slice::from_ref(&merged.winner));
-                    } else if merged.winner != incoming {
+                        to_relay
+                            .entry(from)
+                            .or_default()
+                            .push(merged.winner.clone());
+                    } else if Self::lost_to(&incoming, &merged.winner) {
                         // **The sender is behind: tell it.** Our map did not move, so there is
                         // nothing to flood — but the peer that sent this is holding a state that
                         // lost, and nothing else will ever correct it. Anti-entropy only runs when a
@@ -1798,13 +1928,22 @@ impl Node {
                         // disagreed about this channel indefinitely: it would keep resolving the
                         // wrong owner, and after a reclaim it would keep serving a replica of an
                         // incarnation the mesh has retired.
-                        let _ = self
-                            .dissemination
-                            .lock_safe()
-                            .reply(from, std::slice::from_ref(&merged.winner));
+                        to_reply
+                            .entry(from)
+                            .or_default()
+                            .push(merged.winner.clone());
                     }
                     if merged.winner.deleted {
                         retired.push(name);
+                    }
+                }
+                if !to_relay.is_empty() || !to_reply.is_empty() {
+                    let mut d = self.dissemination.lock_safe();
+                    for (from, delta) in to_relay {
+                        let _ = d.relay(from, &delta);
+                    }
+                    for (to, delta) in to_reply {
+                        let _ = d.reply(to, &delta);
                     }
                 }
                 // A tombstone we just learned about retires any subscription we hold for that
@@ -1831,6 +1970,20 @@ impl Node {
     }
 
     // ---------------- discovery ----------------
+
+    /// Whether `incoming` genuinely **lost** to `winner`, by the same key the registry merge orders on.
+    ///
+    /// The reply guard cannot be full struct equality. Two identities can tie on the ordering key —
+    /// `(epoch, deleted, registered_at_nanos, owner)` — and still differ in a payload field the merge
+    /// does not look at, in which case each node keeps its own, each sees a winner that "differs from
+    /// incoming", and the two reply to each other every tick forever, never converging. Comparing the
+    /// key instead means a tie sends nothing, which is correct: neither side can move the other, so
+    /// there is nothing to say. No path in this tree produces such a tie today, but the guard should
+    /// not depend on that continuing to be true.
+    fn lost_to(incoming: &ChannelIdentity, winner: &ChannelIdentity) -> bool {
+        let key = |id: &ChannelIdentity| (id.epoch, id.deleted, id.registered_at_nanos, id.owner);
+        key(incoming) != key(winner)
+    }
 
     /// Merge into the registry and publish the result to discovery **iff the map changed**.
     /// Anti-entropy re-merges a peer's whole registry on every reconnect, so publishing per
@@ -2111,7 +2264,11 @@ impl Node {
     pub fn subscription_status(&self, name: &str) -> Option<SubscriptionStatus> {
         // Hosted here ⇒ read from the origin; nothing to lag behind (see the `Subscribe`
         // handler, which hands such a client the origin path).
-        if let Some(src) = self.hosted.lock_safe().get(name).cloned() {
+        // Bound first, for the same reason as `deregister_topic`: the guard would otherwise be held
+        // across the `registry` lock below, inverting the leaf-locks-are-lowest rule and closing a
+        // second cycle with that function's `registry → hosted`.
+        let hosted = self.hosted.lock_safe().get(name).cloned();
+        if let Some(src) = hosted {
             let head = xchannel::ReaderBuilder::new(&src.path)
                 .late_join()
                 .build()
@@ -2706,6 +2863,31 @@ mod tests {
         start_advertising(cfg, None)
     }
 
+    /// [`start`] without the maintenance loop: it serves both planes and answers peers, but never
+    /// emits a heartbeat of its own accord. For tests about what a node's *silence* means, where a
+    /// heartbeat every few milliseconds would undo the thing under test.
+    fn start_quiet(id: u64, dir: &str) -> (Node, SocketAddr, SocketAddr) {
+        let node = Node::new(config(id, temp_dir(dir)));
+        let stream_l = node.bind_stream().unwrap();
+        let control_l = node.bind_control().unwrap();
+        let stream_addr = stream_l.local_addr().unwrap();
+        let control_addr = control_l.local_addr().unwrap();
+        for (node, run) in [
+            (node.clone(), Run::Stream(stream_l)),
+            (node.clone(), Run::Control(control_l)),
+        ] {
+            std::thread::spawn(move || match run {
+                Run::Stream(l) => {
+                    let _ = node.serve_stream(l);
+                }
+                Run::Control(l) => {
+                    let _ = node.serve_control(l);
+                }
+            });
+        }
+        (node, stream_addr, control_addr)
+    }
+
     /// [`start_with`], but advertising `advertise` as this node's control address instead of the
     /// one it bound. Simulates a node that can dial out but cannot be dialled: peers learn an
     /// address that refuses connections, exactly as they would through a firewall. Applied before
@@ -2761,6 +2943,79 @@ mod tests {
         panic!("condition not met within timeout");
     }
 
+    /// **A duplicate is a standing condition, so the verdict must be re-evaluated, not latched.**
+    /// Rate-limiting is for the message. A node that owned a channel when it first noticed the
+    /// duplicate cannot stand aside then — that would orphan the channel — but it must be able to once
+    /// it owns nothing, which is the only state in which standing aside is safe at all.
+    #[test]
+    fn a_duplicate_verdict_is_re_evaluated_not_latched_by_the_rate_limit() {
+        let mut cfg = config(141, temp_dir("dup-verdict"));
+        cfg.id_generated = true;
+        let node = Node::new(cfg);
+        crate::node_identity::resolve(&node.config.data_dir, None, Some("n".into())).unwrap();
+
+        // While it owns a channel, standing aside would orphan it.
+        let _w = node.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap();
+        assert_eq!(
+            node.report_duplicate_identity(&[NodeId(141)]),
+            OnDuplicateIdentity::Continue
+        );
+
+        // Once it owns nothing, the same detection must reach the opposite conclusion — even though
+        // the warning for this id has already been printed and will not be printed again.
+        drop(_w);
+        node.deregister("md.aapl").unwrap();
+        assert_eq!(
+            node.report_duplicate_identity(&[NodeId(141)]),
+            OnDuplicateIdentity::StepAside,
+            "the first tick's answer was latched, so this node could never stand aside"
+        );
+    }
+
+    /// **The lock order is an invariant with nothing enforcing it, so assert it.**
+    ///
+    /// `deregister_topic` must not hold the registry lock while it disseminates the tombstone.
+    /// Written as a direct probe rather than as a race: this thread takes the locks in the
+    /// documented order (dissemination, then registry) while the retirement runs, which is exactly
+    /// what `dial_peer` and `serve_control` do. If the retirement holds the registry lock across its
+    /// announce, this thread can never acquire it and the two are deadlocked — so the probe is a
+    /// bounded `try_lock` loop, which fails the test in two seconds instead of hanging the suite.
+    #[test]
+    fn retiring_a_topic_never_holds_the_registry_lock_while_disseminating() {
+        let node = Node::new(config(140, temp_dir("lock-order")));
+        node.create_topic("t.orders", TopicOptions::default())
+            .unwrap();
+
+        // Hold dissemination, as any dialling or accepting thread does.
+        let held = node.dissemination.lock_safe();
+
+        let worker = {
+            let node = node.clone();
+            std::thread::spawn(move || node.deregister_topic("t.orders"))
+        };
+        // Let the worker reach the point where it wants the dissemination lock we are holding.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got_registry = false;
+        while Instant::now() < deadline {
+            if let Ok(guard) = node.registry.try_lock() {
+                drop(guard);
+                got_registry = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Release the worker either way, so it can finish and the test can end cleanly.
+        drop(held);
+        assert!(
+            got_registry,
+            "deregister_topic held the registry lock while waiting for the dissemination lock — \
+             that inverts this type's lock order and deadlocks the whole control plane"
+        );
+        assert!(worker.join().unwrap().unwrap(), "the topic was retired");
+    }
+
     /// The maintenance loop is also the heartbeat loop, so what it spends on dialling is taken
     /// directly out of this node's liveness. Unbounded, the candidate set — which grows with every
     /// address the mesh has ever mentioned — set the heartbeat period, and a dozen decommissioned
@@ -2797,13 +3052,90 @@ mod tests {
             "addresses in backoff must be skipped, and the walk must continue where it left off"
         );
 
-        // Every attempt is one that failed, so each carries a penalty that grows.
+        // Every attempt carries a penalty that grows.
         for (addr, (_, gap)) in node.dial_backoff.lock_safe().iter() {
             assert!(
                 *gap >= DIAL_BACKOFF_MIN && *gap <= DIAL_BACKOFF_MAX,
                 "{addr} has an out-of-range backoff {gap:?}"
             );
         }
+
+        // The seed walk must not disturb the learned walk. One shared cursor was reduced modulo each
+        // list in turn, so a one-seed configuration pinned the learned walk to a constant index
+        // forever — the rotation existed only in the comments.
+        assert_eq!(
+            *node.dial_cursor_learned.lock_safe(),
+            0,
+            "dialling seeds moved the learned-peer cursor"
+        );
+    }
+
+    /// **An address that accepts and then drops the link must still back off.** This is the case a
+    /// success-only penalty missed entirely: a seed or hint naming a stream port, or a peer whose
+    /// control frames this release cannot decode. The connect succeeds, so nothing was recorded; the
+    /// link dies, so `connected` clears; and the next tick spends a dial on it again — forever, for
+    /// as many such addresses as fit in the budget, starving every live peer behind them.
+    #[test]
+    fn an_address_that_accepts_and_drops_the_link_still_backs_off() {
+        // A listener that accepts and immediately closes — what a stream port does when handed a
+        // control frame, without needing a second daemon to arrange it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                drop(conn);
+            }
+        });
+
+        let node = Node::new(NodeConfig {
+            seeds: vec![addr],
+            ..config(122, temp_dir("dial-accept-drop"))
+        });
+        node.connect_seeds();
+        let (_, gap) = *node.dial_backoff.lock_safe().get(&addr).expect(
+            "an address that accepted the connection and gave us nothing must still be penalised",
+        );
+        assert_eq!(gap, DIAL_BACKOFF_MIN);
+
+        // ...and it must not be retried while that penalty stands, however many ticks run.
+        for _ in 0..5 {
+            node.connect_seeds();
+        }
+        let (_, gap) = *node.dial_backoff.lock_safe().get(&addr).unwrap();
+        assert_eq!(
+            gap, DIAL_BACKOFF_MIN,
+            "the address was dialled again inside its own backoff window"
+        );
+    }
+
+    /// The other half of that rule: a *real* peer whose link drops is dialled again at once. The
+    /// penalty is forgiven for having identified itself — not for having accepted a connection.
+    #[test]
+    fn a_peer_that_identified_itself_is_redialled_without_serving_its_penalty() {
+        let (_a, _a_stream, a_control) = start(123, "dial-refund-a");
+        let b = Node::new(config(124, temp_dir("dial-refund-b")));
+        b.connect_control_peer(a_control).unwrap();
+
+        // Wait for A's heartbeat, which is what identifies the far end of the link we dialled.
+        poll_until(|| {
+            b.dissemination
+                .lock_safe()
+                .dialled_identity(a_control)
+                .map(|_| ())
+        });
+        // Stand in for a dropped link: the address is penalised and not yet due.
+        b.dial_backoff.lock_safe().insert(
+            a_control,
+            (Instant::now() + DIAL_BACKOFF_MAX, DIAL_BACKOFF_MAX),
+        );
+        assert!(
+            b.dial_due(a_control),
+            "a peer that has identified itself must be re-dialled promptly, not after a minute"
+        );
+        assert!(
+            !b.dial_backoff.lock_safe().contains_key(&a_control),
+            "the forgiven penalty must be cleared, not merely ignored"
+        );
     }
 
     /// A wildcard address is a bind target, never a destination. A peer that advertises the address
@@ -2855,14 +3187,29 @@ mod tests {
         poll_until(|| (a.dissemination.lock_safe().peer_count() > 0).then_some(()));
         a.registry.lock_safe().merge(winner.clone());
 
-        // The peer announces a state that loses: same name, later registration.
+        // A second name, so the reply has something to coalesce.
+        let winner2 = ChannelIdentity {
+            name: "md.msft".into(),
+            ..winner.clone()
+        };
+        a.registry.lock_safe().merge(winner2.clone());
+
+        // The peer announces states that lose: same names, later registration.
         let loser = ChannelIdentity {
             owner: NodeId(999),
             registered_at_nanos: u64::MAX,
             ..winner.clone()
         };
+        let loser2 = ChannelIdentity {
+            owner: NodeId(999),
+            registered_at_nanos: u64::MAX,
+            ..winner2.clone()
+        };
         peer.send_frame(&codec::encode_control(
-            &xchannel_net_core::wire::ControlMsg::RegistryDelta(vec![loser.clone()]),
+            &xchannel_net_core::wire::ControlMsg::RegistryDelta(vec![
+                loser.clone(),
+                loser2.clone(),
+            ]),
         ))
         .unwrap();
 
@@ -2881,6 +3228,14 @@ mod tests {
                     "A must not echo the losing state back as though it had won"
                 );
                 if ids.contains(&winner) {
+                    // **One frame, both winners.** A frame can carry any number of identities, and
+                    // replying per identity meant a lock acquisition and a blocking write per
+                    // identity — 200 000 of them stalled the node's heartbeat for forty seconds.
+                    assert!(
+                        ids.contains(&winner2),
+                        "the reply must coalesce a pump cycle's winners into one frame, not send \
+                         one frame per identity"
+                    );
                     replied = true;
                     break;
                 }
@@ -3138,7 +3493,12 @@ mod tests {
     /// and keeps trying to replicate from them.
     #[test]
     fn a_clean_shutdown_makes_peers_drop_the_node_immediately() {
-        let (a, _a_stream, a_control) = start(96, "leave-a");
+        // A runs **without a maintenance loop**. `shutdown()` announces the departure but does not
+        // stop the daemon's threads — in a real daemon the process exits immediately afterwards, but a
+        // test node lives on, and a node that keeps heartbeating puts itself straight back into its
+        // peer's live set. The assertion below would then be chasing a state that exists only between
+        // two heartbeats, which is a race that a loaded machine loses.
+        let (a, _a_stream, a_control) = start_quiet(96, "leave-a");
         let (b, _b_stream, _b_control) = start_seeded(97, "leave-b", &[a_control]);
 
         // B sees A as live once their link is up.

@@ -16,6 +16,13 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn main() -> std::io::Result<()> {
+    // **First thing, before any other work.** This used to sit after the data directory was created,
+    // the identity resolved and the lock taken, so a signal in the first few milliseconds was a hard
+    // kill despite the comment claiming it was not — measured, three attempts of three. A hard kill
+    // there is safe (nothing is bound, nothing is committed), so the only cost was that peers waited
+    // out the liveness timeout for a node that had barely started. But a claim in a comment should be
+    // true.
+    xchannel_net::shutdown::install();
     // A node's identity is generated once and kept in its data dir; `XCHANNELD_NODE_ID` overrides
     // it for deployments that need deterministic ids. There is deliberately **no default**: the
     // old `1` meant two unconfigured daemons silently shared an identity, and everything —
@@ -163,9 +170,6 @@ fn main() -> std::io::Result<()> {
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
     };
-
-    // Install before anything else runs, so a signal during startup is not simply fatal.
-    xchannel_net::shutdown::install();
 
     let client_path = config.client_path.clone();
     let node = Node::new(config);

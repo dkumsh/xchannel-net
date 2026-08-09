@@ -44,10 +44,18 @@ unsafe extern "C" {
 /// shutdown path — a blocking `write_all` to a peer that stopped reading is the realistic one —
 /// would swallow every further signal and could only be ended with `SIGKILL`. Re-arming is
 /// `signal`'s own behaviour on Linux and is async-signal-safe.
-extern "C" fn on_signal(sig: i32) {
-    // SAFETY: `signal` with `SIG_DFL` is async-signal-safe, and takes no locks and no allocation.
-    unsafe { signal(sig, None) };
+extern "C" fn on_signal(_sig: i32) {
+    // **Set the flag first.** Disarming first left a window in which a second signal arriving
+    // immediately — a double `^C`, which is one keypress repeated — killed the process before the
+    // graceful path had been asked for at all.
     REQUESTED.store(true, Ordering::Relaxed);
+    // Disarm **both**, not just the one that arrived: the escape hatch is "signal it again", and an
+    // operator who presses `^C` and then reaches for `kill` should not find that the second signal is
+    // the one still being caught.
+    for sig in [SIGINT, SIGTERM] {
+        // SAFETY: `signal` with `SIG_DFL` is async-signal-safe, takes no locks and does not allocate.
+        unsafe { signal(sig, None) };
+    }
 }
 
 /// Install handlers for `SIGTERM` and `SIGINT`. Idempotent; failures are ignored, in which case the
