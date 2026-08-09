@@ -64,12 +64,14 @@ owner to read-only replicas on subscribing nodes.
 - **Stale peers are not pruned from the membership map.** Resolution now gates on liveness
   (below), but `Membership::forget_stale` is still not called by the maintenance loop, so
   stale entries linger (harmless to resolution, which ignores them, but unbounded).
-- **Partition reconvergence is not guaranteed.** Delta broadcast is best-effort (a peer that
-  errors is dropped, no retry); reconvergence relies on `RegistrySync` at (re)connect. With
-  no `seeds` configured (the binary's default is `seeds: vec![]`) and inbound-only links not
-  re-dialed, a healed partition may not reconverge automatically — two nodes can keep
-  divergent registries, and both believe they own a name. Lost-collision detection does not
-  help here: `claim_name` can only reject a collision the *local* registry already knows
+- **Partition reconvergence is best-effort.** Delta broadcast drops a peer that errors and does
+  not retry it; reconvergence relies on `RegistrySync` at (re)connect and on the mesh re-forming.
+  The mesh **is** self-forming now (§2.2), so a node reachable from any seed ends up linked to
+  every other, and a change is relayed hop-by-hop rather than stopping at the originator's
+  neighbours. What is still not guaranteed: a node with **no** seeds configured (the binary's
+  default is `seeds: vec![]`) knows nobody and nobody learns of it, and during a partition each
+  side proceeds independently — both may believe they own a name. Lost-collision detection does
+  not help there: `claim_name` can only reject a collision the *local* registry already knows
   about, and across a partition neither side knows about the other (§"Name collisions").
 - **Crash resume is verified only for a quiesced writer.** Cross-process tests `SIGKILL` the
   daemon and respawn it, asserting every member resumes contiguously — which exercises the
@@ -178,6 +180,38 @@ first is load-bearing:
 Because the merge (concern 1) is fixed, swapping the broadcast out for real epidemic
 gossip later — *if* node count ever justifies it — is a change to the delta transport
 only, with the registry logic untouched.
+
+### 2.2 Forming the mesh
+
+Peers are **not** discovered by broadcast, multicast or any membership protocol. A node dials the
+control addresses in its seed list, and accepts whoever dials it. From that starting graph the mesh
+**closes itself**, by two mechanisms that are separate and neither of which implies the other:
+
+- **Gossiped control addresses.** A `Heartbeat` carries the sender's *control* address as well as
+  its stream address, and knowledge about a third node travels as a `PeerHint`. A node that learns
+  of a peer it holds no link to dials it. So any seed graph that is connected — a chain, a star,
+  one well-known node — converges to a full mesh, which is the topology the rest of §2 assumes.
+- **Relay on change.** A node that merges an inbound identity and finds its map actually changed
+  forwards the winner to its other peers. Relaying only on a *change* is what terminates the flood:
+  the registry merge is a total order and idempotent, so a given winning state can move a given
+  node's map at most once, however many cycles the topology has. The relay skips the link it
+  arrived on, which keeps a full mesh — where the relay is redundant, everyone having been told
+  directly — to one round of no-op merges rather than one per peer.
+
+Two properties are deliberate and worth keeping:
+
+**Hearsay teaches addresses, never liveness.** A `PeerHint` is not a forwarded heartbeat. A
+heartbeat means "I heard from this node"; forwarding one would make that claim on another node's
+behalf, and *membership liveness is specifically this node's own ability to reach another*
+(§5.4). `resolve` returns `HostUnreachable` from it, `force_deregister` guards a name reclaim on
+it, the topic member reaper tombstones on it, and discovery reports `owner_live` from it — so
+liveness by hearsay would let a node on the far side of a partition look reachable because a third
+party vouched for it, which is exactly what `force_deregister` exists to refuse. A hint says only
+"it exists, here is where"; liveness follows from dialling it and hearing for oneself.
+
+**One link per pair.** Both ends of a newly-learned pair know about each other, so both would dial;
+the lower `NodeId` is the one that does. Configured seeds are exempt — those are explicit operator
+intent, and a node must reach its seed however the ids fall.
 
 ### Name collisions
 

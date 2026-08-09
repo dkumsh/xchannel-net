@@ -13,8 +13,21 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 struct Member {
+    /// Stream-plane address — where to subscribe to a channel this node owns.
     addr: SocketAddr,
-    last_seen: Instant,
+    /// Control-plane address — where to open a peer link, so a node learned second-hand can
+    /// be dialled and become a direct peer.
+    control_addr: SocketAddr,
+    /// When this node was last heard from **directly**. `None` for a node known only by
+    /// hearsay: a peer told us it exists, but we have never had a link to it.
+    ///
+    /// The distinction is the whole reason relayed knowledge is a separate thing from a
+    /// heartbeat. `live_members` has to keep meaning "nodes *this* node can reach", because
+    /// `resolve` decides `HostUnreachable` on it, `force_deregister` guards a name reclaim on
+    /// it, the topic member reaper tombstones on it, and discovery reports `owner_live` from
+    /// it. Liveness by hearsay would let a node on the far side of a partition look reachable
+    /// because a third party said so — exactly the case `force_deregister` exists to refuse.
+    last_seen: Option<Instant>,
 }
 
 /// Known peers and where to reach them, refreshed by heartbeats.
@@ -28,16 +41,72 @@ impl Membership {
         Self::default()
     }
 
-    /// Record (or refresh) a peer's address and mark it seen now. A node may change
-    /// address across restarts; the latest heartbeat wins.
-    pub fn record(&mut self, node: NodeId, addr: SocketAddr) {
+    /// Record a peer heard from **directly**: refresh its addresses and its liveness. A node
+    /// may change address across restarts; the latest heartbeat wins.
+    ///
+    /// Returns whether this taught us something new — an unknown node, or one that moved.
+    /// The caller relays on `true` and stays quiet on `false`, which is what stops a steady
+    /// stream of heartbeats from becoming a steady stream of relays.
+    pub fn record(&mut self, node: NodeId, addr: SocketAddr, control_addr: SocketAddr) -> bool {
+        let novel = self
+            .members
+            .get(&node)
+            .is_none_or(|m| m.addr != addr || m.control_addr != control_addr);
         self.members.insert(
             node,
             Member {
                 addr,
-                last_seen: Instant::now(),
+                control_addr,
+                last_seen: Some(Instant::now()),
             },
         );
+        novel
+    }
+
+    /// Record a peer we were *told about* by another peer: learn where it is, but do **not**
+    /// confer liveness — we have not heard from it ourselves. Returns whether this was new.
+    ///
+    /// Never downgrades an existing entry: if we already have a direct link to this node, its
+    /// `last_seen` is preserved, so hearsay can refresh an address without ever making a node
+    /// look less reachable than it is.
+    pub fn learn(&mut self, node: NodeId, addr: SocketAddr, control_addr: SocketAddr) -> bool {
+        match self.members.get_mut(&node) {
+            Some(m) => {
+                let novel = m.addr != addr || m.control_addr != control_addr;
+                m.addr = addr;
+                m.control_addr = control_addr;
+                novel
+            }
+            None => {
+                self.members.insert(
+                    node,
+                    Member {
+                        addr,
+                        control_addr,
+                        last_seen: None,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Everything we know about every node: `(node, stream addr, control addr)`. Sent once to a
+    /// newly adopted peer so a joiner learns the whole mesh from a single seed link.
+    pub fn directory(&self) -> Vec<(NodeId, SocketAddr, SocketAddr)> {
+        self.members
+            .iter()
+            .map(|(&n, m)| (n, m.addr, m.control_addr))
+            .collect()
+    }
+
+    /// Every node we know of and the control address to reach it on — the candidate set for
+    /// forming links, whether we heard from it directly or were told about it.
+    pub fn known_peers(&self) -> Vec<(NodeId, SocketAddr)> {
+        self.members
+            .iter()
+            .map(|(&n, m)| (n, m.control_addr))
+            .collect()
     }
 
     /// The last-known address of `node`, regardless of liveness (callers that care about
@@ -52,7 +121,7 @@ impl Membership {
     pub fn live_addr_of(&self, node: NodeId, timeout: Duration) -> Option<SocketAddr> {
         self.members
             .get(&node)
-            .filter(|m| m.last_seen.elapsed() <= timeout)
+            .filter(|m| m.last_seen.is_some_and(|t| t.elapsed() <= timeout))
             .map(|m| m.addr)
     }
 
@@ -60,7 +129,10 @@ impl Membership {
     /// at all. Callers deciding whether an owner is *gone* (rather than momentarily silent)
     /// need the duration, not just the live/not-live verdict.
     pub fn silent_for(&self, node: NodeId) -> Option<Duration> {
-        self.members.get(&node).map(|m| m.last_seen.elapsed())
+        self.members
+            .get(&node)
+            .and_then(|m| m.last_seen)
+            .map(|t| t.elapsed())
     }
 
     /// Nodes heard from within `timeout`.
@@ -68,7 +140,10 @@ impl Membership {
         let now = Instant::now();
         self.members
             .iter()
-            .filter(|(_, m)| now.duration_since(m.last_seen) <= timeout)
+            .filter(|(_, m)| {
+                m.last_seen
+                    .is_some_and(|t| now.duration_since(t) <= timeout)
+            })
             .map(|(&n, _)| n)
             .collect()
     }
@@ -79,7 +154,7 @@ impl Membership {
         let stale: Vec<NodeId> = self
             .members
             .iter()
-            .filter(|(_, m)| now.duration_since(m.last_seen) > timeout)
+            .filter(|(_, m)| m.last_seen.is_none_or(|t| now.duration_since(t) > timeout))
             .map(|(&n, _)| n)
             .collect();
         for n in &stale {
@@ -109,8 +184,8 @@ mod tests {
     #[test]
     fn records_and_resolves_addresses() {
         let mut m = Membership::new();
-        m.record(NodeId(1), addr(7001));
-        m.record(NodeId(2), addr(7002));
+        m.record(NodeId(1), addr(7001), addr(7001 + 1000));
+        m.record(NodeId(2), addr(7002), addr(7002 + 1000));
         assert_eq!(m.addr_of(NodeId(1)), Some(addr(7001)));
         assert_eq!(m.addr_of(NodeId(2)), Some(addr(7002)));
         assert_eq!(m.addr_of(NodeId(3)), None);
@@ -120,8 +195,8 @@ mod tests {
     #[test]
     fn latest_heartbeat_wins_on_address_change() {
         let mut m = Membership::new();
-        m.record(NodeId(1), addr(7001));
-        m.record(NodeId(1), addr(8001)); // restarted on a new port
+        m.record(NodeId(1), addr(7001), addr(7001 + 1000));
+        m.record(NodeId(1), addr(8001), addr(8001 + 1000)); // restarted on a new port
         assert_eq!(m.addr_of(NodeId(1)), Some(addr(8001)));
         assert_eq!(m.len(), 1);
     }
@@ -129,7 +204,7 @@ mod tests {
     #[test]
     fn liveness_expires_after_timeout() {
         let mut m = Membership::new();
-        m.record(NodeId(1), addr(7001));
+        m.record(NodeId(1), addr(7001), addr(7001 + 1000));
         assert_eq!(m.live_members(Duration::from_secs(60)), vec![NodeId(1)]);
 
         std::thread::sleep(Duration::from_millis(20));
@@ -144,7 +219,7 @@ mod tests {
     #[test]
     fn live_addr_of_gates_on_liveness() {
         let mut m = Membership::new();
-        m.record(NodeId(1), addr(7001));
+        m.record(NodeId(1), addr(7001), addr(7001 + 1000));
         // Fresh: live_addr_of returns the address.
         assert_eq!(
             m.live_addr_of(NodeId(1), Duration::from_secs(60)),

@@ -55,7 +55,27 @@ pub enum ControlMsg {
     /// Carries the sender's stream-plane address so peers can resolve `owner: NodeId`
     /// (from a [`ChannelIdentity`]) to where they must connect to subscribe — the
     /// separate-membership-map approach (DESIGN §9: identity stays address-free).
-    Heartbeat { node: NodeId, addr: SocketAddr },
+    Heartbeat {
+        node: NodeId,
+        addr: SocketAddr,
+        /// Where to open a peer link to the sender, so a node that learns of it can dial it and
+        /// the mesh forms itself from any connected seed graph.
+        control_addr: SocketAddr,
+    },
+    /// What a peer knows *about a third node* — its addresses, and nothing about its liveness.
+    ///
+    /// Deliberately not a relayed [`Heartbeat`]. A heartbeat means "I heard from this node";
+    /// forwarding one would make that claim on someone else's behalf, and membership liveness is
+    /// specifically *this* node's ability to reach another (DESIGN §5.4). A hint means only "it
+    /// exists, here is where" — enough to dial it and find out first-hand.
+    ///
+    /// Relayed only when it teaches the receiver something it did not know, which is what makes
+    /// the flood terminate on a mesh with cycles.
+    PeerHint {
+        node: NodeId,
+        addr: SocketAddr,
+        control_addr: SocketAddr,
+    },
     /// Registration was rejected because another registration won the name.
     RegisterRejected { name: ChannelName, winner: NodeId },
 }

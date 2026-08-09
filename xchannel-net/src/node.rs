@@ -1369,7 +1369,12 @@ impl Node {
 
     /// Bind the control-plane listener.
     pub fn bind_control(&self) -> io::Result<TcpListener> {
-        TcpListener::bind(self.config.control_addr)
+        let listener = TcpListener::bind(self.config.control_addr)?;
+        // Advertise the address that actually accepts links, not the configured one — with `:0`
+        // they differ, and a peer dialling the configured port would reach nothing.
+        let addr = listener.local_addr()?;
+        self.dissemination.lock_safe().set_self_control_addr(addr);
+        Ok(listener)
     }
 
     /// Accept peer control connections forever, adopting each as a dissemination peer
@@ -1399,6 +1404,30 @@ impl Node {
     /// (Re)connect to any configured seed peer not currently linked. Called at startup and
     /// each maintenance tick, so a dropped seed link is re-established. Uses a bounded dial
     /// timeout so a down seed doesn't stall the loop.
+    /// Dial peers we have *learned about* but hold no link to, so a seed graph closes itself
+    /// into a full mesh.
+    ///
+    /// Only the lower `NodeId` of a pair dials. Both sides know about each other, and without a
+    /// tie-break both would dial, leaving two links per pair — twice the connections, twice the
+    /// heartbeats, and every delta delivered twice. Configured seeds are exempt from the rule:
+    /// those are explicit operator intent, and a node must be able to reach its seed regardless
+    /// of how the ids fall.
+    pub fn connect_learned_peers(&self) {
+        let candidates = self.dissemination.lock_safe().unconnected_peers();
+        for (node, control_addr) in candidates {
+            if node < self.config.node_id || self.config.seeds.contains(&control_addr) {
+                continue;
+            }
+            if let Ok(conn) = TcpTransport::connect_timeout(&control_addr, Duration::from_secs(1)) {
+                let snapshot = self.registry_snapshot();
+                let _ =
+                    self.dissemination
+                        .lock_safe()
+                        .add_outbound_peer(conn, control_addr, &snapshot);
+            }
+        }
+    }
+
     pub fn connect_seeds(&self) {
         for addr in self.config.seeds.clone() {
             if self.dissemination.lock_safe().is_connected(addr) {
@@ -1423,16 +1452,33 @@ impl Node {
     pub fn run_maintenance(&self, interval: Duration) -> io::Result<()> {
         loop {
             self.connect_seeds();
+            self.connect_learned_peers();
             let pumped = {
                 let mut d = self.dissemination.lock_safe();
                 let _ = d.emit_heartbeat();
+                // Forward peer knowledge learned since the last tick, so the mesh keeps closing
+                // itself; only knowledge that was *new* to us is queued, so this goes quiet.
+                d.relay_hints();
                 d.pump()?
             };
             if !pumped.is_empty() {
                 let mut retired = Vec::new();
-                for id in pumped {
+                for (from, id) in pumped {
                     let name = id.name.clone();
-                    if self.merge_and_publish(id).deleted {
+                    let merged = self.merge_and_publish(id);
+                    // **Relay on change.** Without this a delta reaches only the originator's
+                    // direct peers and a node two hops away stays ignorant until it opens a fresh
+                    // link. Relaying only when the merge actually moved our map is what makes it
+                    // terminate: the registry merge is a total order and idempotent, so a given
+                    // winning state can change a given node's map at most once, whatever cycles
+                    // the topology has.
+                    if merged.changed {
+                        let _ = self
+                            .dissemination
+                            .lock_safe()
+                            .relay(from, std::slice::from_ref(&merged.winner));
+                    }
+                    if merged.winner.deleted {
                         retired.push(name);
                     }
                 }
@@ -1460,12 +1506,12 @@ impl Node {
     /// Merge into the registry and publish the result to discovery **iff the map changed**.
     /// Anti-entropy re-merges a peer's whole registry on every reconnect, so publishing per
     /// merge rather than per change would turn each reconnect into a storm of no-ops.
-    fn merge_and_publish(&self, incoming: ChannelIdentity) -> ChannelIdentity {
+    fn merge_and_publish(&self, incoming: ChannelIdentity) -> crate::registry::Merged {
         let merged = self.registry.lock_safe().merge_tracked(incoming);
         if merged.changed {
             self.publish_change(&self.change_of(&merged.winner));
         }
-        merged.winner
+        merged
     }
 
     /// The discovery record describing an entry's current state.
@@ -2314,7 +2360,19 @@ mod tests {
     /// Start a node: bind both listeners and spawn serve_stream / serve_control /
     /// maintenance. Returns the node and its (stream_addr, control_addr).
     fn start(id: u64, dir: &str) -> (Node, SocketAddr, SocketAddr) {
-        let node = Node::new(config(id, temp_dir(dir)));
+        start_with(config(id, temp_dir(dir)))
+    }
+
+    /// [`start`] with configured seed peers, for topology tests.
+    fn start_seeded(id: u64, dir: &str, seeds: &[SocketAddr]) -> (Node, SocketAddr, SocketAddr) {
+        start_with(NodeConfig {
+            seeds: seeds.to_vec(),
+            ..config(id, temp_dir(dir))
+        })
+    }
+
+    fn start_with(cfg: NodeConfig) -> (Node, SocketAddr, SocketAddr) {
+        let node = Node::new(cfg);
         let stream_l = node.bind_stream().unwrap();
         let control_l = node.bind_control().unwrap();
         let stream_addr = stream_l.local_addr().unwrap();
@@ -2398,6 +2456,92 @@ mod tests {
     /// sees nothing wrong. Resuming there would append the new log's records onto the old
     /// log's — indices lining up perfectly, contiguity check satisfied, two unrelated channels
     /// silently spliced into one replica. The subscription must discard and rebuild instead.
+    /// The mesh forms itself. A **chain** — C seeded only to B, B seeded only to A, and A and C
+    /// with no knowledge of each other — must converge into direct links, and a channel
+    /// registered at one end must reach the other.
+    ///
+    /// What makes this work is **gossiped control addresses**: before them a heartbeat carried
+    /// only a *stream* address — where to fetch data, never where to open a peer link — so C could
+    /// not have dialled A whatever it knew. Removing that makes this test fail.
+    ///
+    /// Removing delta *relay* does **not** make it fail, and that is worth stating plainly: once
+    /// the mesh closes, C is adjacent to A and receives its registry as join-time anti-entropy on
+    /// the new link. Relay covers the window before the mesh closes, and any pair that never
+    /// manages to link at all; it is exercised in isolation by
+    /// `a_delta_relays_across_a_chain_without_echoing_its_source`.
+    #[test]
+    fn a_seed_chain_closes_into_a_full_mesh() {
+        let (a, _a_stream, a_control) = start(80, "mesh-a");
+        let (b, _b_stream, b_control) = start_seeded(81, "mesh-b", &[a_control]);
+        let (c, _c_stream, _c_control) = start_seeded(82, "mesh-c", &[b_control]);
+
+        // A registers a channel. Only B is adjacent to it at this point.
+        drop(a.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap());
+
+        // C learns the channel two hops away — that is the relay.
+        poll_until(|| c.registry.lock_safe().get("md.aapl").map(|_| ()));
+
+        // ...and A and C end up direct peers, each having heard from the other first-hand.
+        // Liveness is what proves the link is real: it is only ever conferred by a heartbeat
+        // received directly, never by hearsay.
+        poll_until(|| {
+            let a_sees_c = a.dissemination.lock_safe().live_addr_of(NodeId(82));
+            let c_sees_a = c.dissemination.lock_safe().live_addr_of(NodeId(80));
+            (a_sees_c.is_some() && c_sees_a.is_some()).then_some(())
+        });
+
+        // And C can now actually resolve the channel to its owner, which needs both the registry
+        // entry and live membership for A.
+        let (id, addr) = c.resolve("md.aapl", Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(id.owner, NodeId(80));
+        // Compared against *C's* view: a node never records its own heartbeat, so A's membership
+        // has no entry for A.
+        assert_eq!(
+            Some(addr),
+            c.dissemination.lock_safe().live_addr_of(NodeId(80)),
+            "C resolves the owner to the address it heard from A directly"
+        );
+    }
+
+    /// Hearsay teaches an address but must never confer liveness. `live_members` has to keep
+    /// meaning "nodes *this* node can reach" — `resolve` returns `HostUnreachable` from it,
+    /// `force_deregister` guards a name reclaim on it, and the topic reaper tombstones on it. A
+    /// node that looked live because a third party vouched for it would weaken exactly the guard
+    /// that exists to stop a partition retiring a channel whose owner is alive.
+    #[test]
+    fn hearsay_teaches_an_address_but_never_liveness() {
+        let mut m = xchannel_net_core::membership::Membership::new();
+        let stream: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let control: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        let timeout = Duration::from_secs(60);
+
+        assert!(m.learn(NodeId(9), stream, control), "new to us");
+        assert_eq!(
+            m.known_peers(),
+            vec![(NodeId(9), control)],
+            "we know where it is, so we can dial it"
+        );
+        assert_eq!(
+            m.live_addr_of(NodeId(9), timeout),
+            None,
+            "but we have not heard from it, so it is not live"
+        );
+        assert!(m.live_members(timeout).is_empty());
+        assert_eq!(m.silent_for(NodeId(9)), None, "never heard from directly");
+
+        // A direct heartbeat is what makes it live.
+        m.record(NodeId(9), stream, control);
+        assert_eq!(m.live_addr_of(NodeId(9), timeout), Some(stream));
+
+        // And later hearsay must not undo that.
+        m.learn(NodeId(9), stream, control);
+        assert_eq!(
+            m.live_addr_of(NodeId(9), timeout),
+            Some(stream),
+            "hearsay must never make a reachable node look unreachable"
+        );
+    }
+
     #[test]
     fn a_reclaimed_channel_rebuilds_the_replica_instead_of_splicing() {
         let (a, _a_stream, a_control) = start(41, "reclaim-a");

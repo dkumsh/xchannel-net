@@ -4,6 +4,46 @@ All notable changes to xchannel-net are documented here. Versioning is pre-1.0 a
 experimental: the wire protocol and on-disk layout may change without notice (see
 `SECURITY.md`).
 
+## Unreleased
+
+### Added
+- **The mesh forms itself.** Peers were previously exactly what you configured: a node dialled its
+  `XCHANNELD_SEEDS` and accepted whoever dialled it, and that was the whole membership. Nothing was
+  relayed — a heartbeat updated local membership and stopped there, and a registry delta merged
+  from a peer was never forwarded — so on any topology short of a full mesh, a change reached the
+  originator's neighbours and no further, and a node two hops away was invisible.
+
+  Two mechanisms, separate and neither implying the other (`doc/DESIGN.md` §2.2):
+  - **Gossiped control addresses.** `Heartbeat` now carries the sender's control address as well as
+    its stream address, and knowledge about a third node travels as a new `PeerHint`. A node dials
+    peers it learns about, so any *connected* seed graph — a chain, a star, one well-known node —
+    closes into the full mesh the rest of the design assumes. Only the lower `NodeId` of a pair
+    dials, so a pair forms one link rather than two; configured seeds are exempt, being explicit
+    operator intent.
+  - **Relay on change.** A node that merges an inbound identity and finds its map actually changed
+    forwards the winner to its other peers. Relaying only on a *change* is what terminates the
+    flood: the registry merge is a total order and idempotent, so a given winning state can move a
+    given node's map at most once, whatever cycles the topology has. The relay skips the link it
+    came in on.
+
+  **Hearsay teaches addresses, never liveness** — a `PeerHint` is deliberately not a forwarded
+  heartbeat. Membership liveness means *this* node's ability to reach another, and `resolve`,
+  `force_deregister`'s reclaim guard, the topic member reaper and discovery's `owner_live` all
+  depend on that reading. A node that looked reachable because a third party vouched for it would
+  weaken exactly the guard that stops a partition retiring a channel whose owner is alive and
+  writing. Liveness follows from dialling the node and hearing from it directly.
+
+  Honest about what each half buys: with the mesh closing, **relay is not what makes a chain
+  converge** — the new link delivers the registry as join-time anti-entropy anyway. Relay covers
+  the window before the mesh closes and any pair that never manages to link. The tests say so
+  rather than implying otherwise.
+
+### Changed
+- **Wire (breaking):** `ControlMsg::Heartbeat` gains `control_addr`, and `ControlMsg::PeerHint` is
+  new. A 0.2.x daemon and a newer one cannot share a control plane.
+- `Dissemination::pump` returns each identity with the peer link it arrived on, and gains
+  `relay`, so an implementation can forward without echoing the source.
+
 ## 0.2.1 (2026-08-09)
 
 **Documentation and packaging only — no behaviour change.** 0.2.0's published crates contained

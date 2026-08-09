@@ -209,6 +209,7 @@ mod control_tag {
     pub const REGISTRY_SYNC: u8 = 3;
     pub const HEARTBEAT: u8 = 4;
     pub const REGISTER_REJECTED: u8 = 5;
+    pub const PEER_HINT: u8 = 6;
 }
 
 /// Encode a control-plane message into `buf` (appended; caller clears for reuse).
@@ -232,10 +233,25 @@ pub fn encode_control_into(buf: &mut Vec<u8>, m: &ControlMsg) {
             w.u8(control_tag::REGISTRY_SYNC);
             put_identities(&mut w, ids);
         }
-        ControlMsg::Heartbeat { node, addr } => {
+        ControlMsg::Heartbeat {
+            node,
+            addr,
+            control_addr,
+        } => {
             w.u8(control_tag::HEARTBEAT);
             w.u64(node.0);
             w.addr(*addr);
+            w.addr(*control_addr);
+        }
+        ControlMsg::PeerHint {
+            node,
+            addr,
+            control_addr,
+        } => {
+            w.u8(control_tag::PEER_HINT);
+            w.u64(node.0);
+            w.addr(*addr);
+            w.addr(*control_addr);
         }
         ControlMsg::RegisterRejected { name, winner } => {
             w.u8(control_tag::REGISTER_REJECTED);
@@ -265,6 +281,12 @@ pub fn decode_control(bytes: &[u8]) -> io::Result<ControlMsg> {
         control_tag::HEARTBEAT => ControlMsg::Heartbeat {
             node: NodeId(r.u64()?),
             addr: r.addr()?,
+            control_addr: r.addr()?,
+        },
+        control_tag::PEER_HINT => ControlMsg::PeerHint {
+            node: NodeId(r.u64()?),
+            addr: r.addr()?,
+            control_addr: r.addr()?,
         },
         control_tag::REGISTER_REJECTED => ControlMsg::RegisterRejected {
             name: r.str()?,
@@ -747,9 +769,15 @@ mod tests {
             },
             ControlMsg::RegistryDelta(vec![ident("a", 1), ident("b", 2)]),
             ControlMsg::RegistrySync(vec![]),
+            ControlMsg::PeerHint {
+                node: NodeId(7),
+                addr: "10.0.0.4:7000".parse().unwrap(),
+                control_addr: "10.0.0.4:7001".parse().unwrap(),
+            },
             ControlMsg::Heartbeat {
                 node: NodeId(42),
                 addr: "127.0.0.1:7000".parse().unwrap(),
+                control_addr: "127.0.0.1:7001".parse().unwrap(),
             },
             ControlMsg::RegisterRejected {
                 name: "dup".into(),
@@ -911,6 +939,7 @@ mod tests {
         let mut bytes = encode_control(&ControlMsg::Heartbeat {
             node: NodeId(1),
             addr: "127.0.0.1:1".parse().unwrap(),
+            control_addr: "127.0.0.1:7001".parse().unwrap(),
         });
         bytes.push(0xAB);
         assert!(decode_control(&bytes).is_err());

@@ -22,6 +22,13 @@ use crate::NodeId;
 use crate::identity::ChannelIdentity;
 use std::io;
 
+/// Opaque handle for the peer link a message arrived on, so a relay can skip its source.
+/// [`NO_PEER`] denotes "not from a peer" (a locally originated change).
+pub type PeerId = u64;
+
+/// A [`PeerId`] that matches no link.
+pub const NO_PEER: PeerId = 0;
+
 /// How a node manager spreads registry state across the mesh and observes membership.
 ///
 /// The node manager drives it: call [`announce`](Dissemination::announce) when the local
@@ -34,11 +41,25 @@ pub trait Dissemination: Send {
     /// makes that harmless. Anti-entropy on (re)connect closes any gaps from drops.
     fn announce(&mut self, delta: &[ChannelIdentity]) -> io::Result<()>;
 
+    /// Forward a change that arrived from `from` to every *other* peer.
+    ///
+    /// This is what makes a partial mesh converge: without it a delta reaches only the
+    /// originator's direct peers, and a node two hops away learns nothing until it happens to
+    /// open a fresh link and receive a full anti-entropy sync. The caller relays only when its
+    /// merge actually **changed** the map, which is what terminates the flood — the registry
+    /// merge is a total order and idempotent, so any given winning state can change a given
+    /// node's map at most once, however many cycles the topology has.
+    ///
+    /// Skipping the source is an optimisation, not a correctness requirement (the echo would be
+    /// absorbed by the same suppression); on a full mesh, where the relay is redundant anyway, it
+    /// is what keeps the redundancy to one round instead of one round per peer.
+    fn relay(&mut self, from: PeerId, delta: &[ChannelIdentity]) -> io::Result<()>;
+
     /// Drive inbound traffic and housekeeping (anti-entropy exchange, heartbeats /
     /// failure detection) and return any channel identities received from peers for the
     /// caller to merge into its registry. Does the work that is currently available and
     /// returns; the caller decides the cadence.
-    fn pump(&mut self) -> io::Result<Vec<ChannelIdentity>>;
+    fn pump(&mut self) -> io::Result<Vec<(PeerId, ChannelIdentity)>>;
 
     /// Nodes currently considered reachable — *membership* liveness, distinct from
     /// *writer* liveness (a channel can be frozen-but-healthy; see DESIGN.md §2).

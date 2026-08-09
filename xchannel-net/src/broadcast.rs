@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use xchannel_net_core::NodeId;
 use xchannel_net_core::codec::{decode_control, encode_control};
-use xchannel_net_core::dissemination::Dissemination;
+use xchannel_net_core::dissemination::{Dissemination, NO_PEER, PeerId};
 use xchannel_net_core::identity::ChannelIdentity;
 use xchannel_net_core::membership::Membership;
 use xchannel_net_core::transport::{TcpTransport, Transport};
@@ -26,7 +26,12 @@ use xchannel_net_core::wire::ControlMsg;
 
 use crate::util::MutexExt;
 
-type Inbox = Arc<Mutex<VecDeque<ChannelIdentity>>>;
+/// Inbound registry identities, tagged with the link they arrived on so a relay can skip it.
+type Inbox = Arc<Mutex<VecDeque<(PeerId, ChannelIdentity)>>>;
+/// Peer knowledge worth forwarding: `(source link, node, stream addr, control addr)`. Queued by
+/// reader threads (which cannot broadcast — the send halves live on the struct) and drained by
+/// [`BroadcastDissemination::relay_hints`].
+type Hints = Arc<Mutex<VecDeque<(PeerId, NodeId, SocketAddr, SocketAddr)>>>;
 type SharedMembership = Arc<Mutex<Membership>>;
 /// Dial addresses of outbound peer links currently believed connected (for dedup +
 /// reconnection). An outbound peer's reader removes its address here on disconnect.
@@ -39,8 +44,14 @@ pub struct BroadcastDissemination {
     self_addr: SocketAddr,
     /// A node is "live" if heard from within this timeout.
     liveness_timeout: Duration,
-    /// Send halves of peer connections (broadcast target for deltas/heartbeats).
-    peers: Vec<TcpTransport>,
+    /// The control address this node advertises, so peers can dial it back and a node that
+    /// learns of us second-hand can form a direct link.
+    self_control_addr: SocketAddr,
+    /// Send halves of peer connections, each with a stable id (broadcast target for
+    /// deltas/heartbeats). Ids are stable across peer removal, unlike positions.
+    peers: Vec<(PeerId, TcpTransport)>,
+    next_peer_id: PeerId,
+    hints: Hints,
     /// Filled by per-peer reader threads; drained by [`pump`](Self::pump).
     inbox: Inbox,
     membership: SharedMembership,
@@ -52,8 +63,11 @@ impl BroadcastDissemination {
         Self {
             self_node,
             self_addr,
+            self_control_addr: self_addr,
             liveness_timeout,
             peers: Vec::new(),
+            next_peer_id: NO_PEER + 1,
+            hints: Arc::new(Mutex::new(VecDeque::new())),
             inbox: Arc::new(Mutex::new(VecDeque::new())),
             membership: Arc::new(Mutex::new(Membership::new())),
             connected: Arc::new(Mutex::new(HashSet::new())),
@@ -100,9 +114,13 @@ impl BroadcastDissemination {
         initial_sync: &[ChannelIdentity],
     ) -> io::Result<()> {
         let reader = transport.try_clone()?;
+        let id = self.next_peer_id;
+        self.next_peer_id += 1;
         spawn_reader(
             reader,
+            id,
             Arc::clone(&self.inbox),
+            Arc::clone(&self.hints),
             Arc::clone(&self.membership),
             Arc::clone(&self.connected),
             addr,
@@ -112,21 +130,71 @@ impl BroadcastDissemination {
         send.send_frame(&encode_control(&ControlMsg::RegistrySync(
             initial_sync.to_vec(),
         )))?;
-        send.send_frame(&encode_control(&ControlMsg::Heartbeat {
+        send.send_frame(&encode_control(&self.heartbeat()))?;
+        // Introduce everyone we already know, so a joiner learns the whole mesh from one link
+        // instead of only its seed. Sent once per link, not periodically.
+        for (node, addr, control_addr) in self.membership.lock_safe().directory() {
+            if node == self.self_node {
+                continue;
+            }
+            send.send_frame(&encode_control(&ControlMsg::PeerHint {
+                node,
+                addr,
+                control_addr,
+            }))?;
+        }
+        self.peers.push((id, send));
+        Ok(())
+    }
+
+    /// This node's own heartbeat frame.
+    fn heartbeat(&self) -> ControlMsg {
+        ControlMsg::Heartbeat {
             node: self.self_node,
             addr: self.self_addr,
-        }))?;
-        self.peers.push(send);
-        Ok(())
+            control_addr: self.self_control_addr,
+        }
+    }
+
+    /// Forward queued peer knowledge to every link except the one it came from. Called on the
+    /// maintenance tick; a hint is only queued when it taught this node something, so a mesh
+    /// with cycles goes quiet once everyone knows everyone.
+    pub fn relay_hints(&mut self) {
+        let pending: Vec<_> = self.hints.lock_safe().drain(..).collect();
+        for (from, node, addr, control_addr) in pending {
+            if node == self.self_node {
+                continue; // never gossip about ourselves second-hand; our heartbeat says it
+            }
+            let frame = encode_control(&ControlMsg::PeerHint {
+                node,
+                addr,
+                control_addr,
+            });
+            self.send_except(from, &frame);
+        }
+    }
+
+    /// Peers we know of but hold no outbound link to, as `(node, control address)`.
+    pub fn unconnected_peers(&self) -> Vec<(NodeId, SocketAddr)> {
+        let connected = self.connected.lock_safe();
+        self.membership
+            .lock_safe()
+            .known_peers()
+            .into_iter()
+            .filter(|(node, control)| *node != self.self_node && !connected.contains(control))
+            .collect()
+    }
+
+    /// Set the control address advertised to peers — used after binding the control listener to
+    /// an ephemeral port, so what we gossip is the address that actually accepts connections.
+    pub fn set_self_control_addr(&mut self, addr: SocketAddr) {
+        self.self_control_addr = addr;
     }
 
     /// Send a `Heartbeat` (this node + its address) to every peer. The caller drives the
     /// cadence; peers refresh our membership entry on receipt.
     pub fn emit_heartbeat(&mut self) -> io::Result<()> {
-        let hb = encode_control(&ControlMsg::Heartbeat {
-            node: self.self_node,
-            addr: self.self_addr,
-        });
+        let hb = encode_control(&self.heartbeat());
         self.broadcast(&hb);
         Ok(())
     }
@@ -159,7 +227,13 @@ impl BroadcastDissemination {
 
     /// Best-effort broadcast to all peers; drops peers whose send fails (disconnected).
     fn broadcast(&mut self, frame: &[u8]) {
-        self.peers.retain_mut(|p| p.send_frame(frame).is_ok());
+        self.send_except(NO_PEER, frame);
+    }
+
+    /// Broadcast to every peer except `from`; drops peers whose send fails (disconnected).
+    fn send_except(&mut self, from: PeerId, frame: &[u8]) {
+        self.peers
+            .retain_mut(|(id, p)| *id == from || p.send_frame(frame).is_ok());
     }
 }
 
@@ -170,7 +244,13 @@ impl Dissemination for BroadcastDissemination {
         Ok(())
     }
 
-    fn pump(&mut self) -> io::Result<Vec<ChannelIdentity>> {
+    fn relay(&mut self, from: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
+        let frame = encode_control(&ControlMsg::RegistryDelta(delta.to_vec()));
+        self.send_except(from, &frame);
+        Ok(())
+    }
+
+    fn pump(&mut self) -> io::Result<Vec<(PeerId, ChannelIdentity)>> {
         let mut q = self.inbox.lock_safe();
         Ok(q.drain(..).collect())
     }
@@ -186,9 +266,12 @@ impl Dissemination for BroadcastDissemination {
 /// `RegistryDelta`/`RegistrySync` identities go to the inbox for the node to merge;
 /// `Heartbeat`s refresh membership. Client→manager frames (`Register`, …) are not expected
 /// on a peer link and are ignored.
+#[allow(clippy::too_many_arguments)]
 fn spawn_reader(
     mut reader: TcpTransport,
+    id: PeerId,
     inbox: Inbox,
+    hints: Hints,
     membership: SharedMembership,
     connected: Connected,
     addr: Option<SocketAddr>,
@@ -200,10 +283,30 @@ fn spawn_reader(
             };
             match msg {
                 ControlMsg::RegistryDelta(ids) | ControlMsg::RegistrySync(ids) => {
-                    inbox.lock_safe().extend(ids);
+                    inbox.lock_safe().extend(ids.into_iter().map(|i| (id, i)));
                 }
-                ControlMsg::Heartbeat { node, addr } => {
-                    membership.lock_safe().record(node, addr);
+                // A direct heartbeat: confers liveness *and* teaches addresses. Queue a hint only
+                // when it told us something new, so a steady heartbeat stream does not become a
+                // steady relay stream.
+                ControlMsg::Heartbeat {
+                    node,
+                    addr,
+                    control_addr,
+                } => {
+                    if membership.lock_safe().record(node, addr, control_addr) {
+                        hints.lock_safe().push_back((id, node, addr, control_addr));
+                    }
+                }
+                // Hearsay: learn where the node is, but grant it no liveness — we have not heard
+                // from it, and `live_members` must keep meaning "reachable by us".
+                ControlMsg::PeerHint {
+                    node,
+                    addr,
+                    control_addr,
+                } => {
+                    if membership.lock_safe().learn(node, addr, control_addr) {
+                        hints.lock_safe().push_back((id, node, addr, control_addr));
+                    }
                 }
                 _ => {} // not expected on a peer link
             }
@@ -264,7 +367,7 @@ mod tests {
         // pump() is destructive, so accumulate across polls.
         let mut received: Vec<ChannelIdentity> = Vec::new();
         poll_until(|| {
-            received.extend(b.pump().unwrap());
+            received.extend(b.pump().unwrap().into_iter().map(|(_, id)| id));
             (received.len() >= 2).then_some(())
         });
         received.sort_by(|x, y| x.name.cmp(&y.name));
@@ -276,6 +379,52 @@ mod tests {
         let a_seen = poll_until(|| b.addr_of(NodeId(1)));
         assert_eq!(a_seen, a_addr);
         assert_eq!(b.live_members(), vec![NodeId(1)]);
+    }
+
+    /// Link two dissemination instances over loopback, returning their ends.
+    fn link(a: &mut BroadcastDissemination, b: &mut BroadcastDissemination) {
+        let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap());
+        let a_end = TcpTransport::connect(addr).unwrap();
+        let b_end = accept.join().unwrap();
+        a.add_peer(a_end, &[]).unwrap();
+        b.add_peer(b_end, &[]).unwrap();
+    }
+
+    /// Relay across two hops: `A — B — C`, with no A–C link. B forwards what it merged, so C
+    /// learns a change it was never sent directly — and B does **not** echo it back to A.
+    ///
+    /// Isolated here rather than at the node level, because a node-level chain closes itself into
+    /// a full mesh and then every node is adjacent to every other: the channel would arrive by
+    /// join-time anti-entropy on the new link whether or not anything relayed. Relay is what
+    /// covers the window before the mesh closes, and any pair that never manages to link.
+    #[test]
+    fn a_delta_relays_across_a_chain_without_echoing_its_source() {
+        let t = Duration::from_secs(60);
+        let mut a = BroadcastDissemination::new(NodeId(1), "127.0.0.1:9001".parse().unwrap(), t);
+        let mut b = BroadcastDissemination::new(NodeId(2), "127.0.0.1:9002".parse().unwrap(), t);
+        let mut c = BroadcastDissemination::new(NodeId(3), "127.0.0.1:9003".parse().unwrap(), t);
+        link(&mut a, &mut b);
+        link(&mut b, &mut c);
+
+        a.announce(&[ident("md.aapl", 1)]).unwrap();
+
+        // B receives it, tagged with the link it came in on.
+        let (from, id) = poll_until(|| b.pump().unwrap().into_iter().next());
+        assert_eq!(id.name, "md.aapl");
+        b.relay(from, &[id]).unwrap();
+
+        // C learns it two hops from the origin.
+        let (_, at_c) = poll_until(|| c.pump().unwrap().into_iter().next());
+        assert_eq!(at_c.name, "md.aapl");
+
+        // And A is not sent its own change back.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            a.pump().unwrap().is_empty(),
+            "the relay must skip the link it arrived on"
+        );
     }
 
     /// Spin briefly until `f` yields `Some` (reader threads run asynchronously).
