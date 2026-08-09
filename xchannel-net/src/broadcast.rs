@@ -74,12 +74,33 @@ fn link_key(local: SocketAddr, peer: SocketAddr) -> LinkKey {
     }
 }
 
-/// How long a blocking write to a peer may stall before that peer is treated as dead.
+/// How long **one frame** to one peer may take before that peer is treated as dead.
 ///
-/// The control plane writes under the dissemination lock, so this is the bound on how long one
-/// unresponsive peer can stop *everything* — including the heartbeat that keeps this node in every
-/// other peer's live set. Comfortably under `LIVENESS_TIMEOUT` for that reason.
-const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The control plane writes while holding the dissemination lock, which the heartbeat also needs, so
+/// this is the bound on how long a single unresponsive peer can stop everything. It has to be a bound
+/// on the *frame*: `SO_SNDTIMEO` alone bounds a syscall, and `write_all` retries whenever a byte
+/// moved, which measured 4.1 s per wedged peer at a 2 s setting and 19 s for a peer draining slowly
+/// enough that the timeout never fired. Hence [`TcpTransport::send_frame_within`].
+///
+/// 250 ms is enormous for a healthy peer — frames are capped at [`MAX_IDENTITIES_PER_FRAME`]
+/// identities, some tens of kilobytes, which drains in microseconds even on a slow link — and keeping
+/// it small is what bounds a *broadcast*: writes are serial, so P unresponsive peers cost P × this,
+/// once each, before they are dropped. It is also charged against the tick's dial budget (see the
+/// build-time assertion in `node.rs`), because a successful dial writes the join-time sync.
+pub(crate) const PEER_FRAME_BUDGET: Duration = Duration::from_millis(250);
+
+/// Per-syscall slice, so no single `write` parks indefinitely. The frame budget above is what actually
+/// decides; this only keeps a blocked syscall from outliving it.
+const PEER_WRITE_SLICE: Duration = Duration::from_millis(100);
+
+/// Identities per control frame.
+///
+/// Anti-entropy sends the whole registry on every reconnect, and a coalesced relay can carry a whole
+/// pump cycle, so without a cap one frame could be megabytes — a 10.6 MB frame was measured taking
+/// 6.1 s to write to a stalled peer, all of it under the dissemination lock. Chunking keeps every frame
+/// small enough that the frame budget is generous rather than marginal. The receiver merges each frame
+/// independently, and the merge is idempotent and order-free, so splitting is invisible to it.
+const MAX_IDENTITIES_PER_FRAME: usize = 256;
 
 /// Cap on remembered addresses claiming our own id. A genuine duplicate is one or two; the bound is
 /// there because the source is unauthenticated gossip.
@@ -189,26 +210,66 @@ impl BroadcastDissemination {
         self.connected.lock_safe().contains(&addr)
     }
 
-    /// Spawn a reader thread, send join-time `RegistrySync` + a first `Heartbeat`, and
+    /// Send the join-time `RegistrySync` + `Heartbeat` + directory, then spawn the reader thread and
     /// retain the send half. `addr` is `Some` for outbound links (tracked for reconnection).
+    ///
+    /// **Writes first, reader second.** The reader owns a `try_clone` dup of the socket, so spawning it
+    /// before these writes meant an early return dropped only the send half: the connection stayed
+    /// ESTABLISHED with a thread parked in `recv_frame` forever, and callers discard this error, so the
+    /// dialler retried the same address on the next tick and leaked again — measured at one thread, one
+    /// descriptor and one orphaned socket per failed adopt. Before the writes were bounded they could
+    /// not fail at all, which is how that went unnoticed; bounding them made it reachable. In this order
+    /// a failure has nothing to clean up, because dropping `transport` is the last reference and closes
+    /// the connection.
     fn adopt(
         &mut self,
-        transport: TcpTransport,
+        mut transport: TcpTransport,
         addr: Option<SocketAddr>,
         initial_sync: &[ChannelIdentity],
     ) -> io::Result<()> {
-        let reader = transport.try_clone()?;
-        // **Bound the send side.** Every control-plane write — heartbeat, announce, relay, reply, and
-        // the directory below — is a blocking `write_all` made while holding the dissemination lock.
-        // A peer that is alive but not draining (stopped, swapping, or wedged itself) therefore stalls
-        // this node's entire control plane, silently and indefinitely. With a timeout the write fails
-        // instead, and a failed write is already how a dead peer is reaped. Chosen long enough that
-        // it can only mean malfunction: a healthy LAN peer drains a frame in microseconds.
-        let _ = transport.set_write_timeout(Some(PEER_WRITE_TIMEOUT));
+        // Every control-plane write happens while holding the dissemination lock, which is also what
+        // the heartbeat needs, so an unbounded write is a node-wide stall. `PEER_WRITE_SLICE` keeps a
+        // single syscall from parking; `PEER_FRAME_BUDGET` is the bound that matters, applied per frame
+        // by `send_frame_within`.
+        let _ = transport.set_write_timeout(Some(PEER_WRITE_SLICE));
         let (local, peer) = transport.endpoints()?;
         let key = link_key(local, peer);
+
+        // Chunked, because anti-entropy carries the entire registry and one frame of it was measured
+        // at 10.6 MB taking 6.1 s to write to a stalled peer. The receiver merges each frame
+        // independently and the merge is idempotent and order-free, so splitting is invisible to it.
+        for batch in initial_sync.chunks(MAX_IDENTITIES_PER_FRAME) {
+            transport.send_frame_within(
+                &encode_control(&ControlMsg::RegistrySync(batch.to_vec())),
+                PEER_FRAME_BUDGET,
+            )?;
+        }
+        transport.send_frame_within(&encode_control(&self.heartbeat()), PEER_FRAME_BUDGET)?;
+        // Introduce everyone we already know, so a joiner learns the whole mesh from one link instead
+        // of only its seed. Sent once per link, not periodically.
+        //
+        // Bind the directory *before* the loop: a guard temporary in a `for` head lives to the end of
+        // the loop, so this held the membership lock across every blocking send. One peer that stopped
+        // reading would stall every reader thread waiting on that lock.
+        let directory = self.membership.lock_safe().directory();
+        for (node, addr, control_addr, name) in directory {
+            if node == self.self_node {
+                continue;
+            }
+            transport.send_frame_within(
+                &encode_control(&ControlMsg::PeerHint {
+                    node,
+                    addr,
+                    control_addr,
+                    name,
+                }),
+                PEER_FRAME_BUDGET,
+            )?;
+        }
+
         let id = self.next_peer_id;
         self.next_peer_id += 1;
+        let reader = transport.try_clone()?;
         spawn_reader(
             reader,
             id,
@@ -224,32 +285,9 @@ impl BroadcastDissemination {
             Arc::clone(&self.same_id_addrs),
             Arc::clone(&self.dial_identity),
         );
-
-        let mut send = transport;
-        send.send_frame(&encode_control(&ControlMsg::RegistrySync(
-            initial_sync.to_vec(),
-        )))?;
-        send.send_frame(&encode_control(&self.heartbeat()))?;
-        // Introduce everyone we already know, so a joiner learns the whole mesh from one link
-        // instead of only its seed. Sent once per link, not periodically.
-        // Bind the directory *before* the loop: a guard temporary in a `for` head lives to the end
-        // of the loop, so this held the membership lock across every blocking send. One peer that
-        // stopped reading would stall every reader thread waiting on that lock.
-        let directory = self.membership.lock_safe().directory();
-        for (node, addr, control_addr, name) in directory {
-            if node == self.self_node {
-                continue;
-            }
-            send.send_frame(&encode_control(&ControlMsg::PeerHint {
-                node,
-                addr,
-                control_addr,
-                name,
-            }))?;
-        }
         self.peers.push(Peer {
             id,
-            conn: send,
+            conn: transport,
             key,
             outbound: addr.is_some(),
         });
@@ -349,15 +387,6 @@ impl BroadcastDissemination {
             .collect()
     }
 
-    /// Which node has ever identified itself over a link **we dialled at this exact address** —
-    /// proof that the address is a working peer rather than merely one that accepts connections.
-    ///
-    /// Deliberately not `node_at`: that consults membership, where every learned candidate address
-    /// already appears, so it would call an address proven before anything was ever heard from it.
-    pub fn dialled_identity(&self, addr: SocketAddr) -> Option<NodeId> {
-        self.dial_identity.lock_safe().get(&addr).copied()
-    }
-
     /// Which node is known to sit at `addr`, if any — by its advertised control address first, and
     /// otherwise by what a previous dial to that exact address turned out to reach.
     ///
@@ -401,8 +430,8 @@ impl BroadcastDissemination {
     }
 
     /// Tell every peer this node is leaving, so they mark it not-live now rather than waiting out
-    /// the liveness timeout. Best-effort and synchronous: `send_frame` writes before returning, so
-    /// by the time this does the notice is on the wire.
+    /// the liveness timeout. Best-effort and synchronous: the write happens before returning, so by
+    /// the time this does the notice is on the wire (or that peer has been dropped for not taking it).
     pub fn announce_leaving(&mut self) {
         let frame = encode_control(&ControlMsg::Leaving {
             node: self.self_node,
@@ -507,7 +536,7 @@ impl BroadcastDissemination {
             if p.id == from {
                 return true;
             }
-            match p.conn.send_frame(frame) {
+            match p.conn.send_frame_within(frame, PEER_FRAME_BUDGET) {
                 Ok(()) => true,
                 Err(_) => {
                     // Shut it down rather than just dropping our handle, so the reader thread on
@@ -522,24 +551,32 @@ impl BroadcastDissemination {
 
 impl Dissemination for BroadcastDissemination {
     fn announce(&mut self, delta: &[ChannelIdentity]) -> io::Result<()> {
-        let frame = encode_control(&ControlMsg::RegistryDelta(delta.to_vec()));
-        self.broadcast(&frame);
+        for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
+            let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
+            self.broadcast(&frame);
+        }
         Ok(())
     }
 
     fn relay(&mut self, from: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
-        let frame = encode_control(&ControlMsg::RegistryDelta(delta.to_vec()));
-        self.send_except(from, &frame);
+        for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
+            let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
+            self.send_except(from, &frame);
+        }
         Ok(())
     }
 
     fn reply(&mut self, to: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
-        let frame = encode_control(&ControlMsg::RegistryDelta(delta.to_vec()));
-        if let Some(p) = self.peers.iter_mut().find(|p| p.id == to)
-            && p.conn.send_frame(&frame).is_err()
-        {
-            let _ = p.conn.shutdown();
-            self.peers.retain(|p| p.id != to);
+        for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
+            let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
+            let Some(p) = self.peers.iter_mut().find(|p| p.id == to) else {
+                return Ok(()); // already reaped, by an earlier batch or another send
+            };
+            if p.conn.send_frame_within(&frame, PEER_FRAME_BUDGET).is_err() {
+                let _ = p.conn.shutdown();
+                self.peers.retain(|p| p.id != to);
+                return Ok(());
+            }
         }
         Ok(())
     }

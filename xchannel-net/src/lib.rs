@@ -28,6 +28,20 @@ pub struct NodeConfig {
     pub control_addr: std::net::SocketAddr,
     /// Stream-plane listen address (serving subscriptions).
     pub stream_addr: std::net::SocketAddr,
+    /// What to **advertise** to peers instead of the address actually bound, when the two must
+    /// differ. `None` advertises the bound address, which is right whenever it is dialable.
+    ///
+    /// Needed because a node gossips the address it bound, and a wildcard bind (`0.0.0.0`) is a fine
+    /// thing to listen on and a useless thing to advertise: peers pass it on and none of them can dial
+    /// it back, so links form only in the outbound direction. Worse, every wildcard-bound node
+    /// advertises the *same* address, which is what duplicate-`NodeId` detection compares — so a fleet
+    /// of clones from one image, the case the step-aside exists for, becomes undetectable, and their
+    /// links get collapsed as duplicate *links* instead. A container that binds `0.0.0.0` and advertises
+    /// its routable address is the deployment this makes possible.
+    pub advertise_control_addr: Option<std::net::SocketAddr>,
+    /// The stream-plane counterpart of [`advertise_control_addr`](Self::advertise_control_addr): what a
+    /// subscriber is told to connect to.
+    pub advertise_stream_addr: Option<std::net::SocketAddr>,
     /// Client-plane Unix-domain-socket path (local client↔daemon RPC). Lives under
     /// `data_dir` so the `0700` directory restricts who can reach the daemon.
     pub client_path: std::path::PathBuf,

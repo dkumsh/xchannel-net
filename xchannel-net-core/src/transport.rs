@@ -32,6 +32,43 @@ pub const MAX_FRAME_LEN: usize = 64 << 20; // 64 MiB
 
 /// Write one length-delimited frame (`u32` LE length prefix + body) to any writer. Shared
 /// by every [`Transport`] so the framing can't drift between substrates.
+/// `write_all`, but abandoning the frame once `deadline` passes rather than only once a single
+/// syscall has waited out its own timeout.
+///
+/// The distinction is the whole point: `SO_SNDTIMEO` restarts on any syscall that moved a byte, so a
+/// slow or stalled peer can stretch one `write_all` without limit. Progress is required *and* the
+/// total is bounded.
+fn write_all_by<W: Write>(
+    w: &mut W,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer did not accept the frame within its write budget",
+            ));
+        }
+        match w.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "peer accepted no bytes",
+                ));
+            }
+            Ok(n) => bytes = &bytes[n..],
+            // The per-syscall timeout expiring is not itself fatal — the deadline above decides.
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn send_framed<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_FRAME_LEN {
         return Err(io::Error::new(
@@ -106,11 +143,45 @@ impl TcpTransport {
         self.stream.shutdown(std::net::Shutdown::Both)
     }
 
-    /// Bound how long a blocking write may wait. Without this, a peer that stops reading blocks
-    /// the writer inside `write_all` indefinitely — and on the control plane that writer is holding
-    /// a lock, so one wedged socket stalls the whole node.
+    /// Bound how long a **single** write syscall may block.
+    ///
+    /// This is `SO_SNDTIMEO`, and on its own it is *not* a bound on sending a frame — a fact worth
+    /// stating plainly here because relying on it as one was a real defect. `write_all` loops, and the
+    /// timeout restarts on every syscall that moved even one byte, so a peer that drains slowly (or
+    /// that stalls with a partly-filled buffer) stretches a single frame arbitrarily: measured at
+    /// 4.1 s per wedged peer against a 2 s setting, and 19 s for a peer draining at 128 KiB/s where
+    /// the timeout never fired at all. Use [`send_frame_within`](Self::send_frame_within) for a bound
+    /// on the frame; this is only the slice that keeps each syscall from parking forever.
     pub fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
         self.stream.set_write_timeout(timeout)
+    }
+
+    /// Send a length-delimited frame, giving up after `budget` **in total**.
+    ///
+    /// The bound the control plane actually needs. Every control-plane write happens while holding
+    /// the dissemination lock, which is also what the heartbeat needs, so an unbounded write is a
+    /// node-wide stall: three unresponsive peers produced a 15 s heartbeat gap against a 10 s liveness
+    /// timeout, and the node was declared dead by every peer while alive and serving.
+    ///
+    /// A frame abandoned part-way leaves the stream desynchronized, so the error is not recoverable
+    /// for this connection: every caller must drop **and shut down** the peer. That is what they
+    /// already do for any send error, which is why this returns a plain error rather than something
+    /// more descriptive.
+    pub fn send_frame_within(
+        &mut self,
+        bytes: &[u8],
+        budget: std::time::Duration,
+    ) -> io::Result<()> {
+        if bytes.len() > MAX_FRAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame exceeds MAX_FRAME_LEN",
+            ));
+        }
+        let deadline = std::time::Instant::now() + budget;
+        let len = (bytes.len() as u32).to_le_bytes();
+        write_all_by(&mut self.stream, &len, deadline)?;
+        write_all_by(&mut self.stream, bytes, deadline)
     }
 
     /// Bound how long a blocking read may wait. Used on the handshake, so a peer that connects
@@ -440,6 +511,110 @@ impl Listener for UnixListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A per-syscall timeout is not a per-frame bound**, and relying on it as one was a real defect:
+    /// `write_all` retries whenever a syscall moved even one byte, so a peer that drains slowly — or
+    /// stalls with a partly-filled buffer — stretches a single frame without limit. Measured before
+    /// this: 4.1 s per wedged peer against a 2 s setting, and 19 s for a peer draining at 128 KiB/s
+    /// where the timeout never fired at all.
+    ///
+    /// Written against a peer that accepts the connection and never reads a byte, which is what a
+    /// stopped, swapping or paused daemon looks like from here.
+    #[test]
+    fn a_frame_write_gives_up_on_its_budget_even_while_bytes_are_moving() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and never read. Held open for the duration, so the failure is a stalled peer rather
+        // than a closed connection.
+        let held = std::thread::spawn(move || listener.accept().unwrap().0);
+
+        let mut conn = TcpTransport::connect(addr).unwrap();
+        conn.set_write_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+
+        // Comfortably larger than any socket buffer, so the write cannot simply be absorbed.
+        let big = vec![0u8; 8 << 20];
+        let budget = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = conn.send_frame_within(&big, budget).unwrap_err();
+        let took = started.elapsed();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            took < budget * 4,
+            "the frame took {took:?} against a {budget:?} budget — the bound is on the syscall \
+             again, not on the frame"
+        );
+        drop(held.join().unwrap());
+    }
+
+    /// The case a per-syscall timeout cannot catch at all: a peer that **is** draining, just far too
+    /// slowly. Every syscall moves bytes, so `SO_SNDTIMEO` never fires and `write_all` runs to
+    /// completion however long that takes — measured at a 19 s heartbeat gap from a single peer reading
+    /// at 128 KiB/s, with the timeout set to 2 s. Only a deadline over the whole frame bounds this.
+    #[test]
+    fn a_frame_write_gives_up_on_a_peer_that_drains_too_slowly() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Stopped explicitly rather than by EOF: after the assertion the socket still holds megabytes,
+        // and draining them at this rate would take a minute of test time for no added confidence.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trickle = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                // ~40 KiB/s: always progressing, never fast enough.
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::io::Read::read(&mut conn, &mut buf).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            })
+        };
+
+        let mut conn = TcpTransport::connect(addr).unwrap();
+        conn.set_write_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let big = vec![0u8; 8 << 20];
+        let budget = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = conn.send_frame_within(&big, budget).unwrap_err();
+        let took = started.elapsed();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            took < budget * 4,
+            "the write ran for {took:?} against a {budget:?} budget: a peer that drains slowly can \
+             still hold the control plane for as long as it likes"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(conn);
+        let _ = trickle.join();
+    }
+
+    /// The bound must not fire on a peer that is simply reading, however large the frame.
+    #[test]
+    fn a_draining_peer_is_not_dropped_for_a_large_frame() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut sink = Vec::new();
+            std::io::Read::read_to_end(&mut conn, &mut sink).unwrap();
+            sink.len()
+        });
+
+        let mut conn = TcpTransport::connect(addr).unwrap();
+        conn.set_write_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let big = vec![7u8; 8 << 20];
+        conn.send_frame_within(&big, std::time::Duration::from_secs(10))
+            .expect("a peer that reads must never be dropped for the size of a frame");
+        drop(conn);
+        assert_eq!(reader.join().unwrap(), big.len() + 4);
+    }
 
     #[test]
     fn tcp_round_trips_frames_including_empty() {

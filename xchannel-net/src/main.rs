@@ -34,6 +34,23 @@ fn main() -> std::io::Result<()> {
     let stream_addr: SocketAddr = env_or("XCHANNELD_STREAM_ADDR", "127.0.0.1:7000")
         .parse()
         .expect("XCHANNELD_STREAM_ADDR must be host:port");
+    // What to tell peers, when it must differ from what is bound — a container binding `0.0.0.0`
+    // needs to advertise a routable address, or peers learn one nobody can dial and duplicate-id
+    // detection (which compares advertised control addresses) stops working.
+    let advertise_control_addr: Option<SocketAddr> =
+        std::env::var("XCHANNELD_ADVERTISE_CONTROL_ADDR")
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .expect("XCHANNELD_ADVERTISE_CONTROL_ADDR must be host:port")
+            });
+    let advertise_stream_addr: Option<SocketAddr> =
+        std::env::var("XCHANNELD_ADVERTISE_STREAM_ADDR")
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .expect("XCHANNELD_ADVERTISE_STREAM_ADDR must be host:port")
+            });
     let control_addr: SocketAddr = env_or("XCHANNELD_CONTROL_ADDR", "127.0.0.1:7001")
         .parse()
         .expect("XCHANNELD_CONTROL_ADDR must be host:port");
@@ -139,6 +156,8 @@ fn main() -> std::io::Result<()> {
         data_dir,
         control_addr,
         stream_addr,
+        advertise_control_addr,
+        advertise_stream_addr,
         client_path,
         seeds,
         reclaim_after,
@@ -188,11 +207,16 @@ fn main() -> std::io::Result<()> {
             "configured via XCHANNELD_NODE_ID".to_string()
         },
     );
+    // Show both when they differ, since which one peers receive is the thing that matters.
+    let shown = |bound: SocketAddr, advertised: Option<SocketAddr>| match advertised {
+        Some(a) if a != bound => format!("{bound} (advertised {a})"),
+        _ => bound.to_string(),
+    };
     eprintln!(
         "xchanneld[{}]: stream {} | control {} | client {}",
         node_id,
-        stream_listener.local_addr()?,
-        control_listener.local_addr()?,
+        shown(stream_listener.local_addr()?, advertise_stream_addr),
+        shown(control_listener.local_addr()?, advertise_control_addr),
         client_path.display(),
     );
 
@@ -215,12 +239,19 @@ fn main() -> std::io::Result<()> {
         // depends on this node dialling out first — and duplicate-id detection, which distinguishes
         // a twin from a self-link by comparing advertised control addresses, degrades too, because
         // two wildcard-bound machines advertise the *same* address.
-        if addr.ip().is_unspecified() {
+        let advertised = match plane {
+            "stream" => advertise_stream_addr,
+            _ => advertise_control_addr,
+        };
+        if addr.ip().is_unspecified() && advertised.is_none() {
             eprintln!(
-                "xchanneld[{node_id}]: WARNING: {plane} plane bound to the wildcard address \
-                 {addr}, which is what it will advertise to peers — they cannot dial it back, so \
-                 links form only in the outbound direction and duplicate-NodeId detection is \
-                 weakened. Set XCHANNELD_{}_ADDR to an address peers can reach.",
+                "xchanneld[{node_id}]: WARNING: {plane} plane bound to the wildcard address {addr} \
+                 and nothing else was given to advertise, so that is what peers will be told. They \
+                 cannot dial it back, so links form only in the direction this node opens them; and \
+                 because every wildcard-bound node advertises the *same* address, two nodes sharing a \
+                 NodeId become indistinguishable — their links are collapsed as duplicates instead of \
+                 reported, so a cloned image never stands down. Set XCHANNELD_ADVERTISE_{}_ADDR to an \
+                 address peers can reach.",
                 plane.to_uppercase(),
             );
         }

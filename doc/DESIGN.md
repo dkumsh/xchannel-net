@@ -263,21 +263,42 @@ a tick can spend and the loop simply saturates. A build-time assertion ties the 
 timeout, because the failure it guards against is invisible: a heartbeat period that quietly grows past
 `LIVENESS_TIMEOUT` looks like a healthy node right up to the moment every peer declares it dead.
 
-Two things about the walk are load-bearing and were each wrong once. **Each list has its own cursor,
+Three things about the walk are load-bearing and were each wrong once. **Each list has its own cursor,
 advanced by the candidates it actually consumed** — a single shared cursor reduced modulo each list in
-turn pinned the learned walk to a constant index forever. And **the penalty is charged for the attempt,
-not for the failure**: an address can accept a connection and then drop the link (a hint naming a
-stream port, or a peer whose control frames this release cannot decode), which costs a full dial while
-recording nothing, so two such addresses consumed the entire budget every tick in perpetuity. The
-penalty is forgiven once an address has *identified itself* over a link dialled there — a real peer
-whose link merely dropped, which is what prompt reconnection is for.
+turn pinned the learned walk to a constant index forever. **The penalty is charged for the attempt, not
+for the failure**: an address can accept a connection and then drop the link (a hint naming a stream
+port, or a peer whose control frames this release cannot decode), which costs a full dial while
+recording nothing, so two such addresses consumed the entire budget every tick in perpetuity. And **the
+gap escalates while attempts keep coming and decays once they stop** — with no exemption for an address
+that once worked. An exemption keyed on "this address identified itself over a link we dialled there"
+looked right and was a straight regression: that memo is never pruned, so it applied on every tick
+forever and cleared the penalty before it could double, and a host powered off overnight was then
+dialled every tick in perpetuity. Four such hosts took the heartbeat period from 0.5 s to a sustained
+4.5 s. No exemption is needed, because a link that lasted longer than its own gap has already outlived
+the penalty from the dial that created it, while a link dying *inside* its gap is flapping and ought to
+back off.
 
-Dialling is not the only blocking work in the tick. Registry replies and relays are coalesced to one
-frame per peer per cycle and every peer socket carries a write timeout, because a peer that stops
-reading would otherwise stall the dissemination lock — and therefore the heartbeat — indefinitely; a
-single frame of 200 000 losing identities produced a forty-second heartbeat gap before that was closed.
-Member attachment still costs a bounded resolve per unattached remote member and is *not* capped in
-member count; that is the next thing to bound if a tick ever runs long.
+Dialling is not the only blocking work in the tick, and the rest needed bounding too.
+
+**Every control-plane write is bounded per frame, and every frame is bounded in size.** These writes
+happen while holding the dissemination lock, which the heartbeat also needs, so an unbounded one is a
+node-wide stall — and a socket send timeout is *not* such a bound: `write_all` retries whenever a
+syscall moved a byte, so three unresponsive peers produced a 15 s heartbeat gap against a 10 s liveness
+timeout, and a peer merely draining at 128 KiB/s produced 19 s without the timeout ever firing.
+Registry frames are therefore capped at a few hundred identities (anti-entropy, which sends the whole
+registry, is chunked), and each frame is given a deadline after which the peer is dropped. Relays and
+replies are coalesced to one frame per *source link* per pump cycle rather than one per identity: that
+alone took a 200 000-identity delta from a 40 s heartbeat gap to 0.7 s.
+
+**Member attachment is capped per tick.** Each remote member not yet replicating costs a bounded
+resolve, and the count used to be unbounded: fifty of them made a tick 10.5 s. Attachment is idempotent
+and retried every tick, so a cap delays it rather than losing it.
+
+A build-time assertion ties the worst-case dial spend — count × (connect timeout + frame budget) — to
+`LIVENESS_TIMEOUT`, keeping a fixed reserve back for everything else in the tick. Read it as a bound on
+*dialling*, which is what it computes, and not as a bound on the tick: the earlier version of it was
+written in truncating whole seconds and omitted the frame budget entirely, so it passed for any dial
+count whatever while the real worst case was ninety seconds.
 
 **`NodeId`s must be unique; nothing negotiates them, and a duplicate is detected rather than
 prevented.** A node generates 64 random bits from `/dev/urandom` on first start and keeps them in
@@ -297,6 +318,15 @@ has only a single link and so nothing to compare: a heartbeat that claims our id
 is not ours is a twin, and the same heartbeat carrying *our own* advertised address is merely a link
 we opened to ourselves — which a seed list naming every node produces routinely and which must never
 be mistaken for a duplicate.
+
+**A wildcard bind defeats all of this, so a node can advertise something other than what it bound.**
+Every mechanism above compares *advertised* control addresses, and a node bound to `0.0.0.0` advertises
+exactly that: peers cannot dial it back, and — because every wildcard-bound node advertises the same
+address — two of them sharing an id are indistinguishable, so their links are collapsed as duplicate
+*links* rather than reported as a duplicate *identity*. That is the container deployment, which is also
+the golden-image deployment, so the case the step-aside exists for was the case it could not see.
+`XCHANNELD_ADVERTISE_CONTROL_ADDR` (and its stream counterpart) is the answer: bind the wildcard,
+advertise something routable. A node that binds a wildcard and advertises nothing warns at startup.
 
 For the second form to be reachable at all, a clone has to be able to *dial* its sibling — and the
 ordinary dial candidates cannot contain it, because they come from membership and membership excludes

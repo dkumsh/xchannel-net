@@ -102,6 +102,16 @@ node before starting any new one; see *Upgrading from 0.2.x* in the README.
   and exit 3. Every clone stands aside rather than all but one — they detect each other simultaneously
   and none has grounds to consider itself the original, which is harmless because none owned anything.
 
+- **`XCHANNELD_ADVERTISE_CONTROL_ADDR` and `XCHANNELD_ADVERTISE_STREAM_ADDR`** — what to tell peers,
+  when that must differ from what was bound. A node gossips the address it bound, and a wildcard bind
+  (`0.0.0.0`) is a fine thing to listen on and a useless thing to advertise: peers pass it on and none
+  of them can dial it back, so links form only outbound. Worse, every wildcard-bound node advertises the
+  *same* address — and that is what duplicate-`NodeId` detection compares, so a fleet of clones from one
+  container image, the exact case the step-aside exists for, was invisible to it and their links were
+  collapsed as duplicate *links* instead. Binding the wildcard and advertising something routable now
+  works, and is verified end to end: two wildcard-bound clones seeded only at a bootstrap detect each
+  other and both stand down. A node that binds a wildcard and advertises nothing warns at startup.
+
 - **A cosmetic node name and creation time**, gossiped with the heartbeat and stored in membership.
   `XCHANNELD_NODE_NAME`, defaulting to the hostname. Never a key, never a tie-break — a duplicate name
   is confusing, not incorrect. It exists because an auto-generated id is unreadable, so without it
@@ -217,7 +227,7 @@ Everything from here down was found by a pre-release review of the four changes 
   Measured before and after, with 25 dead seeds and 100 unreachable learned peers: heartbeat period
   max **4.50 s** against a 10 s liveness timeout, and a healthy owner reported dead in **0 of 60**
   samples where it had previously been 15 of 25. A 100-node mesh (4950 links, all live) closes in
-  **13.3 s** and a registration crosses it in 0.28 s; a 50-node mesh holds steady with **6** TCP opens
+  **13.0 s** and a registration crosses it in 0.28 s; a 50-node mesh holds steady with **zero** TCP opens
   across the whole mesh in 30 s.
 
   Three details of the cap were each wrong first, and are the kind that look like tuning and are not:
@@ -230,21 +240,43 @@ Everything from here down was found by a pre-release review of the four changes 
     the whole budget every tick, permanently, and the node joined only in the inbound direction. The
     penalty is forgiven once an address has *identified itself* over a link dialled there, which is a
     real peer whose link merely dropped.
-  - **Seeds, learned peers and same-id candidates carry separate budgets**, so a tick's worst case is
-    their sum — five dials, five seconds — not the two the constant's own doc claimed. A build-time
-    assertion now ties that sum to `LIVENESS_TIMEOUT`, because a heartbeat period that quietly grows
-    past it looks healthy right until every peer declares this node dead.
+  - **Seeds, learned peers and same-id candidates carry separate budgets**, so a tick's worst-case dial
+    spend is their sum, not the one budget the constant's own doc claimed. A build-time assertion ties
+    that spend — count × (connect timeout + frame budget) — to `LIVENESS_TIMEOUT` with a fixed reserve
+    held back for the rest of the tick, because a heartbeat period that quietly grows past it looks
+    healthy right until every peer declares this node dead. It is a bound on *dialling*, not on the
+    tick; the first version of it was written in truncating whole seconds and omitted the frame budget,
+    so it passed for any dial count whatever while the real worst case was ninety seconds.
+  - **The gap escalates while attempts continue and decays once they stop, with no exemption for an
+    address that once worked.** An exemption keyed on "has identified itself over a link we dialled
+    there" was a straight regression: that memo is never pruned, so it applied every tick forever and
+    cleared the penalty before it could double, and a host powered off overnight was dialled every tick
+    in perpetuity. Four such hosts took the heartbeat period from 0.5 s to a sustained **4.5 s**, where
+    0.2.x decayed to one attempt a minute. No exemption is needed — a link that outlasted its own gap
+    has already outlived the penalty from the dial that created it.
+  - **Member attachment is capped per tick.** Each remote member not yet replicating costs a bounded
+    resolve, and the count was unbounded: fifty of them made a tick **10.5 s**. Attachment is idempotent
+    and retried, so the cap delays it rather than losing it.
 
 - **A peer that stopped reading could stall the entire node.** Every control-plane write is a blocking
-  `write_all` made while holding the dissemination lock, so one unresponsive peer stalled the heartbeat
-  along with everything else. Two halves: peer sockets now carry a **write timeout** (a failed write is
-  already how a dead peer is reaped), and registry relays and replies are **coalesced to one frame per
-  peer per pump cycle** instead of one per identity, which also collapses N lock acquisitions to one.
-  Measured on the unfixed code: a single frame carrying 200 000 losing identities produced a **40.09 s
-  heartbeat gap** — four times the liveness timeout — and a ≥20 s client-plane outage. A control run
-  where the same identities *relayed* instead of replying peaked at 1.79 s, isolating the cause.
+  write made while holding the dissemination lock, so one unresponsive peer stalled the heartbeat along
+  with everything else. Measured on the unfixed code: a single frame carrying 200 000 losing identities
+  produced a **40.09 s heartbeat gap** — four times the liveness timeout — and a ≥20 s client-plane
+  outage. A control run where the same identities *relayed* instead of replying peaked at 1.79 s,
+  isolating the cause. Three parts:
+  - Relays and replies are **coalesced to one frame per source link per pump cycle** instead of one per
+    identity, which also collapses N dissemination-lock acquisitions into one. This alone took that
+    measurement to **0.718 s**, with the client plane answering in 22 ms.
+  - Registry frames are **chunked** to a few hundred identities. Anti-entropy sends the whole registry
+    on every reconnect, and one frame of it was measured at 10.6 MB taking 6.1 s to write to a stalled
+    peer — all of it under the lock.
+  - Each frame carries a **deadline**, after which the peer is dropped. A socket send timeout is not a
+    substitute and it was a mistake to ship one as if it were: `write_all` retries whenever a syscall
+    moved a byte, so three unresponsive peers produced a **15.03 s** heartbeat gap against a 2 s
+    setting, and a peer draining at 128 KiB/s produced **19.37 s** with the timeout never firing at all.
 
-- **A `deregister_topic` deadlocked the whole control plane against a peer being dialled or accepted.**
+- **Retiring a topic deadlocked the control plane against a peer being dialled or accepted.** Reachable
+  through the library API rather than through `xchanneld`, which has no client RPC for it —
   Taking the registry snapshot under the dissemination lock (below) gave the node a lock *order*, and
   this function violated it invisibly: `if let Some(t) = self.registry.lock_safe().deregister(..)` holds
   the guard for the whole body, across both the `hosted` lock and the announce. Two independent
@@ -252,8 +284,24 @@ Everything from here down was found by a pre-release review of the four changes 
   arriving every 5 ms, and hung silently — the dissemination lock is the entire control plane, so the
   node stops heartbeating and every peer declares it dead. `subscription_status` held `hosted` across
   the registry lock the same way, closing a second cycle. Both now bind before the `if let`; the lock
-  order is written on the `Node` type, along with the temporary-scope hazard that caused it, and a test
-  asserts the invariant directly rather than racing for it.
+  order is written on the `Node` type, along with the full table of which syntactic forms keep a guard
+  alive, and a test asserts the invariant directly rather than racing for it.
+
+  The same class then recurred thirty lines from the fix, which is why the table is exhaustive rather
+  than illustrative: `subscription_status` bound its guard to a `let` — the shape that *looks* like the
+  remedy — but the value it took *borrows* from the guard, so the guard lived to the end of the function
+  and spanned both higher locks. It now copies what it needs out inside a block. And the new test had a
+  false-pass mode of its own: the retirement returns `Ok(true)` unconditionally, so asserting on its
+  result proved only that a topic existed, and removing the announce entirely still passed. It now
+  requires the worker to be *blocked* before the probe means anything.
+
+- **A failed peer adoption leaked a thread, a descriptor and a live socket.** The reader thread is
+  spawned on a duplicate of the socket, so returning early dropped only the send half and left the
+  connection ESTABLISHED with a thread parked on it forever — and callers discard that error, so the
+  dialler retried the same address next tick and leaked again. Measured at one of each per attempt.
+  Bounding the writes above is what made the path reachable at all, which is how it arrived and got
+  fixed in the same release: the writes now happen *before* the reader is spawned, so a failure has
+  nothing to unwind.
 
 - **A node listing itself among its seeds kept a permanent link to itself** — a thread, two descriptors
   and a heartbeat exchanged with nobody, held forever because a self-link never learns an identity and

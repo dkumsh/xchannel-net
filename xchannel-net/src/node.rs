@@ -76,6 +76,27 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// node finds its way back.
 const MAX_DIALS_PER_TICK: usize = 2;
 
+/// What [`Node::subscription_status`] needs from a subscription, copied out so the `subscriptions`
+/// lock is released before any higher-ranked lock is taken. Every field is an atomic load.
+struct SubscriptionSnapshot {
+    active: bool,
+    synced: u64,
+    head_at_connect: u64,
+    last_record_at_ms: Option<u64>,
+    rebuilds_gap: u64,
+    rebuilds_diverged: u64,
+    last_rebuild_at_ms: Option<u64>,
+}
+
+/// One address's dial penalty: when it was last tried, when it may be tried again, and the gap that
+/// produced that. The attempt instant is what lets the gap decay rather than only ever grow.
+#[derive(Clone, Copy)]
+struct DialPenalty {
+    attempted_at: Instant,
+    next: Instant,
+    gap: Duration,
+}
+
 /// Dials per tick spent on addresses claiming this node's own id.
 ///
 /// Smaller than the others because a duplicate identity is a misconfiguration, not a topology: there
@@ -83,16 +104,42 @@ const MAX_DIALS_PER_TICK: usize = 2;
 /// slow ordinary mesh formation. One per tick reaches a twin inside a second.
 const MAX_TWIN_DIALS_PER_TICK: usize = 1;
 
-/// The coupling that makes the cap worth having: a tick must fit inside the liveness budget with
-/// room to spare, since dialling is only part of what a tick does. Stated as a build-time check
-/// because the failure it guards against is invisible — a heartbeat period that quietly exceeds
-/// `LIVENESS_TIMEOUT` gets this node declared dead by every peer, and the topic member reaper then
-/// tombstones its live members' names.
+/// The coupling that makes the cap worth having: a tick must fit inside the liveness budget with room
+/// to spare, since dialling is only part of what a tick does. Stated as a build-time check because the
+/// failure it guards against is invisible — a heartbeat period that quietly exceeds `LIVENESS_TIMEOUT`
+/// gets this node declared dead by every peer, and the topic member reaper then tombstones its live
+/// members' names.
+///
+/// **In milliseconds, and counting the join-time write.** Written in `as_secs()` it was theatre: the
+/// division truncates, so a `CONNECT_TIMEOUT` of 900 ms read as zero and the assertion passed for any
+/// dial count whatever, while a 1900 ms one read as 1 and hid a 9.5 s worst case. It also omitted the
+/// dominant term — a successful dial writes the join-time sync before returning — so the quantity it
+/// checked was not the one it named.
+///
+/// It still does not model everything in a tick: `attach_pending_members` costs a `RESOLVE_TIMEOUT`
+/// per unattached remote member and is capped only by [`MAX_ATTACH_RESOLVES_PER_TICK`]. Read it as a
+/// bound on *dialling*, which is what it says, not as a bound on the tick.
 const _: () = assert!(
-    (2 * MAX_DIALS_PER_TICK + MAX_TWIN_DIALS_PER_TICK) as u64 * CONNECT_TIMEOUT.as_secs() * 2
-        <= LIVENESS_TIMEOUT.as_secs(),
-    "the worst-case dial budget leaves too little of LIVENESS_TIMEOUT for the rest of the tick"
+    (2 * MAX_DIALS_PER_TICK + MAX_TWIN_DIALS_PER_TICK) as u128
+        * (CONNECT_TIMEOUT.as_millis() + crate::broadcast::PEER_FRAME_BUDGET.as_millis())
+        + TICK_RESERVE.as_millis()
+        <= LIVENESS_TIMEOUT.as_millis(),
+    "the worst-case dial spend leaves less than TICK_RESERVE of LIVENESS_TIMEOUT for the rest of the \
+     tick — reduce a dial budget, CONNECT_TIMEOUT, or PEER_FRAME_BUDGET"
 );
+
+/// How much of `LIVENESS_TIMEOUT` the assertion above keeps back for everything in a tick that is not
+/// dialling: the pump and its writes, member attachment, subscription servicing, and the sleep. Not a
+/// measurement of that work — a floor under what is left for it.
+const TICK_RESERVE: Duration = Duration::from_secs(3);
+
+/// Member resolves attempted per tick by `attach_pending_members`.
+///
+/// Each unattached remote member costs a `RESOLVE_TIMEOUT`, and the count was unbounded: fifty
+/// unattached members made a tick 10.5 s, which is a node declared dead by every peer and its live
+/// members' names then tombstoned by the reaper. Attachment is idempotent and retried every tick, so
+/// capping it delays attachment rather than losing it.
+const MAX_ATTACH_RESOLVES_PER_TICK: usize = 4;
 
 /// First retry gap after a failed dial, doubling to [`DIAL_BACKOFF_MAX`].
 ///
@@ -384,16 +431,37 @@ pub struct TopicStatus {
 /// the snapshot *inside* the dissemination lock. The leaf locks are unordered among themselves; no
 /// path holds two of them and reaches back up.
 ///
-/// This is a documented invariant with nothing enforcing it, and it has been violated once, so the
-/// hazard is worth naming precisely: **a `MutexGuard` in an `if let` / `match` scrutinee is held for
-/// the whole body.** Rust 2024 moved that drop point ahead of the `else` arm only. So
+/// This is a documented invariant with nothing enforcing it, and it has now been violated twice — the
+/// second time in the very commit that fixed the first, thirty lines from the fix. So the hazard is
+/// worth naming exhaustively rather than by example. **A `MutexGuard` is a temporary, and where it
+/// dies depends on the syntax around it** (edition 2024; verified by probing with `try_lock`):
+///
+/// | form | guard alive in the body? |
+/// |---|---|
+/// | `if <guard-expr> { }` / `while <guard-expr> { }` | no |
+/// | `a && <guard-expr>` / `<guard-expr> && b` | no |
+/// | `let P = <guard-expr> else { };` | no |
+/// | `if let P = <guard-expr> { }` | **yes**, in the then-block |
+/// | `match <guard-expr> { }` | **yes**, in every arm |
+/// | `f(<guard-expr>, g())` | **yes**, for the whole call |
+/// | `let g = <guard-expr>;` | **yes**, to the end of the block |
+///
+/// The last row is the one that bites hardest, because it looks like the fix for the fourth:
 ///
 /// ```ignore
-/// if let Some(t) = self.registry.lock_safe().deregister(name, id) { self.announce(&t)?; }
+/// let subs = self.subscriptions.lock_safe();
+/// let sub = subs.get(name)?;                    // borrows the guard, so it lives to the end
+/// let owner = self.registry.lock_safe().get(name);   // ...and this inverts the order
 /// ```
 ///
-/// holds the registry lock across the announce and deadlocks against any thread taking the locks in
-/// the documented order. Bind the value to a `let` first; the guard then drops at the semicolon.
+/// Binding is only enough if nothing *borrows* from the guard. Copy what you need out of it inside a
+/// block, and let the block end release it.
+///
+/// One more thing this diagram flattens: `dissemination` is not a single lock but a small lattice of
+/// its own (`connected → membership → {dial_identity, hints}`, `link_peers → membership`,
+/// `self_control → {conflicts, same_id_addrs}`), exercised by reader threads that hold no
+/// `dissemination` guard at all. It is acyclic, and "no reader takes `connected` under `membership`"
+/// is load-bearing there.
 #[derive(Clone)]
 pub struct Node {
     config: Arc<NodeConfig>,
@@ -410,10 +478,9 @@ pub struct Node {
     /// Per-owner "unreachable from here since" clock, for owners we have never had contact with.
     /// Bounded by the registry's owner set, which `note_unreachable_owners` prunes it to.
     owner_unreachable_since: Arc<Mutex<HashMap<NodeId, Instant>>>,
-    /// Per-address dial backoff: when this address may next be tried, and the gap that produced
-    /// that instant. Bounded by the candidate set, and only ever holding addresses we have failed
-    /// to reach.
-    dial_backoff: Arc<Mutex<HashMap<SocketAddr, (Instant, Duration)>>>,
+    /// Per-address dial penalty: when this address was last attempted, when it may next be tried,
+    /// and the gap that produced that instant. Bounded by the candidate set.
+    dial_backoff: Arc<Mutex<HashMap<SocketAddr, DialPenalty>>>,
     /// Where the last tick's dial budget stopped in each candidate list, so a list is walked
     /// round-robin rather than always from its head.
     ///
@@ -834,6 +901,13 @@ impl Node {
     /// a member whose replica isn't ready yet is retried on the next call. Runs on the
     /// maintenance loop, so it reacts as `member_of` registrations gossip in.
     pub fn attach_pending_members(&self) {
+        // **Bounded per tick.** Each remote member that is not yet replicating costs a
+        // `RESOLVE_TIMEOUT`, and this runs on the heartbeat loop: fifty of them made a tick 10.5 s,
+        // which is long enough for every peer to declare this node dead and for their topic reapers to
+        // tombstone its live members' names. Attachment is idempotent and retried every tick, so a cap
+        // delays it rather than losing it — and the members that are already replicating, which is the
+        // steady state, cost nothing here and are not counted against it.
+        let mut resolves = 0usize;
         for (topic, mux) in self.mux_handles() {
             // Members the registry says belong to this topic right now (live, non-tombstoned).
             let live: Vec<ChannelIdentity> = {
@@ -850,7 +924,12 @@ impl Node {
                 // This is essential after a restart: reconstruct may re-attach a member from a
                 // *stale* replica, so we must (re)start its subscription to resume its stream —
                 // idempotent, a no-op if already replicating.
-                if remote {
+                if remote && resolves < MAX_ATTACH_RESOLVES_PER_TICK {
+                    // Only a member that is *not* already replicating can block, and only that case is
+                    // charged: `ensure_member_subscription` returns immediately for a live one.
+                    if !self.is_replicating(&m.name) {
+                        resolves += 1;
+                    }
                     self.ensure_member_subscription(&m.name);
                 }
 
@@ -955,6 +1034,16 @@ impl Node {
     /// Ensure a self-healing subscription is replicating remote member `name` locally, so its
     /// replica can feed the mux. Reuses the subscription map (idempotent); a short resolve
     /// timeout keeps the maintenance loop responsive if the owner isn't reachable yet.
+    /// Whether a live subscription for `name` already exists, so the caller can tell a free call to
+    /// [`ensure_member_subscription`](Self::ensure_member_subscription) from one that may block on a
+    /// resolve.
+    fn is_replicating(&self, name: &str) -> bool {
+        self.subscriptions
+            .lock_safe()
+            .get(name)
+            .is_some_and(|s| s.is_active())
+    }
+
     fn ensure_member_subscription(&self, name: &str) {
         let live = self
             .subscriptions
@@ -1439,7 +1528,9 @@ impl Node {
     pub fn bind_stream(&self) -> io::Result<TcpListener> {
         let listener = TcpListener::bind(self.config.stream_addr)?;
         let addr = listener.local_addr()?;
-        self.dissemination.lock_safe().set_self_addr(addr);
+        // Advertise what peers can reach, which is not always what was bound.
+        let advertised = self.config.advertise_stream_addr.unwrap_or(addr);
+        self.dissemination.lock_safe().set_self_addr(advertised);
         *self.bound_stream_addr.lock_safe() = Some(addr);
         Ok(listener)
     }
@@ -1487,10 +1578,15 @@ impl Node {
     /// Bind the control-plane listener.
     pub fn bind_control(&self) -> io::Result<TcpListener> {
         let listener = TcpListener::bind(self.config.control_addr)?;
-        // Advertise the address that actually accepts links, not the configured one — with `:0`
-        // they differ, and a peer dialling the configured port would reach nothing.
+        // Advertise the address that actually accepts links, not the configured one — with `:0` they
+        // differ, and a peer dialling the configured port would reach nothing. An explicit
+        // `advertise_control_addr` overrides both, for the wildcard-bind case where the bound address
+        // is not something any peer can dial.
         let addr = listener.local_addr()?;
-        self.dissemination.lock_safe().set_self_control_addr(addr);
+        let advertised = self.config.advertise_control_addr.unwrap_or(addr);
+        self.dissemination
+            .lock_safe()
+            .set_self_control_addr(advertised);
         Ok(listener)
     }
 
@@ -1733,11 +1829,27 @@ impl Node {
     /// itself* rather than for having accepted a connection.
     fn dial_peer(&self, addr: SocketAddr) {
         {
+            let now = Instant::now();
             let mut backoff = self.dial_backoff.lock_safe();
-            let gap = backoff
-                .get(&addr)
-                .map_or(DIAL_BACKOFF_MIN, |(_, g)| (*g * 2).min(DIAL_BACKOFF_MAX));
-            backoff.insert(addr, (Instant::now() + gap, gap));
+            // **Escalate on a recent history of attempts; start fresh without one.** The gap doubles
+            // only while attempts keep coming, and an address whose last attempt is older than the
+            // ceiling begins again at the floor. Without that decay the doubling was monotone for the
+            // life of the process, so an address dialled once an hour — an ordinary peer reconnecting
+            // — would eventually have to serve a full minute before anyone here could reach it.
+            let gap = match backoff.get(&addr) {
+                Some(p) if p.attempted_at.elapsed() < DIAL_BACKOFF_MAX * 2 => {
+                    (p.gap * 2).min(DIAL_BACKOFF_MAX)
+                }
+                _ => DIAL_BACKOFF_MIN,
+            };
+            backoff.insert(
+                addr,
+                DialPenalty {
+                    attempted_at: now,
+                    next: now + gap,
+                    gap,
+                },
+            );
         }
         if let Ok(conn) = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT) {
             let mut d = self.dissemination.lock_safe();
@@ -1746,39 +1858,26 @@ impl Node {
         }
     }
 
-    /// Whether `addr` may be dialled now. Unknown addresses are always due — a first attempt is
-    /// never delayed.
+    /// Whether `addr` may be dialled now. Unknown addresses are always due — a first attempt is never
+    /// delayed — and so is one whose gap has elapsed.
     ///
-    /// An address that has served out its gap is due, and so is one that has **identified itself**
-    /// over a link we dialled there: that is a real peer whose link merely dropped, and re-dialling
-    /// it promptly is the entire point of reconnection. An address that has only ever *accepted* gets
-    /// no such credit.
+    /// **There is deliberately no exemption for an address that once worked.** There was one, and it
+    /// is worth recording why it was wrong: it keyed on "has this address ever identified itself over
+    /// a link we dialled there", and that memo is never pruned, so the exemption applied on every tick
+    /// forever and cleared the penalty before it could ever double. A peer that *departed* — a host
+    /// powered off overnight, precisely the population a backoff exists for — was then dialled every
+    /// tick in perpetuity: four such addresses took the heartbeat period from 0.5 s to a sustained
+    /// 4.5 s, 45 % of the liveness budget, where the previous release decayed to one attempt a minute.
     ///
-    /// Takes the two locks one at a time rather than nesting them — `dial_backoff` is a leaf lock and
-    /// `dissemination` outranks it, so holding the leaf across the acquisition would invert this
-    /// type's documented lock order.
+    /// No exemption is needed. A link that lasted longer than its own gap has already outlived the
+    /// penalty from the dial that created it, so `now >= next` holds and the reconnection is prompt on
+    /// the merits. A link that dies *inside* its gap is flapping, and backing off is the right answer
+    /// rather than something to excuse.
     fn dial_due(&self, addr: SocketAddr) -> bool {
-        let Some(next) = self
-            .dial_backoff
+        self.dial_backoff
             .lock_safe()
             .get(&addr)
-            .map(|(next, _)| *next)
-        else {
-            return true;
-        };
-        if Instant::now() >= next {
-            return true;
-        }
-        if self
-            .dissemination
-            .lock_safe()
-            .dialled_identity(addr)
-            .is_some()
-        {
-            self.dial_backoff.lock_safe().remove(&addr);
-            return true;
-        }
-        false
+            .is_none_or(|p| Instant::now() >= p.next)
     }
 
     /// Dial at most `budget` of `candidates`, skipping those already linked, those still in backoff,
@@ -2296,8 +2395,23 @@ impl Node {
             });
         }
 
-        let subs = self.subscriptions.lock_safe();
-        let sub = subs.get(name)?;
+        // Take what is needed and release the leaf before touching anything that outranks it. Binding
+        // `sub` out of the guard is not enough — it *borrows* from the guard, so the guard would live to
+        // the end of the function and span both locks below, which is this type's documented order run
+        // backwards. Every field read here is an atomic load, so copying them is free.
+        let held = {
+            let subs = self.subscriptions.lock_safe();
+            let sub = subs.get(name)?;
+            SubscriptionSnapshot {
+                active: sub.is_active(),
+                synced: sub.synced_index(),
+                head_at_connect: sub.head_at_connect(),
+                last_record_at_ms: sub.last_record_at_ms(),
+                rebuilds_gap: sub.rebuilds().gap(),
+                rebuilds_diverged: sub.rebuilds().diverged(),
+                last_rebuild_at_ms: sub.rebuilds().last_at_ms(),
+            }
+        };
         let (owner, generation) = self
             .registry
             .lock_safe()
@@ -2311,16 +2425,16 @@ impl Node {
             .contains(&owner);
         Some(SubscriptionStatus {
             local: false,
-            active: sub.is_active(),
-            synced: RecordIndex(sub.synced_index()),
-            head_at_connect: RecordIndex(sub.head_at_connect()),
+            active: held.active,
+            synced: RecordIndex(held.synced),
+            head_at_connect: RecordIndex(held.head_at_connect),
             owner,
             owner_live,
             generation,
-            last_record_at_ms: sub.last_record_at_ms().unwrap_or(0),
-            rebuilds_gap: sub.rebuilds().gap(),
-            rebuilds_diverged: sub.rebuilds().diverged(),
-            last_rebuild_at_ms: sub.rebuilds().last_at_ms().unwrap_or(0),
+            last_record_at_ms: held.last_record_at_ms.unwrap_or(0),
+            rebuilds_gap: held.rebuilds_gap,
+            rebuilds_diverged: held.rebuilds_diverged,
+            last_rebuild_at_ms: held.last_rebuild_at_ms.unwrap_or(0),
         })
     }
 
@@ -2824,6 +2938,8 @@ mod tests {
             reclaim_after: Duration::from_millis(0),
             promoted_topics: Default::default(),
             mux_idle: MuxIdle::default(),
+            advertise_control_addr: None,
+            advertise_stream_addr: None,
             node_name: format!("test-{id}"),
             id_generated: false,
         }
@@ -3006,6 +3122,14 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        // **The probe proves nothing unless the worker is actually blocked on the lock we hold.**
+        // `deregister_topic` returns `Ok(true)` unconditionally, so asserting on its result showed only
+        // that a mux existed: with the announce removed entirely the test still passed.
+        assert!(
+            !worker.is_finished(),
+            "the retirement completed without ever wanting the dissemination lock, so acquiring the \
+             registry lock below demonstrates nothing about the order"
+        );
         // Release the worker either way, so it can finish and the test can end cleanly.
         drop(held);
         assert!(
@@ -3053,10 +3177,11 @@ mod tests {
         );
 
         // Every attempt carries a penalty that grows.
-        for (addr, (_, gap)) in node.dial_backoff.lock_safe().iter() {
+        for (addr, penalty) in node.dial_backoff.lock_safe().iter() {
             assert!(
-                *gap >= DIAL_BACKOFF_MIN && *gap <= DIAL_BACKOFF_MAX,
-                "{addr} has an out-of-range backoff {gap:?}"
+                penalty.gap >= DIAL_BACKOFF_MIN && penalty.gap <= DIAL_BACKOFF_MAX,
+                "{addr} has an out-of-range backoff {:?}",
+                penalty.gap
             );
         }
 
@@ -3092,49 +3217,74 @@ mod tests {
             ..config(122, temp_dir("dial-accept-drop"))
         });
         node.connect_seeds();
-        let (_, gap) = *node.dial_backoff.lock_safe().get(&addr).expect(
-            "an address that accepted the connection and gave us nothing must still be penalised",
-        );
+        let gap = node
+            .dial_backoff
+            .lock_safe()
+            .get(&addr)
+            .expect("an address that accepted the connection and gave us nothing must be penalised")
+            .gap;
         assert_eq!(gap, DIAL_BACKOFF_MIN);
 
         // ...and it must not be retried while that penalty stands, however many ticks run.
         for _ in 0..5 {
             node.connect_seeds();
         }
-        let (_, gap) = *node.dial_backoff.lock_safe().get(&addr).unwrap();
+        let gap = node.dial_backoff.lock_safe().get(&addr).unwrap().gap;
         assert_eq!(
             gap, DIAL_BACKOFF_MIN,
             "the address was dialled again inside its own backoff window"
         );
     }
 
-    /// The other half of that rule: a *real* peer whose link drops is dialled again at once. The
-    /// penalty is forgiven for having identified itself — not for having accepted a connection.
+    /// The other half of that rule, and the reason no "this address once worked" exemption is needed:
+    /// **a link that outlives its own gap has already paid the penalty from the dial that created
+    /// it.** So a departed peer is re-dialled promptly on the merits, while a *flapping* one — dying
+    /// inside its gap — correctly waits. The exemption that used to be here keyed on a memo that is
+    /// never pruned, so it applied every tick forever and the gap never doubled: four departed hosts
+    /// cost a dial each per tick, taking the heartbeat period from 0.5 s to a sustained 4.5 s.
     #[test]
-    fn a_peer_that_identified_itself_is_redialled_without_serving_its_penalty() {
-        let (_a, _a_stream, a_control) = start(123, "dial-refund-a");
-        let b = Node::new(config(124, temp_dir("dial-refund-b")));
-        b.connect_control_peer(a_control).unwrap();
+    fn a_penalty_expires_on_its_own_and_decays_when_attempts_stop() {
+        let node = Node::new(config(125, temp_dir("dial-decay")));
+        // Nothing listens here; the dial fails fast with ECONNREFUSED.
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
 
-        // Wait for A's heartbeat, which is what identifies the far end of the link we dialled.
-        poll_until(|| {
-            b.dissemination
-                .lock_safe()
-                .dialled_identity(a_control)
-                .map(|_| ())
-        });
-        // Stand in for a dropped link: the address is penalised and not yet due.
-        b.dial_backoff.lock_safe().insert(
-            a_control,
-            (Instant::now() + DIAL_BACKOFF_MAX, DIAL_BACKOFF_MAX),
+        node.dial_peer(addr);
+        assert_eq!(
+            node.dial_backoff.lock_safe().get(&addr).unwrap().gap,
+            DIAL_BACKOFF_MIN
         );
+        assert!(!node.dial_due(addr), "the gap has not elapsed yet");
+
+        // An elapsed gap is the entire mechanism — no exemption of any kind is consulted.
+        node.dial_backoff.lock_safe().get_mut(&addr).unwrap().next = Instant::now();
         assert!(
-            b.dial_due(a_control),
-            "a peer that has identified itself must be re-dialled promptly, not after a minute"
+            node.dial_due(addr),
+            "a peer whose link outlasted its gap must be re-dialled promptly, which is why no \
+             permanent exemption is needed"
         );
-        assert!(
-            !b.dial_backoff.lock_safe().contains_key(&a_control),
-            "the forgiven penalty must be cleared, not merely ignored"
+
+        // Escalation, while attempts keep coming.
+        node.dial_peer(addr);
+        assert_eq!(
+            node.dial_backoff.lock_safe().get(&addr).unwrap().gap,
+            DIAL_BACKOFF_MIN * 2,
+            "a repeated attempt must double the gap"
+        );
+
+        // Decay, once they stop: the doubling must not be monotone for the life of the process.
+        node.dial_backoff
+            .lock_safe()
+            .get_mut(&addr)
+            .unwrap()
+            .attempted_at = Instant::now() - DIAL_BACKOFF_MAX * 3;
+        node.dial_peer(addr);
+        assert_eq!(
+            node.dial_backoff.lock_safe().get(&addr).unwrap().gap,
+            DIAL_BACKOFF_MIN,
+            "a long-quiet address must start again at the floor"
         );
     }
 
