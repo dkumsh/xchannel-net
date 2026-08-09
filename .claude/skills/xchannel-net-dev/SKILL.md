@@ -165,10 +165,28 @@ future-at-scale = a `foca`-backed SWIM impl behind the same trait, registry unto
 
 ## Current status (update this section as work lands)
 
-_As of 2026-08-09, at tag **v0.2.1** (docs/packaging only; 0.2.0 is the substantive release). Its headline is the §4.1 duty cycle (one loop, poll-items,
-no thread per connection) plus the correctness work found by reviewing everything since 0.0.1 —
-see `CHANGELOG.md`. **0.2.0 breaks on disk**: no migrator, a 0.1.0 data directory is not carried
-forward (slot-table wire version, and channels written before name stamping are refused)._
+_As of 2026-08-09, at tag **v0.3.0**. Its headline is **zero-configuration joining**: a node
+generates its own `NodeId` (64 random bits in `<data_dir>/.node_id`, no default any more), gossips its
+control address, learns third parties via `PeerHint`, and closes any connected seed graph into a full
+mesh. Plus graceful `SIGTERM` (courtesy, not safety — a hard kill was always safe), a per-user data
+dir (`$HOME/.xchannel-net`, no `/tmp`), and the fixes a pre-release council review produced. **0.3.0
+breaks the control wire and the data-dir default**; 0.2.0 broke on disk (no migrator, ever). Do not run
+a mixed-version mesh: an unrecognised control frame drops the link, so the versions reconnect and drop
+each other forever._
+
+**Load-bearing invariants added in 0.3.0** (easy to undo by accident — see `CHANGELOG.md` for why each
+exists):
+- `Membership::last_seen` is `Option<Instant>`; `None` = known by **hearsay only**. `learn` must never
+  touch it, and `live_members` must keep meaning "reachable by *me*" — `resolve`, the reclaim guard,
+  the topic member reaper and `owner_live` all read it that way. `last_contact` is the separate clock
+  that survives a departure, so silence stays measurable after liveness is gone.
+- A node **never** records itself in its own membership map, from a heartbeat or a hint.
+- The reclaim guard judges the *owner*, never this node's uptime (`owner_unreachable_since`).
+- Both ends of a pair dial; `dedup_links` resolves the duplicate on `(initiator NodeId, ordered
+  endpoint pair)`. Nothing process-local may enter that key.
+- Registry convergence is two-way: relay on change, **reply on loss**.
+- Dialling happens *after* the heartbeat, capped at `MAX_DIALS_PER_TICK`, with per-address backoff.
+- The registry snapshot for join-time anti-entropy is taken **under** the dissemination lock.
 - Dep is published **`xchannel = "5.1.0"`**. `.justfile` present in every commit; every
   commit passes `just check` (cargo check + fmt --check + clippy --all-targets).
 - **v1 complete and hardened.** External client process → `Client` RPC → local `xchanneld`

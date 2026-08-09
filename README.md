@@ -20,9 +20,11 @@ its own writer's path, and killing it loses nothing.
 ## Status
 
 **Experimental, pre-1.0**; the wire protocol, the on-disk layout and the control protocol change
-between releases, without migrators. Treat an upgrade as a fresh start for the whole mesh: a
-mixed-version cluster does not gossip, and a data directory written by an earlier release is not
-carried forward. `CHANGELOG.md` names what breaks in each release.
+between releases, without migrators. Treat an upgrade as a fresh start for the whole mesh, and stop
+every node before starting any new one — a mixed-version cluster is worse than one that merely fails
+to gossip: an unrecognised control frame drops the link, so the two versions reconnect and drop each
+other continuously, and neither side's membership ever settles. A data directory written by an earlier
+release is not carried forward either. `CHANGELOG.md` names what breaks in each release.
 
 **Platform: Unix only.** The client plane is a permission-gated Unix domain socket and the
 data directory relies on Unix mode bits (`0700`/`0600`), so the daemon does not build on
@@ -78,6 +80,14 @@ timeout. It exists for promptness, not for safety — there is nothing it has to
 
 What a hard kill *does* cost is time. Peers take up to ten seconds to notice, and a subscriber
 re-sends whatever was in flight. Prefer `SIGTERM`; reach for `SIGKILL` without anxiety.
+
+## Upgrading from 0.2.x
+
+The default data directory moved from `/tmp/xchanneld` to `$HOME/.xchannel-net`, and **nothing is
+migrated**: a 0.3 daemon does not read the old location, and a 0.2 data directory would be refused
+anyway. In practice there is nothing worth moving — `/tmp` is `tmpfs` on most systems, so those
+channels were never durable, and it is cleared on reboot. Point `XCHANNELD_DATA_DIR` at the old path
+if you want the old behaviour back, and expect the same consequences.
 
 ## Workspace
 

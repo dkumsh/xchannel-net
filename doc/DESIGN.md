@@ -52,7 +52,13 @@ owner to read-only replicas on subscribing nodes.
   `get` but retained and propagated by anti-entropy. `Node::deregister` tombstones + announces;
   convergence is covered by a permutation test. Client-facing `Deregister` and `ForceDeregister`
   RPCs invoke it (the latter being the operator-only path to reclaim a *dead* owner's name), and
-  merging a tombstone proactively retires any subscription held for that name.
+  merging a tombstone proactively retires any subscription held for that name. The reclaim guard
+  judges the owner on how long it has been unreachable **from this node** — silence since the last
+  direct contact, or, for an owner never contacted, how long this node has known of it and failed to
+  reach it, a clock reset the instant contact is made. Never on this node's own uptime, which is not
+  an observation about the owner at all: it made every daemon older than the threshold satisfy it
+  unconditionally, so an owner that was alive and writing but merely unreachable from here could have
+  its channel tombstoned.
 - **Lost-collision detection (`RegisterRejected`)** — `claim_name` reserves the name before
   creating any file and fails with `AlreadyExists` if an earlier registration owns it, so the
   client is told rather than silently believing it owns the name (§"Name collisions").
@@ -197,6 +203,13 @@ control addresses in its seed list, and accepts whoever dials it. From that star
   node's map at most once, however many cycles the topology has. The relay skips the link it
   arrived on, which keeps a full mesh — where the relay is redundant, everyone having been told
   directly — to one round of no-op merges rather than one per peer.
+- **Reply on loss.** The mirror of the above, and not optional: when the arriving state *loses* the
+  merge, the winner goes back to the peer that sent it. Silence taught the sender nothing, and
+  join-time anti-entropy only runs when a link is *established* — so on a link that stays up the two
+  disagreed about that channel indefinitely, the sender resolving the wrong owner and, after a
+  reclaim, serving a replica of an incarnation the mesh had retired. This terminates for the same
+  reason the relay does, plus one step: a reply is sent only when the arriving state differs from the
+  winner, so the reply — which *is* the winner — cannot provoke another.
 
 Two properties are deliberate and worth keeping:
 
@@ -217,19 +230,62 @@ direction would have worked first time. So both dial, and `dedup_links` resolves
 duplicate knowing which direction succeeded.
 
 Resolution has to be one both ends reach independently, or they would drop opposite links and be
-left with none: **keep the link whose initiator has the lower `NodeId`**. Each end knows, for each
-link, whether it dialled and who the peer is, so both compute the same initiator for the same link.
+left with none: **keep the link whose initiator has the lower `NodeId`**, and break a tie on the
+link's two endpoint addresses, ordered. Each end knows, for each link, whether it dialled and who the
+peer is, so both compute the same initiator; and one end's `(local, peer)` is the other's
+`(peer, local)`, so ordering the pair names the *connection* identically on both sides. Neither half
+may be anything local — a per-process link counter looks like a tie-break and is not one, because the
+two ends number the same pair of links differently, each keeps the one the other drops, and the peers
+are left with no link at all.
+
 A link's peer is learned from its first heartbeat, which is also why dialling is gated on *node
 identity* rather than dial address — an inbound link has no dial address, so address-based tracking
-alone would call its peer unconnected and dial it a second time.
+alone would call its peer unconnected and dial it a second time. The identity found at a dial address
+is remembered for the same reason: a peer's advertised control address and the address we happened to
+reach it on need not be the same, so without that memory a seed given under an alias was dialled,
+deduplicated, and re-dialled on every tick forever.
 
-**`NodeId`s must be unique, and nothing enforces it.** They come from `XCHANNELD_NODE_ID`, which
-defaults to `1`. A duplicate makes two nodes indistinguishable in the membership map (their
-addresses overwrite each other), in channel ownership (`ChannelIdentity.owner`, and the
-`registered_at_nanos`/`NodeId` collision tiebreak), and now in link deduplication, where it would
-drop the link between two genuinely distinct peers. A node that hears its own id on a peer link
-warns once; a duplicate between two *other* nodes is not detectable from here. Assigning ids is the
-operator's job.
+**Dialling is bounded per tick, and it happens after the heartbeat.** The maintenance loop is also
+the heartbeat loop, so what it spends dialling is taken out of this node's own liveness. Since the
+candidate set grows with every address the mesh has ever mentioned, and an unreachable address costs
+a full connect timeout, unbounded dialling let the *number of addresses this node knows of* set its
+heartbeat period — and a node whose heartbeat exceeds the liveness timeout is declared dead by
+everyone, which the topic member reaper then converts into tombstones for its live members' names.
+Each address that fails backs off exponentially, and the candidate list is walked round-robin so a
+permanently dead address cannot starve a live peer behind it.
+
+**`NodeId`s must be unique; nothing negotiates them, and a duplicate is detected rather than
+prevented.** A node generates 64 random bits from `/dev/urandom` on first start and keeps them in
+`<data_dir>/.node_id`; `XCHANNELD_NODE_ID` overrides. There is no default, because a default is a
+duplicate: two unconfigured daemons would share it silently. Uniqueness cannot be *guaranteed*
+without a coordinator, and §2.1 rules out both a central registry and consensus at join — so the
+design pays for detection instead. Across 100 nodes the chance any two random ids collide is
+~3 × 10⁻¹⁶; the realistic source of duplicates is copying (a restored backup, a golden image
+snapshotted after first start), which produces them with certainty and which no amount of entropy
+addresses.
+
+Detection is exact, not heuristic, and takes two forms. Two links reporting one id at two advertised
+control addresses is two machines, since a machine advertises one control address; that case keeps
+**both** links, because collapsing them would drop connectivity to a real peer in order to tidy away
+a misconfiguration. The case that matters more is the one where the duplicated id is *ours*, which
+has only a single link and so nothing to compare: a heartbeat that claims our id from an address that
+is not ours is a twin, and the same heartbeat carrying *our own* advertised address is merely a link
+we opened to ourselves — which a seed list naming every node produces routinely and which must never
+be mistaken for a duplicate.
+
+A node that finds its own *generated* id duplicated and owns no channels discards it and stops with a
+non-zero status, so a supervisor's restart takes a fresh one. Both clones may do that at once; that is
+harmless, because neither owned anything. Past the point where a node owns a channel, changing its id
+would leave those channels registered to an owner that never returns, so from there this can only
+warn.
+
+A duplicate makes two nodes indistinguishable in the membership map (their addresses overwrite each
+other), in channel ownership (`ChannelIdentity.owner`, and the `registered_at_nanos`/`NodeId`
+collision tiebreak), and in link deduplication. For that reason a node never records *itself* in its
+own membership map, from a heartbeat or a hint: doing so overwrote its own entry with a twin's
+addresses, and since the dial candidates exclude this node's own id, the twin was then permanently
+excluded from them — the two could never meet again, and the duplicate became unresolvable in
+principle.
 
 ### Name collisions
 

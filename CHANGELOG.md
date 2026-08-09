@@ -4,27 +4,126 @@ All notable changes to xchannel-net are documented here. Versioning is pre-1.0 a
 experimental: the wire protocol and on-disk layout may change without notice (see
 `SECURITY.md`).
 
-## Unreleased
+## 0.3.0 (2026-08-09)
+
+**A node now joins a mesh without being told how.** It generates its own identity on first start,
+learns its peers from the ones it already has, and closes any connected seed graph into the full mesh
+the rest of the design assumes. Configuration went from "give every node an id and a peer list" to
+"name one seed" — and, on a single host, to nothing at all.
+
+Alongside that: a per-user data directory instead of `/tmp`, graceful shutdown, and the correctness
+work a pre-release review turned up — a leaked link that could silently wedge a node, convergence that
+only worked in one direction, a link tie-break the two ends computed differently, and a dial loop that
+could get a healthy node declared dead by everyone.
+
+**Breaking:** the control-plane wire format and the default data directory both change. Stop every
+node before starting any new one; see *Upgrading from 0.2.x* in the README.
 
 ### Added
-- **Graceful shutdown on `SIGTERM`/`SIGINT`.** The daemon exits of its own accord, tells its peers it
-  is leaving (a new `ControlMsg::Leaving`) so they mark it not-live immediately instead of waiting
-  out the ten-second liveness timeout, and removes its client socket. Hand-rolled against `signal(2)`
-  rather than adding a `libc` dependency, and covered end to end by a test that sends a real
-  `SIGTERM` and requires a successful exit — "did the signal reach a handler" is not something a
-  unit test on the flag can answer.
+- **The mesh forms itself** (`doc/DESIGN.md` §2.2). Peers used to be exactly what you configured: a
+  node dialled its `XCHANNELD_SEEDS`, accepted whoever dialled it, and that was the whole membership.
+  Nothing was relayed — a heartbeat updated local membership and stopped there, a registry delta
+  merged from a peer was never forwarded — so on any topology short of a full mesh, a change reached
+  the originator's neighbours and no further, and a node two hops away was invisible.
 
-  Explicitly **courtesy, not safety**: it exists for promptness and has nothing to unwind. A hard
-  kill was already safe and remains so. That property is now stated in the READMEs, where it belongs
-  — it is unusual enough to be worth advertising: the daemon is never in a writer's path, committed
-  records are durable in their mmap, merge cursors and resume positions are recomputed from the logs
-  rather than saved, and a restart reconstructs rather than restores. The cross-process tests
-  `SIGKILL` a running daemon and assert contiguous resume.
+  Two mechanisms, separate and neither implying the other:
+  - **Gossiped control addresses.** `Heartbeat` now carries the sender's control address as well as
+    its stream address, and knowledge about a third node travels as a new `PeerHint`. A node dials
+    peers it learns about, so any *connected* seed graph — a chain, a star, one well-known node —
+    closes into a full mesh.
+  - **Relay on change.** A node that merges an inbound identity and finds its map actually changed
+    forwards the winner to its other peers. Relaying only on a *change* is what terminates the flood:
+    the registry merge is a total order and idempotent, so a given winning state can move a given
+    node's map at most once, whatever cycles the topology has. The relay skips the link it arrived on.
+
+  **Hearsay teaches addresses, never liveness** — a `PeerHint` is deliberately not a forwarded
+  heartbeat. Membership liveness means *this* node's ability to reach another, and `resolve`,
+  `force_deregister`'s reclaim guard, the topic member reaper and discovery's `owner_live` all depend
+  on that reading. A node that looked reachable because a third party vouched for it would weaken
+  exactly the guard that stops a partition retiring a channel whose owner is alive and writing.
+
+  **Both ends of a pair dial**, and the duplicate link is collapsed afterwards by `dedup_links`.
+  Electing one dialler in advance — the lower `NodeId` — was the first shape of this and it is wrong:
+  the election happens before anyone knows whether the elected node can *reach* the other, so under
+  asymmetric reachability (a firewall, a NAT) it hands the job to the node that cannot dial and the
+  pair never links, though the other direction would have worked first time.
+
+  Honest about what each half buys: with the mesh closing, **relay is not what makes a chain
+  converge** — the new link delivers the registry as join-time anti-entropy anyway. Relay covers the
+  window before the mesh closes, and any pair that never manages to link. The tests say so rather than
+  implying otherwise.
+
+- **A node generates its own identity; no configuration needed to join.** `XCHANNELD_NODE_ID` used to
+  default to `1`, so two unconfigured daemons silently shared an identity — and everything is keyed on
+  it: channel ownership, the collision tiebreak, membership, and now peer links. There is no default
+  any more. A node generates 64 random bits from `/dev/urandom` on first start and keeps them in
+  `<data_dir>/.node_id` (dot-prefixed, so no channel name can collide), alongside the time it was
+  created. `XCHANNELD_NODE_ID` still overrides, for deployments that need deterministic ids.
+
+  This is the durable state `DESIGN.md` §5 already sanctions — "the only durable node-owned state is
+  stable `NodeId` + config" — and the id belongs with the data directory because that is what defines
+  the node: the channels it owns live there.
+
+  **Uniqueness is probabilistic, backed by exact detection.** It cannot be guaranteed without a
+  coordinator, and the design rules out both a central registry and consensus at join. Across 100
+  nodes the chance any two random ids collide is ~3 × 10⁻¹⁶ — far below the chance of undetected
+  corruption in the data being replicated. Deliberately **not** a timestamp: a nanosecond clock
+  reading's entropy is only the spread of start times, so it fails hardest in the case that matters
+  (a fleet provisioned together, sharing a clocksource), it inherits the clock's ability to move
+  backwards, and the ordering it would buy is worth nothing — `NodeId` order breaks a name collision
+  only when two `registered_at_nanos` are *exactly* equal.
+
+- **Two machines claiming one `NodeId` are detected exactly, in both of the shapes that happen.** Two
+  links reporting one id at two advertised control addresses is provably two machines, since a machine
+  advertises one control address; `dedup_links` previously *collapsed* that case, dropping connectivity
+  to a real peer in order to tidy away a misconfiguration, and now reports it and keeps both links.
+  The other shape is the one that matters more and had no detection at all: when the duplicated id is
+  **ours**, there is only a single link and so nothing to compare. A heartbeat claiming our id from an
+  address that is not ours is a twin; the same heartbeat carrying *our own* advertised address is
+  merely a link we opened to ourselves, which a seed list naming every node produces routinely and
+  which must not be mistaken for a duplicate.
+
+  A node that finds its own **generated** id duplicated and owns no channels discards it and stops
+  with status `3`, so a supervisor's restart takes a fresh one — the whole point being that deleting
+  the file while carrying on would leave the duplicate live and change nothing but the file. That
+  rescues the likely copying accident, a golden image snapshotted after first start. Both clones may
+  stand down at once; that is harmless, because neither owned anything. Once a node owns a channel,
+  changing its id would orphan it, so past that point this can only warn — and it warns **once per
+  id**, not once per maintenance tick.
+
+- **A cosmetic node name and creation time**, gossiped with the heartbeat and stored in membership.
+  `XCHANNELD_NODE_NAME`, defaulting to the hostname. Never a key, never a tie-break — a duplicate name
+  is confusing, not incorrect. It exists because an auto-generated id is unreadable, so without it
+  automatic identity would be a downgrade for whoever operates this: `owner of 'fills.prod.mm' (node
+  14523907234)` becomes `(node fra-mm-01)`.
+
+- **A warning when a data directory holds channels but no `.node_id`.** Removing the id file while
+  keeping the data is not the same as a fresh node: the channels are re-registered under a new owner
+  with a later timestamp, peers keep the earlier registration, and those channels end up owned by an
+  id that never returns — frozen until an operator reclaims the names.
+
+- **Graceful shutdown on `SIGTERM`/`SIGINT`.** The daemon exits of its own accord, tells its peers it
+  is leaving (a new `ControlMsg::Leaving`) so they mark it not-live immediately instead of waiting out
+  the ten-second liveness timeout, and removes its client socket. Hand-rolled against `signal(2)`
+  rather than adding a `libc` dependency, and covered end to end by a test that sends a real `SIGTERM`
+  and requires a successful exit — "did the signal reach a handler" is not something a unit test on the
+  flag can answer.
+
+  Explicitly **courtesy, not safety**: it exists for promptness and has nothing to unwind. A hard kill
+  was already safe and remains so. That property is now stated in the READMEs, where it belongs — it
+  is unusual enough to be worth advertising: the daemon is never in a writer's path, committed records
+  are durable in their mmap, merge cursors and resume positions are recomputed from the logs rather
+  than saved, and a restart reconstructs rather than restores. The cross-process tests `SIGKILL` a
+  running daemon and assert contiguous resume.
+
+  A **second** signal restores the default disposition and kills the process outright. Without that
+  escape hatch a daemon wedged anywhere in its shutdown path would swallow every further signal and
+  could only be ended with `SIGKILL`.
 
 ### Changed
-- **The default data directory is now `$HOME/.xchannel-net`, not `/tmp/xchanneld`** (breaking, for
-  the daemon *and* the client). The old default was wrong in ways that got worse as durability work
-  landed:
+- **The default data directory is now `$HOME/.xchannel-net`, not `/tmp/xchanneld`** (breaking, for the
+  daemon *and* the client). Nothing is migrated and the old location is not read; see the README's
+  upgrade note. The old default was wrong in ways that got worse as durability work landed:
   - `/tmp` is `tmpfs` on most systems, so channels — memory-mapped *files* — were held in RAM. That
     silently contradicts the durability the design rests on: a power cut lost everything, and channel
     bytes counted against memory.
@@ -37,9 +136,10 @@ experimental: the wire protocol and on-disk layout may change without notice (se
     possibility instead of surviving it.
   - Two users on one machine collided, and the data-dir lock meant the second daemon just exited.
 
-  There is **no fallback** when `HOME` is unset — it is an error naming `XCHANNELD_DATA_DIR`. A
-  silent second choice is how data ends up somewhere nobody looks, and a service without `HOME` is
-  exactly the deployment that should say where its data goes.
+  There is **no fallback** when `HOME` is unset — it is an error naming `XCHANNELD_DATA_DIR`. A silent
+  second choice is how data ends up somewhere nobody looks, and a service without `HOME` is exactly the
+  deployment that should say where its data goes. A *network* home directory needs it set too: channels
+  are memory-mapped, and mmap coherence over NFS or SMB is not something this relies on.
 
   The default now lives in `xchannel_net_core::paths`, shared by both sides, because
   `Client::connect_or_spawn` finds the implicit daemon by that path: if the two computed it
@@ -50,104 +150,91 @@ experimental: the wire protocol and on-disk layout may change without notice (se
   Running several nodes on one host still means giving each its own `XCHANNELD_DATA_DIR`; the default
   is deliberately one flat per-user directory, since one daemon per user is the case that should need
   no configuration at all.
-- **Wire (breaking):** `ControlMsg::Heartbeat` gains `control_addr`, and `ControlMsg::PeerHint` is
-  new. A 0.2.x daemon and a newer one cannot share a control plane.
-- `Dissemination::pump` returns each identity with the peer link it arrived on, and gains
-  `relay`, so an implementation can forward without echoing the source.
+- **Wire (breaking):** `ControlMsg::Heartbeat` gains `control_addr`; `ControlMsg::PeerHint` and
+  `ControlMsg::Leaving` are new. A 0.2.x daemon and a newer one cannot share a control plane, and the
+  failure is not graceful — an unrecognised frame drops the link, so the two versions reconnect and
+  drop each other continuously.
+- `Dissemination::pump` returns each identity with the peer link it arrived on, and gains `relay` (to
+  forward without echoing the source) and `reply` (to correct the source).
+- **A `Leaving` notice is only accepted for the peer on its own link.** Accepting a third party's id
+  would let one node mark another not-live; under a duplicate id it meant a departing twin silenced its
+  still-serving sibling.
+- The startup line no longer reports `created 0` for a configured id. A configured id is config, not
+  state — nothing is persisted, so there is no creation time to report.
+- The daemon warns when a plane is bound to a wildcard address, because it advertises what it bound:
+  peers gossip `0.0.0.0:7001` onwards and none of them can dial it back, and duplicate-id detection —
+  which separates a twin from a self-link by comparing advertised control addresses — is weakened,
+  since two wildcard-bound machines advertise the *same* address.
 
 ### Fixed
+Everything from here down was found by a pre-release review of the four changes above.
+
+- **A dropped peer link leaked its fd, its thread and its send half — and could silently wedge the
+  node.** The reader owns a `try_clone` dup of the socket, so when its loop exited, dropping it left
+  the connection `ESTABLISHED` and *our* send half writable. Nothing prunes the peer list except a
+  failed send, and `dedup_links` deliberately keeps a link whose identity it does not know — which the
+  exit had just erased. The result was a zombie peer that leaked an fd and a thread on every
+  reconnection attempt, eventually wedged `emit_heartbeat` inside `write_all` while holding the
+  dissemination lock (stalling the whole node with no error anywhere), and shared an initiator with its
+  own replacement, so the far end's tie-break kept the zombie and killed every fresh link. The reader
+  now shuts the socket down on exit, and a failed send shuts down before dropping.
+- **Convergence only worked in one direction.** A peer that sent a registry state which *lost* the
+  merge learned nothing from the recipient's silence, and join-time anti-entropy only runs when a link
+  is *established* — so on a link that stayed up, the two disagreed about that channel indefinitely:
+  the sender resolved the wrong owner, and after a reclaim it kept serving a replica of an incarnation
+  the mesh had retired. The winner now goes back to the sender. It terminates for the same reason the
+  relay does, plus one step: a reply is sent only when the arriving state differs from the winner, so
+  the reply cannot provoke another.
+- **The link tie-break was not one.** Two links with the same initiator — which two dial addresses for
+  one peer produce — were resolved on a *per-process* link counter, so the two ends numbered the same
+  pair of links differently, each kept the one the other dropped, and the peers were left with **no**
+  link at all; then they re-dialled and did it again, every tick. Ties now break on the link's two
+  endpoint addresses, ordered, which both ends compute identically because one end's `(local, peer)` is
+  the other's `(peer, local)`.
+- **A seed named under an alias churned at the maintenance cadence.** A peer's advertised control
+  address and the address we happened to dial it on need not be the same, so membership alone could not
+  answer "is the node at this dial address already linked?" — the link was dialled, deduplicated, and
+  re-dialled forever. The identity found at a dial address is now remembered.
+- **Dialling could get a healthy node declared dead by everyone.** The maintenance loop is also the
+  heartbeat loop, and it dialled *before* emitting a heartbeat, serially, with a one-second timeout per
+  unreachable address and no cap — so the number of addresses the mesh had ever mentioned set this
+  node's heartbeat period. Twelve unreachable addresses were enough to flip a live, actively-writing
+  owner to `owner_live = false` on its peers; because the topic member reaper keys on the same
+  predicate, it then began tombstoning that node's live members' names. The heartbeat now goes first,
+  at most two addresses are dialled per tick, each failure backs off exponentially, and the candidate
+  list is walked round-robin so a permanently dead address cannot starve a live peer behind it.
+- **Startup served nothing for as long as its seed list took to dial.** `connect_seeds` ran before any
+  plane thread was spawned — measured at 25 s against 25 blackholed seeds, with the listeners already
+  bound, so a peer's TCP connect succeeded and then waited: the node looked ready and answered nothing.
+  The planes now start first and the maintenance loop does the dialling.
+- **The reclaim guard vouched for silence it had never observed.** `force_deregister` fell back to this
+  node's own *uptime* when it had never heard from the owner directly — which relay and `PeerHint` have
+  made the ordinary case, since a registry entry now routinely arrives second-hand for a node we hold no
+  link to. Every daemon older than `reclaim_after` therefore satisfied the floor unconditionally, so an
+  owner that was alive and writing but merely unreachable from here could have its channel tombstoned —
+  precisely what the guard exists to refuse. It now measures how long the owner has been unreachable
+  **from this node**: silence since the last direct contact, or, failing that, how long this node has
+  known of the owner and failed to reach it, a clock reset the instant contact is made. Membership keeps
+  a departure instant so that a peer which said goodbye stays distinguishable from one never met —
+  otherwise the fix would have made a graceful departure unreclaimable.
+- **A node recorded *itself* in its own membership map** whenever a twin's heartbeat or a hint about
+  itself arrived, overwriting its own entry with the twin's addresses. Since the dial candidates exclude
+  this node's own id, the twin was then permanently excluded from them: the two could never meet again,
+  and the duplicate became unresolvable in principle.
+- **The membership lock was held across every blocking send.** A guard temporary in a `for` head lives
+  to the end of the loop, so introducing a new peer to the directory held the lock while writing to it.
+  One peer that stopped reading stalled every reader thread waiting on that lock.
+- **Join-time anti-entropy could be incomplete.** The registry snapshot was taken *before* the
+  dissemination lock, so a local registration in between broadcast its delta to the peers that existed
+  at that moment — not the one being adopted — and then handed the new peer a snapshot from before the
+  change. The delta was lost to it until some later reconnect. The snapshot is now taken under the lock.
+- `signal(2)` is declared with its real signature (`Option<extern "C" fn(i32)>`) rather than a `usize`
+  the compiler could not check, and `SIG_DFL` needs no magic constant.
 - **`XCHANNELD_CLIENT_PATH` outside the data dir killed startup.** Binding the client plane chmod'ed
   the socket's *parent* directory to `0700`, so pointing it at a shared directory — `/tmp/x.sock` —
   tried to chmod `/tmp`, failed with `EPERM`, and took the daemon down. Only a directory the daemon
-  creates is restricted now; the data dir is still tightened explicitly at startup and every
-  directory holding channel bytes is created by that path, so nothing loses protection. Found by the
-  SIGTERM test above.
-
-- **A node generates its own identity; no configuration needed to join.** `XCHANNELD_NODE_ID` used
-  to default to `1`, so two unconfigured daemons silently shared an identity — and everything is
-  keyed on it: channel ownership, the collision tiebreak, membership, and now peer links. There is
-  no default any more. A node generates 64 random bits from `/dev/urandom` on first start and keeps
-  them in `<data_dir>/.node_id` (dot-prefixed, so no channel name can collide), alongside the time
-  it was created. `XCHANNELD_NODE_ID` still overrides, for deployments that need deterministic ids.
-
-  This is the durable state `DESIGN.md` §5 already sanctions — "the only durable node-owned state is
-  stable `NodeId` + config" — and the id belongs with the data directory because that is what
-  defines the node: the channels it owns live there.
-
-  **Uniqueness is probabilistic, backed by exact detection.** It cannot be guaranteed without a
-  coordinator, and the design rules out both a central registry and consensus at join. Across 100
-  nodes the chance any two random ids collide is ~3 × 10⁻¹⁶ — far below the chance of undetected
-  corruption in the data being replicated. Deliberately **not** a timestamp: a nanosecond clock
-  reading's entropy is only the spread of start times, so it fails hardest in the case that matters
-  (a fleet provisioned together, sharing a clocksource), it inherits the clock's ability to move
-  backwards, and the ordering it would buy is worth nothing — `NodeId` order breaks a name collision
-  only when two `registered_at_nanos` are *exactly* equal.
-
-- **Two machines claiming one `NodeId` are now detected exactly, and both links are kept.** The
-  advertised control address makes it provable rather than heuristic: one machine advertises one
-  control address, so two under one id means two machines. `dedup_links` previously collapsed them
-  — dropping connectivity to a real peer in order to tidy away a misconfiguration. It now reports
-  them and leaves both links alone. If the reporting node's own id was *generated* and it owns
-  nothing yet, it discards the id so the next start takes a fresh one; that rescues the likely
-  copying accident, a golden image snapshotted after first start, where every clone shares an id and
-  owns nothing. Once a node owns a channel, changing its id would orphan it, so past that point this
-  can only warn.
-
-- **A cosmetic node name and creation time**, gossiped with the heartbeat and stored in membership.
-  `XCHANNELD_NODE_NAME`, defaulting to the hostname. Never a key, never a tie-break — a duplicate
-  name is confusing, not incorrect. It exists because an auto-generated id is unreadable, so without
-  it automatic identity would be a downgrade for whoever operates this: `owner of 'fills.prod.mm'
-  (node 14523907234)` becomes `(node fra-mm-01)`.
-
-- **A warning when a data directory holds channels but no `.node_id`.** Removing the id file while
-  keeping the data is not the same as a fresh node: the channels are re-registered under a new owner
-  with a later timestamp, peers keep the earlier registration, and those channels end up owned by an
-  id that never returns — frozen until an operator reclaims the names.
-- **The mesh forms itself.** Peers were previously exactly what you configured: a node dialled its
-  `XCHANNELD_SEEDS` and accepted whoever dialled it, and that was the whole membership. Nothing was
-  relayed — a heartbeat updated local membership and stopped there, and a registry delta merged
-  from a peer was never forwarded — so on any topology short of a full mesh, a change reached the
-  originator's neighbours and no further, and a node two hops away was invisible.
-
-  Two mechanisms, separate and neither implying the other (`doc/DESIGN.md` §2.2):
-  - **Gossiped control addresses.** `Heartbeat` now carries the sender's control address as well as
-    its stream address, and knowledge about a third node travels as a new `PeerHint`. A node dials
-    peers it learns about, so any *connected* seed graph — a chain, a star, one well-known node —
-    closes into the full mesh the rest of the design assumes. Only the lower `NodeId` of a pair
-    dials, so a pair forms one link rather than two; configured seeds are exempt, being explicit
-    operator intent.
-  - **Relay on change.** A node that merges an inbound identity and finds its map actually changed
-    forwards the winner to its other peers. Relaying only on a *change* is what terminates the
-    flood: the registry merge is a total order and idempotent, so a given winning state can move a
-    given node's map at most once, whatever cycles the topology has. The relay skips the link it
-    came in on.
-
-  **Hearsay teaches addresses, never liveness** — a `PeerHint` is deliberately not a forwarded
-  heartbeat. Membership liveness means *this* node's ability to reach another, and `resolve`,
-  `force_deregister`'s reclaim guard, the topic member reaper and discovery's `owner_live` all
-  depend on that reading. A node that looked reachable because a third party vouched for it would
-  weaken exactly the guard that stops a partition retiring a channel whose owner is alive and
-  writing. Liveness follows from dialling the node and hearing from it directly.
-
-  **Both ends of a pair dial**, and the duplicate link is collapsed afterwards by `dedup_links`.
-  Electing one dialler in advance — the lower `NodeId` — was the first shape of this and it is
-  wrong: the election happens before anyone knows whether the elected node can *reach* the other,
-  so under asymmetric reachability (a firewall, a NAT) it hands the job to the node that cannot
-  dial and the pair never links, though the other direction would have worked first time. The
-  duplicate is resolved by a rule both ends compute identically — keep the link whose initiator has
-  the lower `NodeId` — since resolving it differently would leave them with no link at all. Dialling
-  is gated on node *identity*, not dial address: an inbound link has no dial address, so
-  address-based tracking alone would call its peer unconnected and dial it again.
-
-  A node now **warns once if a peer claims its own `NodeId`**. Nothing assigns or enforces them
-  (`XCHANNELD_NODE_ID` defaults to `1`), and a duplicate makes two nodes indistinguishable in
-  membership, in channel ownership, and now in link dedup — where it would drop the link between
-  two genuinely distinct peers.
-
-  Honest about what each half buys: with the mesh closing, **relay is not what makes a chain
-  converge** — the new link delivers the registry as join-time anti-entropy anyway. Relay covers
-  the window before the mesh closes and any pair that never manages to link. The tests say so
-  rather than implying otherwise.
+  creates is restricted now; the data dir is still tightened explicitly at startup and every directory
+  holding channel bytes is created by that path, so nothing loses protection. Found by the SIGTERM test.
 
 ## 0.2.1 (2026-08-09)
 

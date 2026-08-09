@@ -172,16 +172,17 @@ fn main() -> std::io::Result<()> {
     let stream_listener = node.bind_stream()?;
     let control_listener = node.bind_control()?;
     let client_listener = node.bind_client()?;
+    // A configured id is config, not state: nothing is persisted, so there is no creation time to
+    // report and printing the `0` that stands in for one only invites the question.
     eprintln!(
-        "xchanneld[{}]: node {} ({}), created {}",
+        "xchanneld[{}]: node {} ({})",
         node_id,
         identity.name,
         if identity.generated {
-            "generated"
+            format!("generated, created at {} ms", identity.created_at_ms)
         } else {
-            "configured"
+            "configured via XCHANNELD_NODE_ID".to_string()
         },
-        identity.created_at_ms,
     );
     eprintln!(
         "xchanneld[{}]: stream {} | control {} | client {}",

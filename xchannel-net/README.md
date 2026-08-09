@@ -20,8 +20,9 @@ Configuration is environment only:
 
 | Variable | Default | |
 |---|---|---|
-| `XCHANNELD_NODE_ID` | `1` | Stable identity. Must be unique in the mesh. |
-| `XCHANNELD_DATA_DIR` | `$HOME/.xchannel-net` | Channel files, replicas, the node's identity, and the client socket. One daemon per directory, enforced by a lock. |
+| `XCHANNELD_NODE_ID` | generated on first start | Stable identity, 64 random bits kept in `<data_dir>/.node_id`. Set it only for deployments that need deterministic ids; a *configured* id is never discarded automatically, so resolving a duplicate is then yours to do. |
+| `XCHANNELD_NODE_NAME` | this host's name | Human-readable label, gossiped for display in logs, errors and listings. Cosmetic — never a key, never a tie-break, so a duplicate is confusing rather than incorrect. |
+| `XCHANNELD_DATA_DIR` | `$HOME/.xchannel-net` | Channel files, replicas, the node's identity, and the client socket. One daemon per directory, enforced by a lock. Must be a **local** filesystem: channels are memory-mapped, and mmap coherence over NFS or SMB is not something this relies on. A network home directory therefore needs this set explicitly. |
 | `XCHANNELD_STREAM_ADDR` | `127.0.0.1:7000` | Data plane. |
 | `XCHANNELD_CONTROL_ADDR` | `127.0.0.1:7001` | Registry gossip and heartbeats. |
 | `XCHANNELD_SEEDS` | — | Comma-separated peer control addresses to form the mesh. |
@@ -33,6 +34,15 @@ Configuration is environment only:
 One daemon per data directory, enforced by an exclusive lock — a second exits immediately. To run
 more than one node on a host, give each its own `XCHANNELD_DATA_DIR`; the default is deliberately a
 single per-user directory, because one daemon per user is the case that should need no configuration.
+
+Bind addresses are **advertised as configured**, so a wildcard (`0.0.0.0`) is a poor choice for
+anything but a single-host test: peers gossip it onwards and none of them can dial it back. The daemon
+warns at startup when it sees one.
+
+Exit statuses: `0` on a clean shutdown, `1` when another daemon holds the data directory, and `3` when
+the daemon stopped **to be restarted** — it found another node using its generated id, owned nothing,
+and discarded the id so that a supervisor's restart picks a fresh one. A supervisor that restarts on
+non-zero handles that case by itself; one that does not will need a manual start.
 
 ## How it behaves
 
