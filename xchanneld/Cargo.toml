@@ -1,0 +1,28 @@
+[package]
+name = "xchanneld"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+authors.workspace = true
+description = "The xchannel-net node-manager daemon: registry, discovery, and TCP log replication."
+
+[[bin]]
+name = "xchanneld"
+path = "src/main.rs"
+
+[dependencies]
+xchannel-net = { path = "../xchannel-net", version = "0.3.0" }
+xchannel-net-core.workspace = true
+# The **only** dependency in this workspace beyond `xchannel` itself, and it lives here rather than in
+# a library on purpose: this crate exists so that a program's argument parser cannot reach anyone who
+# links the node manager as a library. A feature flag would have been the smaller change and a weaker
+# guarantee — with a separate crate, `xchannel-net`'s dependency list makes the promise instead of a
+# convention doing it. `env` is not optional: every existing deployment configures by environment
+# (systemd, docker, Kubernetes, and the client's own auto-spawn), and those must keep working.
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+xchannel-net-client = { path = "../xchannel-net-client" }
+xchannel.workspace = true

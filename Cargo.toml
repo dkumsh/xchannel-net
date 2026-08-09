@@ -4,6 +4,7 @@ members = [
     "xchannel-net-core",
     "xchannel-net",
     "xchannel-net-client",
+    "xchanneld",
 ]
 
 [workspace.package]

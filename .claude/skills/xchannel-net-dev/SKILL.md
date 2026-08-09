@@ -100,7 +100,10 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   └── stream.rs             Stream-plane protocol over a Transport (generic): origin
 │   │                         accept_subscription→StreamServer; subscriber subscribe→
 │   │                         StreamClient. Drives the engines; tested over loopback TCP.
-├── xchannel-net/             the node-manager daemon — lib + bin `xchanneld`
+├── xchanneld/               the daemon: `main.rs` (clap args, the only clap in the workspace) +
+│                             tests/cross_process.rs (spawns the real binary). Split out so a program's
+│                             argument parser is not a dependency of the library.
+├── xchannel-net/             the node manager as a library
 │   ├── node.rs               Node: host_channel (register+announce), serve_stream,
 │   │                         control plane (serve_control/connect_control_peer/
 │   │                         run_maintenance over BroadcastDissemination+Registry), and

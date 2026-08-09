@@ -20,6 +20,28 @@ could get a healthy node declared dead by everyone.
 node before starting any new one; see *Upgrading from 0.2.x* in the README.
 
 ### Added
+- **The daemon is its own crate, `xchanneld`, and every option is now a flag as well as an environment
+  variable.** `cargo install xchanneld` replaces `cargo install xchannel-net`; the binary's name, its
+  behaviour and every `XCHANNELD_*` variable are unchanged.
+
+  The split exists to isolate a dependency rather than to reorganise anything: a program needs an argument
+  parser, and `clap` in the crate that also contains the library would reach everyone embedding the node
+  manager. A feature flag would have been the smaller change and a weaker guarantee — with a separate crate,
+  `xchannel-net`'s dependency list makes the promise instead of a convention doing it. `xchannel-net`,
+  `xchannel-net-core` and `xchannel-net-client` still depend on nothing but `xchannel`.
+
+  Flags exist because a setting discoverable only from a README is not discoverable, and `--help` is now the
+  answer. Environment variables remain first-class because that is how a daemon is actually configured —
+  systemd, docker, Kubernetes, and `Client::connect_or_spawn`, which starts this binary with an inherited
+  environment and no argv at all. The cross-process tests moved with the binary and are the proof: ten tests
+  that spawn the real daemon and drive it through the client, all still green — and they caught the one
+  regression the conversion introduced, an empty `XCHANNELD_SEEDS=""` (what a script produces when its seed
+  list is empty) becoming a parse error instead of "no seeds".
+
+  One thing a parser cannot fix: a misspelled *flag* is an error, but a misspelled *variable* is simply
+  absent, and the daemon would start with a default while an operator believed otherwise. It now warns at
+  startup about any `XCHANNELD_*` it does not recognise.
+
 - **The mesh forms itself** (`doc/DESIGN.md` §2.2). Peers used to be exactly what you configured: a
   node dialled its `XCHANNELD_SEEDS`, accepted whoever dialled it, and that was the whole membership.
   Nothing was relayed — a heartbeat updated local membership and stopped there, a registry delta

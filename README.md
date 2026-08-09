@@ -81,7 +81,18 @@ timeout. It exists for promptness, not for safety — there is nothing it has to
 What a hard kill *does* cost is time. Peers take up to ten seconds to notice, and a subscriber
 re-sends whatever was in flight. Prefer `SIGTERM`; reach for `SIGKILL` without anxiety.
 
+## Installing
+
+```sh
+cargo install xchanneld
+xchanneld --help
+```
+
 ## Upgrading from 0.2.x
+
+The daemon is now installed with `cargo install xchanneld` rather than `cargo install xchannel-net` —
+it moved into a crate of its own so that `clap` is not a dependency of the library. The binary, its
+name and every environment variable are unchanged, and each option now also has a flag.
 
 The default data directory moved from `/tmp/xchanneld` to `$HOME/.xchannel-net`, and **nothing is
 migrated**: a 0.3 daemon does not read the old location, and a 0.2 data directory would be refused
@@ -94,8 +105,13 @@ if you want the old behaviour back, and expect the same consequences.
 | Crate | Role |
 |---|---|
 | [`xchannel-net-core`](xchannel-net-core) | Transport-agnostic engine: identity, wire frames, transport trait, replication, and the topic multiplexer. |
-| [`xchannel-net`](xchannel-net) | Node-manager daemon (binary `xchanneld`): CRDT registry, decentralized discovery, TCP replication, duty cycle. |
+| [`xchannel-net`](xchannel-net) | The node manager as a library: CRDT registry, decentralized discovery, TCP replication, duty cycle. |
 | [`xchannel-net-client`](xchannel-net-client) | Thin client library for talking to the local node manager. |
+| [`xchanneld`](xchanneld) | The daemon: `main`, argument parsing, and the cross-process tests. |
+
+The daemon is a crate of its own so that its argument parser is not a dependency of anything that
+embeds the manager. `xchannel-net`, `xchannel-net-core` and `xchannel-net-client` depend on nothing
+but `xchannel`; `clap` lives in `xchanneld` alone.
 
 ## Development
 

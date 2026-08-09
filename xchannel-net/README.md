@@ -1,52 +1,23 @@
 # xchannel-net
 
-The node-manager daemon for [xchannel-net](https://github.com/dkumsh/xchannel-net) — binary
-`xchanneld`, plus the library it is assembled from. One runs per machine. It owns the
+The node manager for [xchannel-net](https://github.com/dkumsh/xchannel-net), as a library. It owns the
 decentralized registry, discovers channels across the mesh, and replicates single-writer
 [xchannel](https://github.com/dkumsh/xchannel) logs between nodes.
 
-Applications do not link this. They use
-[`xchannel-net-client`](https://crates.io/crates/xchannel-net-client) to talk to their local daemon,
-then read and write purely local memory-mapped logs.
+## Using it
 
-## Running it
-
-```sh
-cargo install xchannel-net    # installs `xchanneld`
-xchanneld
+```toml
+[dependencies]
+xchannel-net = "0.3"
 ```
 
-Configuration is environment only:
+The daemon that runs this is [`xchanneld`](https://crates.io/crates/xchanneld) — a separate crate, so
+that its argument parser is not a dependency of yours. This crate's only dependency is `xchannel`.
 
-| Variable | Default | |
-|---|---|---|
-| `XCHANNELD_NODE_ID` | generated on first start | Stable identity, 64 random bits kept in `<data_dir>/.node_id`. Set it only for deployments that need deterministic ids; a *configured* id is never discarded automatically, so resolving a duplicate is then yours to do. |
-| `XCHANNELD_NODE_NAME` | this host's name | Human-readable label, gossiped for display in logs, errors and listings. Cosmetic — never a key, never a tie-break, so a duplicate is confusing rather than incorrect. |
-| `XCHANNELD_DATA_DIR` | `$HOME/.xchannel-net` | Channel files, replicas, the node's identity, and the client socket. One daemon per directory, enforced by a lock. Must be a **local** filesystem: channels are memory-mapped, and mmap coherence over NFS or SMB is not something this relies on. A network home directory therefore needs this set explicitly. |
-| `XCHANNELD_STREAM_ADDR` | `127.0.0.1:7000` | Data plane — the address to **bind**. |
-| `XCHANNELD_CONTROL_ADDR` | `127.0.0.1:7001` | Registry gossip and heartbeats — the address to **bind**. |
-| `XCHANNELD_ADVERTISE_STREAM_ADDR` | the bound address | What to tell peers, when it must differ from what was bound. |
-| `XCHANNELD_ADVERTISE_CONTROL_ADDR` | the bound address | Same, for the control plane. Required in practice when binding a wildcard: peers gossip whatever is advertised, and `0.0.0.0` is not something any of them can dial. **Must be this instance's own address** — it is what duplicate-`NodeId` detection compares, so two nodes advertising one value (a shared env file, or a Service address used in place of a pod address) are as indistinguishable as two advertising a wildcard, and a cloned image will never stand down. A wildcard *advertised* value warns at startup; a shared routable one **cannot** be detected at all, by construction, because identical advertised addresses are indistinguishable from a link to oneself. |
-| `XCHANNELD_SEEDS` | — | Comma-separated peer control addresses to form the mesh. |
-| `XCHANNELD_CLIENT_PATH` | `<data_dir>/client.sock` | Local client plane. Must match what clients look for, so change both or neither. |
-| `XCHANNELD_RECLAIM_AFTER_MS` | `300000` | How long an owner must be unreachable before an operator may reclaim its name. |
-| `XCHANNELD_PROMOTED_TOPICS` | — | Topics given a merge thread of their own instead of the shared duty cycle. |
-| `XCHANNELD_MUX_MAX_PARK_US` | `5000` | Cap on how long an idle duty cycle parks; `0` never parks. |
-
-One daemon per data directory, enforced by an exclusive lock — a second exits immediately. To run
-more than one node on a host, give each its own `XCHANNELD_DATA_DIR`; the default is deliberately a
-single per-user directory, because one daemon per user is the case that should need no configuration.
-
-A bind address is **advertised as configured** unless an advertise address is given, so a container
-binding `0.0.0.0` should set `XCHANNELD_ADVERTISE_CONTROL_ADDR` (and the stream counterpart) to
-something routable. Without it, peers gossip `0.0.0.0` onwards, none of them can dial back, and two
-nodes that share a `NodeId` cannot be told apart — so a cloned image never stands down. The daemon warns
-at startup when it binds a wildcard and has nothing else to advertise.
-
-Exit statuses: `0` on a clean shutdown, `1` when another daemon holds the data directory, and `3` when
-the daemon stopped **to be restarted** — it found another node using its generated id, owned nothing,
-and discarded the id so that a supervisor's restart picks a fresh one. A supervisor that restarts on
-non-zero handles that case by itself; one that does not will need a manual start.
+Embedding `Node` directly is supported and is what the in-process API exists for: `host_channel` takes
+a closure, which a cross-process client cannot. Most applications want
+[`xchannel-net-client`](https://crates.io/crates/xchannel-net-client) instead, which talks to a local
+daemon over a Unix socket.
 
 ## How it behaves
 

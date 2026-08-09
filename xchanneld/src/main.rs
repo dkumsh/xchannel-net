@@ -1,115 +1,199 @@
 //! `xchanneld` — the xchannel-net node-manager daemon entry point.
 //!
-//! Configures from environment, then binds and serves all three planes: the stream
-//! (data) plane, the control plane (registry gossip + membership heartbeats), and the
-//! client RPC plane, alongside a periodic maintenance loop. See DESIGN.md for the
-//! architecture and README.md for current implementation status.
+//! Binds and serves all three planes: the stream (data) plane, the control plane (registry gossip and
+//! membership heartbeats), and the client RPC plane, alongside a periodic maintenance loop. See
+//! `doc/DESIGN.md` for the architecture.
+//!
+//! **This is a crate of its own so that `clap` cannot reach a library.** The node manager is
+//! `xchannel-net`, which depends on nothing but `xchannel`; a program that runs it needs an argument
+//! parser, and confining that to the program is the difference between a promise and a convention.
+//!
+//! Every option is available as a flag **and** as an environment variable. The flags exist because a
+//! setting discoverable only from a README is not discoverable; the environment variables exist because
+//! that is what actually configures a daemon in practice — systemd `Environment=`, docker `-e`,
+//! Kubernetes `env:`, and `Client::connect_or_spawn`, which starts this binary with an inherited
+//! environment and no argv at all.
 
+use clap::Parser;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use xchannel_net::NodeConfig;
 use xchannel_net::node::{MuxIdle, Node};
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// Every environment variable this daemon reads. Used to warn about the ones it *doesn't*.
+const KNOWN_ENV: &[&str] = &[
+    "XCHANNELD_NODE_ID",
+    "XCHANNELD_NODE_NAME",
+    "XCHANNELD_DATA_DIR",
+    "XCHANNELD_CLIENT_PATH",
+    "XCHANNELD_STREAM_ADDR",
+    "XCHANNELD_CONTROL_ADDR",
+    "XCHANNELD_ADVERTISE_STREAM_ADDR",
+    "XCHANNELD_ADVERTISE_CONTROL_ADDR",
+    "XCHANNELD_SEEDS",
+    "XCHANNELD_RECLAIM_AFTER_MS",
+    "XCHANNELD_PROMOTED_TOPICS",
+    "XCHANNELD_MUX_MAX_PARK_US",
+    // Read by the *client* when it spawns this binary, so it is legitimate to see here.
+    "XCHANNELD_BIN",
+];
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "xchanneld",
+    about = "xchannel-net node manager: registry, discovery, and single-writer log replication",
+    long_about = None,
+    version
+)]
+struct Args {
+    /// Stable node identity. Generated once into `<data-dir>/.node_id` if not given — there is
+    /// deliberately no default, because a default is a duplicate: two unconfigured daemons would
+    /// silently share an identity, and channel ownership, membership and peer links are all keyed on it.
+    #[arg(long, env = "XCHANNELD_NODE_ID")]
+    node_id: Option<u64>,
+
+    /// Human-readable label, gossiped for display only. Defaults to this host's name. Never a key and
+    /// never a tie-break, so a duplicate is confusing rather than incorrect.
+    #[arg(long, env = "XCHANNELD_NODE_NAME")]
+    node_name: Option<String>,
+
+    /// Channel files, replicas, the node's identity and the client socket. Defaults to
+    /// `$HOME/.xchannel-net`. One daemon per directory, enforced by a lock. Must be a local
+    /// filesystem: channels are memory-mapped.
+    #[arg(long, env = "XCHANNELD_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+
+    /// Client-plane Unix socket. Defaults to `<data-dir>/client.sock`; clients look for it there, so
+    /// change both or neither.
+    #[arg(long, env = "XCHANNELD_CLIENT_PATH")]
+    client_path: Option<PathBuf>,
+
+    /// Stream (data) plane address to **bind**.
+    #[arg(long, env = "XCHANNELD_STREAM_ADDR", default_value = "127.0.0.1:7000")]
+    stream_addr: SocketAddr,
+
+    /// Control plane address to **bind** — registry gossip and heartbeats.
+    #[arg(long, env = "XCHANNELD_CONTROL_ADDR", default_value = "127.0.0.1:7001")]
+    control_addr: SocketAddr,
+
+    /// What to advertise to peers as the stream address, when it must differ from what was bound.
+    #[arg(long, env = "XCHANNELD_ADVERTISE_STREAM_ADDR")]
+    advertise_stream_addr: Option<SocketAddr>,
+
+    /// What to advertise to peers as the control address. Needed when binding a wildcard: peers gossip
+    /// whatever is advertised, and `0.0.0.0` is not something any of them can dial. Must be **this
+    /// instance's own** address — it is what duplicate-`NodeId` detection compares.
+    #[arg(long, env = "XCHANNELD_ADVERTISE_CONTROL_ADDR")]
+    advertise_control_addr: Option<SocketAddr>,
+
+    /// Peer control addresses to form the mesh with. Repeat the flag, or give one comma-separated list.
+    /// Without any, the daemon runs standalone until something dials it.
+    ///
+    /// Taken as raw strings rather than parsed addresses so that an **empty** value means "none".
+    /// `XCHANNELD_SEEDS=""` is what a script produces when its seed list happens to be empty, and a typed
+    /// list would try to parse the empty string as an address and refuse to start — which is exactly what
+    /// the cross-process tests caught the moment this daemon moved to `clap`.
+    #[arg(long, env = "XCHANNELD_SEEDS", value_delimiter = ',')]
+    seeds: Vec<String>,
+
+    /// How long an owner must have been unreachable *from this node* before an operator may reclaim its
+    /// channel name. Generous on purpose: reclaiming too eagerly can destroy a live channel across a
+    /// partition, while reclaiming late costs only a wait.
+    #[arg(long, env = "XCHANNELD_RECLAIM_AFTER_MS", default_value = "300000")]
+    reclaim_after_ms: u64,
+
+    /// Topics given a merge thread of their own instead of the shared duty cycle. Repeat the flag, or
+    /// give one comma-separated list. Node config rather than a topic option on purpose: spawning a
+    /// thread is the operator's call, not any client's, and this survives a restart.
+    ///
+    /// Empty entries are dropped, for the same reason as `--seeds`: an unset-but-present variable must
+    /// mean "none", not "a topic whose name is the empty string".
+    #[arg(long, env = "XCHANNELD_PROMOTED_TOPICS", value_delimiter = ',')]
+    promoted_topics: Vec<String>,
+
+    /// Cap on how long an idle duty cycle parks, in microseconds. `0` never parks, for a box where the
+    /// data plane is worth a core.
+    #[arg(long, env = "XCHANNELD_MUX_MAX_PARK_US")]
+    mux_max_park_us: Option<u64>,
+}
+
+/// Parse a comma-separated address list, treating blank entries as absent. Returns the offending entry on
+/// failure so the caller can name the flag *and* the variable in one message.
+fn parse_addrs(raw: &[String]) -> Result<Vec<SocketAddr>, String> {
+    raw.iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<SocketAddr>().map_err(|_| s.to_string()))
+        .collect()
+}
+
+/// Warn about `XCHANNELD_*` variables this daemon does not read.
+///
+/// Neither flags nor `clap`'s environment support can catch this: a misspelled *flag* is an error, but a
+/// misspelled *variable* is simply absent, and the daemon starts with a default while the operator
+/// believes they configured something. `XCHANNELD_SEEDZ=10.0.0.5:7001` gets you a standalone node and
+/// not a word of complaint. Since environment is how a daemon is configured in practice, that is the
+/// case worth a warning.
+fn warn_unknown_env() {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("XCHANNELD_") && !KNOWN_ENV.contains(&key.as_str()) {
+            eprintln!(
+                "xchanneld: WARNING: {key} is set but not recognised — it is being ignored. Run \
+                 `xchanneld --help` for the options this daemon reads."
+            );
+        }
+    }
 }
 
 fn main() -> std::io::Result<()> {
-    // **First thing, before any other work.** This used to sit after the data directory was created,
-    // the identity resolved and the lock taken, so a signal in the first few milliseconds was a hard
-    // kill despite the comment claiming it was not — measured, three attempts of three. A hard kill
-    // there is safe (nothing is bound, nothing is committed), so the only cost was that peers waited
-    // out the liveness timeout for a node that had barely started. But a claim in a comment should be
-    // true.
+    // **First thing, before any other work.** A signal arriving in the first few milliseconds should not
+    // be a hard kill just because the handler was not installed yet. (A hard kill *there* is safe —
+    // nothing is bound and nothing is committed — so the only cost was peers waiting out the liveness
+    // timeout for a node that had barely started. But a claim in a comment should be true.)
     xchannel_net::shutdown::install();
-    // A node's identity is generated once and kept in its data dir; `XCHANNELD_NODE_ID` overrides
-    // it for deployments that need deterministic ids. There is deliberately **no default**: the
-    // old `1` meant two unconfigured daemons silently shared an identity, and everything —
-    // channel ownership, membership, peer links — is keyed on it.
-    let configured_id = std::env::var("XCHANNELD_NODE_ID")
-        .ok()
-        .map(|v| v.parse::<u64>().expect("XCHANNELD_NODE_ID must be a u64"));
-    let node_name = std::env::var("XCHANNELD_NODE_NAME").ok();
-    let stream_addr: SocketAddr = env_or("XCHANNELD_STREAM_ADDR", "127.0.0.1:7000")
-        .parse()
-        .expect("XCHANNELD_STREAM_ADDR must be host:port");
-    // What to tell peers, when it must differ from what is bound — a container binding `0.0.0.0`
-    // needs to advertise a routable address, or peers learn one nobody can dial and duplicate-id
-    // detection (which compares advertised control addresses) stops working.
-    let advertise_control_addr: Option<SocketAddr> =
-        std::env::var("XCHANNELD_ADVERTISE_CONTROL_ADDR")
-            .ok()
-            .map(|v| {
-                v.parse()
-                    .expect("XCHANNELD_ADVERTISE_CONTROL_ADDR must be host:port")
-            });
-    let advertise_stream_addr: Option<SocketAddr> =
-        std::env::var("XCHANNELD_ADVERTISE_STREAM_ADDR")
-            .ok()
-            .map(|v| {
-                v.parse()
-                    .expect("XCHANNELD_ADVERTISE_STREAM_ADDR must be host:port")
-            });
-    let control_addr: SocketAddr = env_or("XCHANNELD_CONTROL_ADDR", "127.0.0.1:7001")
-        .parse()
-        .expect("XCHANNELD_CONTROL_ADDR must be host:port");
+
+    let args = Args::parse();
+    warn_unknown_env();
+
     // Per-user and persistent by default (`$HOME/.xchannel-net`). Shared with the client through
-    // `core::paths`, because `Client::connect_or_spawn` finds the implicit daemon by this path and
-    // the two computing it differently would look like "no daemon running".
-    let data_dir = match std::env::var_os("XCHANNELD_DATA_DIR") {
-        Some(d) => PathBuf::from(d),
+    // `core::paths`, because `Client::connect_or_spawn` finds the implicit daemon by this path and the
+    // two computing it differently would look like "no daemon running".
+    let data_dir = match args.data_dir {
+        Some(d) => d,
         None => xchannel_net_core::paths::default_data_dir()?,
     };
-    // Client plane is a Unix domain socket (local-only, permission-gated); defaults under
-    // the data dir so the 0700 directory restricts who can reach the daemon.
-    let client_path = match std::env::var_os("XCHANNELD_CLIENT_PATH") {
-        Some(p) => PathBuf::from(p),
-        None => data_dir.join(xchannel_net_core::paths::CLIENT_SOCKET_NAME),
-    };
+    // The client plane is a Unix socket (local-only, permission-gated); under the data dir by default, so
+    // the `0700` directory decides who can drive the daemon.
+    let client_path = args
+        .client_path
+        .unwrap_or_else(|| data_dir.join(xchannel_net_core::paths::CLIENT_SOCKET_NAME));
 
-    // Seed peers to exchange registry state with on startup: `XCHANNELD_SEEDS` is a
-    // comma-separated list of control-plane `host:port` addresses. Without it a daemon runs
-    // standalone (no peers) — the maintenance loop re-dials these to (re)form the mesh.
-    let seeds: Vec<SocketAddr> = env_or("XCHANNELD_SEEDS", "")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse()
-                .expect("XCHANNELD_SEEDS entries must be host:port")
-        })
+    let configured_id = args.node_id;
+    let node_name = args.node_name;
+    let stream_addr = args.stream_addr;
+    let control_addr = args.control_addr;
+    let advertise_stream_addr = args.advertise_stream_addr;
+    let advertise_control_addr = args.advertise_control_addr;
+    let seeds = parse_addrs(&args.seeds).map_err(|bad| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("--seeds / XCHANNELD_SEEDS: {bad:?} is not a host:port address"),
+        )
+    })?;
+    let reclaim_after = Duration::from_millis(args.reclaim_after_ms);
+    let promoted_topics: HashSet<String> = args
+        .promoted_topics
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(String::from)
         .collect();
-
-    // Safety floor for reclaiming a dead owner's channel name (see
-    // `Node::force_deregister`). Deliberately generous by default — reclaiming too eagerly
-    // can destroy a live channel across a partition, while reclaiming late costs only a wait.
-    let reclaim_after = std::env::var("XCHANNELD_RECLAIM_AFTER_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(300));
-
-    // Topics promoted onto a thread of their own — rung 2 of doc/TOPICS.md §4.1's promotion
-    // path. Comma-separated topic names; empty (the default) leaves everything on the shared duty
-    // cycle. Deliberately node config rather than a `TopicOptions` field: spawning a thread is the
-    // operator's call, not any client's, and unlike `TopicOptions` this survives a restart (see
-    // `NodeConfig::promoted_topics`).
-    let promoted_topics: std::collections::HashSet<String> =
-        env_or("XCHANNELD_PROMOTED_TOPICS", "")
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-
     // How the duty cycle — and each promoted topic's own loop — waits when it finds no work.
-    // `XCHANNELD_MUX_MAX_PARK_US` caps the park; `0` means never park (keep yielding), for a box
-    // where the data plane is worth a core.
     let mux_idle = MuxIdle {
-        max_park: std::env::var("XCHANNELD_MUX_MAX_PARK_US")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        max_park: args
+            .mux_max_park_us
             .map_or(MuxIdle::default().max_park, Duration::from_micros),
         ..MuxIdle::default()
     };

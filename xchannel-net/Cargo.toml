@@ -6,15 +6,11 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 authors.workspace = true
-description = "xchanneld — the xchannel-net node-manager daemon: registry, discovery, and TCP replication."
+description = "The xchannel-net node manager as a library: CRDT registry, discovery, replication, topics."
 
 [lib]
 name = "xchannel_net"
 path = "src/lib.rs"
-
-[[bin]]
-name = "xchanneld"
-path = "src/main.rs"
 
 [dependencies]
 xchannel-net-core.workspace = true
