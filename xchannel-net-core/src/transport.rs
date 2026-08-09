@@ -30,31 +30,48 @@ pub trait Listener: Send {
 /// larger than this would need to raise it.
 pub const MAX_FRAME_LEN: usize = 64 << 20; // 64 MiB
 
-/// Write one length-delimited frame (`u32` LE length prefix + body) to any writer. Shared
-/// by every [`Transport`] so the framing can't drift between substrates.
-/// `write_all`, but abandoning the frame once `deadline` passes rather than only once a single
-/// syscall has waited out its own timeout.
-///
-/// The distinction is the whole point: `SO_SNDTIMEO` restarts on any syscall that moved a byte, so a
-/// slow or stalled peer can stretch one `write_all` without limit. Progress is required *and* the
-/// total is bounded.
 /// How long a peer may accept **nothing at all** before it is abandoned, whatever remains of its
 /// allowance.
 ///
-/// Generous against transient stalls on purpose: a single TCP retransmission timeout is ~200 ms with the
-/// send buffer full, and a healthy peer that hits one must not lose its link for it. Must stay larger
-/// than the caller's per-syscall write timeout, which is how this loop learns that nothing moved.
-const STALL_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// **This is a bound on burstiness, not on rate, and it supersedes the caller's rate policy for a peer
+/// whose progress is lumpy at this scale.** Measured: a peer sustaining 8 MiB/s — twice the rate the
+/// control plane's own policy calls acceptable — is dropped if it takes that throughput in 500 ms gulps,
+/// because the sender sees no write progress between them. TCP window-update batching makes sender-side
+/// progress events sparser than receiver-side reads, so the effective tolerance in application terms is
+/// smaller than this number suggests: a receiver reading every 150 ms was observed producing sender gaps
+/// that grew to 254 ms.
+///
+/// It is therefore *not* a reliable "healthy peers survive a retransmission timeout" guarantee, and the
+/// earlier version of this comment claiming so was wrong. A single TCP RTO with a full send buffer is
+/// ~200 ms and grows with loss, so on a lossy or high-latency link this constant is inside the noise. It
+/// is chosen for the one job it does well: turning a *wedged* peer's cost from a payload-sized allowance
+/// (measured at 12.8 s for 36 MiB) into a constant.
+///
+/// Must stay larger than the caller's per-syscall write timeout, which is how this loop learns that
+/// nothing moved. `xchannel-net`'s `PEER_WRITE_SLICE` asserts that at compile time.
+pub const STALL_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// `write_all`, but abandoning the frame once `deadline` passes, or once the peer has accepted nothing
+/// for [`STALL_LIMIT`].
+///
+/// Two tests, because "too slow" and "not moving" are different failures. `SO_SNDTIMEO` alone bounds
+/// neither: it restarts on any syscall that moved a byte, so a slow or stalled peer can stretch one
+/// `write_all` without limit.
+///
+/// **The first write is always attempted before either check.** A deadline that has already elapsed —
+/// which happens when a caller shares a budget across peers — would otherwise fail a peer with zero
+/// bytes written, and a healthy peer takes a control frame in one syscall. Failing it untried is how one
+/// slow peer once evicted an entire peer table.
 fn write_all_by<W: Write>(
     w: &mut W,
     mut bytes: &[u8],
     deadline: std::time::Instant,
 ) -> io::Result<()> {
     let mut last_progress = std::time::Instant::now();
+    let mut attempted = false;
     while !bytes.is_empty() {
         let now = std::time::Instant::now();
-        if now >= deadline {
+        if attempted && now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "peer did not accept the frame within its write budget",
@@ -65,12 +82,13 @@ fn write_all_by<W: Write>(
         // peer accepting *nothing* is wedged, and an allowance sized for a whole payload is far too much
         // rope: waiting one out held the control plane for 12.8 s on a 36 MiB burst. Bounded by the stall
         // instead, a wedged peer costs the same quarter-second whatever the payload.
-        if now.duration_since(last_progress) >= STALL_LIMIT {
+        if attempted && now.duration_since(last_progress) >= STALL_LIMIT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "peer accepted nothing for the stall limit",
             ));
         }
+        attempted = true;
         match w.write(bytes) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -95,6 +113,8 @@ fn write_all_by<W: Write>(
     Ok(())
 }
 
+/// Write one length-delimited frame (`u32` LE length prefix + body) to any writer. Shared by every
+/// [`Transport`] so the framing cannot drift between substrates.
 fn send_framed<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_FRAME_LEN {
         return Err(io::Error::new(
@@ -176,7 +196,7 @@ impl TcpTransport {
     /// timeout restarts on every syscall that moved even one byte, so a peer that drains slowly (or
     /// that stalls with a partly-filled buffer) stretches a single frame arbitrarily: measured at
     /// 4.1 s per wedged peer against a 2 s setting, and 19 s for a peer draining at 128 KiB/s where
-    /// the timeout never fired at all. Use [`send_frame_within`](Self::send_frame_within) for a bound
+    /// the timeout never fired at all. Use [`send_frame_by`](Self::send_frame_by) for a bound
     /// on the frame; this is only the slice that keeps each syscall from parking forever.
     pub fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
         self.stream.set_write_timeout(timeout)
@@ -649,6 +669,47 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(conn);
         let _ = trickle.join();
+    }
+
+    /// **A peer that keeps making progress must not be judged by the stall limit.** This is the whole
+    /// content of the stall mechanism — that `last_progress` advances on every accepted byte — and without
+    /// it the limit degenerates into "every frame must complete in `STALL_LIMIT`, whatever moved", which
+    /// no other test in this workspace can tell apart: an eager loopback reader takes 8 MiB in ~10 ms and
+    /// never approaches the limit.
+    ///
+    /// So the receiver here drains deliberately slowly but *steadily* — 1 MiB every 100 ms, which is well
+    /// above the rate the control plane calls acceptable — over a payload that cannot finish inside one
+    /// stall window.
+    #[test]
+    fn a_peer_that_keeps_making_progress_is_not_judged_by_the_stall_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut sink = vec![0u8; 1 << 20];
+            let mut total = 0usize;
+            // 1 MiB per 100 ms = 10 MiB/s, steady.
+            while total < (8 << 20) {
+                match std::io::Read::read(&mut conn, &mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n,
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            total
+        });
+
+        let mut conn = TcpTransport::connect(addr).unwrap();
+        conn.set_write_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        let payload = vec![0u8; 8 << 20];
+        conn.send_frame_by(
+            &payload,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .expect("a peer accepting bytes steadily must keep its link, whatever the stall limit is");
+        drop(conn);
+        assert!(reader.join().unwrap() > 0);
     }
 
     /// The bound must not fire on a peer that is simply reading, however large the frame.

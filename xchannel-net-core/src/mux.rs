@@ -318,7 +318,7 @@ pub fn encode_slot_table(geometry: &TopicGeometry, entries: &[SlotEntry]) -> Vec
 }
 
 /// Decode a slot-table control-record payload produced by [`encode_slot_table`]. Refuses a
-/// payload written by a different [`SLOT_TABLE_VERSION`].
+/// payload written by a different slot-table version.
 pub fn decode_slot_table(mut b: &[u8]) -> io::Result<SlotTable> {
     fn take<'a>(b: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
         if b.len() < n {
@@ -870,7 +870,7 @@ pub struct TopicConfig {
 /// configuration + last membership (`doc/RESTART.md`, option (a) content-sniff). `Some` iff the
 /// channel carries a decodable `SlotTable` record; `None` for an ordinary channel, a topic that
 /// never had a member (no slot table), or a topic whose tables are all of an unsupported
-/// [`SLOT_TABLE_VERSION`]. Used by restart reconstruction to re-host topics and re-attach members.
+/// the slot-table version. Used by restart reconstruction to re-host topics and re-attach members.
 pub fn topic_config(path: &Path) -> io::Result<Option<TopicConfig>> {
     let mut reader = ReaderBuilder::new(path).late_join().build()?;
     let mut cfg: Option<TopicConfig> = None;

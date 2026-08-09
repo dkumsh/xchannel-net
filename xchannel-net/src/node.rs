@@ -125,8 +125,11 @@ const MAX_TWIN_DIALS_PER_TICK: usize = 1;
 ///   constant here to check, and no constant that could be right — see `MIN_DRAIN_RATE`.
 /// * A heartbeat costs `P × PEER_SMALL_FRAME_BUDGET` across P peers, once per wedged peer since each
 ///   failed write drops it.
-/// * Member attachment costs at most `MAX_ATTACH_RESOLVES_PER_TICK` resolves, and only for members
-///   whose owner is reachable.
+/// * Member attachment costs one non-blocking resolve per not-yet-replicating member whose owner is
+///   reachable — measured at ~34 µs each, so 10 000 members cost ~340 ms. There is no cap; the per-tick
+///   cap that used to be here starved live members and was deleted.
+/// * Control-plane writes are bounded in aggregate by `broadcast::TICK_WRITE_BUDGET`, which is the only
+///   term here that is actually *checked* rather than measured.
 ///
 /// Bounding the burst term properly means not holding the lock across the write — a per-peer outbox,
 /// which the stream plane already has. Until then it is a documented limit, not a checked one.
@@ -488,6 +491,15 @@ pub struct Node {
     /// Incarnation of this daemon's discovery log — fresh per process, so a client's cursor
     /// from a previous run is recognisably stale.
     discovery_generation: u64,
+    /// Per-member attach penalty, for members whose subscription cannot be established.
+    ///
+    /// Deleting the per-tick resolve cap removed a starvation bug and left one behaviour behind it: a member
+    /// that *can* be resolved but cannot be *attached* — the owner is live but refusing connections, or is at
+    /// its own connection cap — was retried on every tick for ever. Measured: a thousand such members cost
+    /// ~9 % of a core in a permanent loop of thousands of connects a second, with nothing logged. The cap
+    /// used to hide this by throttling the whole queue to four attempts a tick; the honest fix is to back
+    /// off per member, exactly as dialling does per address.
+    attach_backoff: Arc<Mutex<HashMap<String, DialPenalty>>>,
     /// `NodeId`s already complained about, so a permanent duplicate produces one warning rather
     /// than one per maintenance tick. Gates the *message* only — never the decision to stand
     /// aside, which has to be re-evaluated as often as it is detected.
@@ -574,6 +586,7 @@ impl Node {
             conducted: Arc::new(Mutex::new(Vec::new())),
             discovery: Arc::new(Mutex::new(None)),
             discovery_generation: now_nanos(),
+            attach_backoff: Arc::new(Mutex::new(HashMap::new())),
             dup_reported: Arc::new(Mutex::new(HashSet::new())),
             owner_unreachable_since: Arc::new(Mutex::new(HashMap::new())),
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
@@ -961,7 +974,7 @@ impl Node {
                 // The gate covers the *subscription* only. Attaching from a replica already on disk
                 // needs no reachable owner, and skipping that too meant a member whose owner had merely
                 // gone quiet was left unattached even with a complete local replica.
-                if remote && live_nodes.contains(&m.owner) {
+                if remote && live_nodes.contains(&m.owner) && self.attach_due(&m.name) {
                     self.ensure_member_subscription(&m.name);
                 }
 
@@ -1071,6 +1084,36 @@ impl Node {
     /// a live member, so `resolve` succeeds on its first pass; any timeout here could be spent but never
     /// usefully waited, and spending it on the heartbeat's own thread is what made a per-tick cap look
     /// necessary.
+    /// Whether a member's attach attempt is due, and charge the attempt if so.
+    ///
+    /// Shares `DialPenalty`'s escalate-and-decay shape with the dialler, for the same reason: an attempt
+    /// that cannot succeed must not be repeated at the tick rate for ever. A member that attaches clears its
+    /// penalty, so a peer coming back is picked up promptly.
+    fn attach_due(&self, name: &str) -> bool {
+        let mut backoff = self.attach_backoff.lock_safe();
+        if let Some(p) = backoff.get(name)
+            && Instant::now() < p.next
+        {
+            return false;
+        }
+        let now = Instant::now();
+        let gap = match backoff.get(name) {
+            Some(p) if p.attempted_at.elapsed() < DIAL_BACKOFF_MAX * 2 => {
+                (p.gap * 2).min(DIAL_BACKOFF_MAX)
+            }
+            _ => DIAL_BACKOFF_MIN,
+        };
+        backoff.insert(
+            name.to_string(),
+            DialPenalty {
+                attempted_at: now,
+                next: now + gap,
+                gap,
+            },
+        );
+        true
+    }
+
     fn ensure_member_subscription(&self, name: &str) {
         let live = self
             .subscriptions
@@ -1085,6 +1128,8 @@ impl Node {
         // never useful — and spending it on the heartbeat's thread is what made a cap seem necessary.
         if let Ok(sub) = self.subscribe(name, Some(Duration::ZERO)) {
             self.subscriptions.lock_safe().insert(name.to_string(), sub);
+            // It attached, so forget the penalty: the next drop should be retried promptly.
+            self.attach_backoff.lock_safe().remove(name);
         }
     }
 
@@ -1292,7 +1337,7 @@ impl Node {
     }
 
     /// Re-register a non-topic origin channel found on disk (helper for
-    /// [`reconstruct_from_disk`]): recover its geometry from the channel header via
+    /// [`reconstruct_from_disk`](Node::reconstruct_from_disk)): recover its geometry from the channel header via
     /// `xchannel::Reader` and re-register + announce it under this node's ownership. `member_of`
     /// is not recoverable from disk (it was registry state); on a mesh, peer anti-entropy
     /// restores it, and a local topic re-attaches its members from its own slot table regardless.
@@ -1312,7 +1357,7 @@ impl Node {
         self.announce_hosted(&identity, path, 0, 0)
     }
 
-    /// Re-host one topic from disk (helper for [`reconstruct_from_disk`]): re-register the topic
+    /// Re-host one topic from disk (helper for [`reconstruct_from_disk`](Node::reconstruct_from_disk)): re-register the topic
     /// channel we own, reopen its mux (which recovers per-member cursors from the tail), and
     /// re-attach the members named in its last slot table — a local member by its origin file, a
     /// remote member by its on-disk replica (refreshed later when its owner is reachable and the
@@ -2008,6 +2053,10 @@ impl Node {
             // actively-writing owner to `owner_live = false`.
             let pumped = {
                 let mut d = self.dissemination.lock_safe();
+                // Re-arm the tick's total write budget before anything writes. Per-peer allowances stop
+                // one slow peer from evicting the others; this stops P of them from summing past
+                // `LIVENESS_TIMEOUT` — 32 peers accepting nothing measured 10.10 s without it.
+                d.begin_tick();
                 let _ = d.emit_heartbeat();
                 // Forward peer knowledge learned since the last tick, so the mesh keeps closing
                 // itself; only knowledge that was *new* to us is queued, so this goes quiet.
@@ -2566,11 +2615,24 @@ impl Node {
         {
             return;
         }
-        let (node, name, shared) = (self.clone(), name.to_string(), Arc::clone(shared));
-        std::thread::spawn(move || {
-            node.establish(&name, &shared);
-            shared.establishing.store(false, Ordering::Release);
-        });
+        let (node, name) = (self.clone(), name.to_string());
+        let for_thread = Arc::clone(shared);
+        let on_failure = Arc::clone(shared);
+        // **`Builder`, not `spawn`.** A bare `thread::spawn` *panics* if the OS refuses a thread, and this
+        // is called from the maintenance loop, which nothing supervises — so a container hitting its pids
+        // limit would take out the one thread that emits heartbeats, and every peer would declare this node
+        // dead while it was otherwise fine. Establishment is retried every tick, so a refused thread costs
+        // one tick; a panicking one costs the node. The flag has to be cleared on that path too, or the
+        // subscription would believe an attempt was still in flight for ever.
+        let spawned = std::thread::Builder::new()
+            .name(format!("establish-{name}"))
+            .spawn(move || {
+                node.establish(&name, &for_thread);
+                for_thread.establishing.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            on_failure.establishing.store(false, Ordering::Release);
+        }
     }
 
     /// One attempt to connect and hand a subscription's sink to the duty cycle. Failures are
@@ -2638,7 +2700,7 @@ impl Node {
 
     /// **The duty cycle** (`doc/TOPICS.md` §4.1): one thread polling every replication source,
     /// replication sink and mux as peer poll-items, each bounded to
-    /// [`MAX_BATCH_PER_POLL_ITEM`] records per turn so none can head-of-line-block the others for
+    /// `MAX_BATCH_PER_POLL_ITEM` records per turn so none can head-of-line-block the others for
     /// a full drain.
     ///
     /// This is the loop §4.1 describes, and it comes with the coupling §4.1's budget note warns
@@ -2647,7 +2709,7 @@ impl Node {
     /// loop makes in exchange for one thread instead of one per connection, and scheduling that is
     /// deterministic rather than at the mercy of N blocked threads waking in whatever order.
     ///
-    /// Establishment is deliberately *not* here — see [`spawn_establish`](Self::spawn_establish).
+    /// Establishment is deliberately *not* here — see `spawn_establish`.
     pub fn run_duty_cycle(&self, idle: MuxIdle) {
         let mut servers: Vec<HostedServer> = Vec::new();
         let mut clients: Vec<PolledSub> = Vec::new();
@@ -3102,6 +3164,40 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("condition not met within timeout");
+    }
+
+    /// **A member that cannot be attached must not be retried every tick for ever.** Deleting the per-tick
+    /// resolve cap fixed a starvation bug and exposed this: a thousand members whose owners are live but
+    /// unreachable-in-practice cost ~9 % of a core in a permanent connect loop, silently. Attaching backs
+    /// off per member now, the same way dialling backs off per address.
+    #[test]
+    fn a_member_that_cannot_attach_backs_off_instead_of_retrying_every_tick() {
+        let node = Node::new(config(160, temp_dir("attach-backoff")));
+
+        assert!(node.attach_due("mem.a"), "a first attempt is never delayed");
+        assert!(
+            !node.attach_due("mem.a"),
+            "a second attempt in the same window must be refused, or the tick rate becomes the retry rate"
+        );
+
+        // The gap escalates while attempts keep coming...
+        let gap = node.attach_backoff.lock_safe().get("mem.a").unwrap().gap;
+        assert_eq!(gap, DIAL_BACKOFF_MIN);
+        node.attach_backoff
+            .lock_safe()
+            .get_mut("mem.a")
+            .unwrap()
+            .next = Instant::now();
+        assert!(node.attach_due("mem.a"));
+        assert_eq!(
+            node.attach_backoff.lock_safe().get("mem.a").unwrap().gap,
+            DIAL_BACKOFF_MIN * 2,
+            "a repeated failure must widen the gap"
+        );
+
+        // ...and a member that attaches clears it, so a peer coming back is picked up promptly.
+        node.attach_backoff.lock_safe().remove("mem.a");
+        assert!(node.attach_due("mem.a"), "a cleared penalty means due now");
     }
 
     /// **A cap over a deterministically-ordered walk starves whatever sorts last.** Reproduced three

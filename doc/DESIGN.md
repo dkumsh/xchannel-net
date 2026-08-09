@@ -308,11 +308,28 @@ dissemination lock for up to `R / rate`. Bounding *that* requires not holding th
 — a per-peer outbox, which the stream plane already has — and is post-0.3.0 work. The build-time
 assertion therefore covers the connect portion of a tick only, and says so.
 
-Two different failures get two different tests. A peer still accepting bytes is working, however slowly,
-and only its allowance judges it; a peer accepting **nothing** is wedged, and is cut off by a stall limit
-instead — an allowance sized for a whole payload is far too much rope for a peer that is not moving, which
-is how a single wedged peer held the control plane for 12.8 s on a 36 MiB burst. The stall limit sits well
-above a TCP retransmission timeout, so a healthy peer that briefly cannot accept anything keeps its link.
+Two different failures get two different tests. A peer accepting **nothing** is wedged, and is cut off by a
+stall limit rather than by its allowance — an allowance sized for a whole payload is far too much rope for a
+peer that is not moving, which is how a single wedged peer held the control plane for 12.8 s on a 36 MiB
+burst. A peer that keeps accepting bytes is judged by its allowance.
+
+Be precise about what the stall limit costs, because it is a constraint on **burstiness** and not on rate,
+and it therefore supersedes the rate policy for some peers the rate policy would keep: measured, a peer
+sustaining twice the minimum rate is dropped if it takes that throughput in half-second gulps, and TCP
+window-update batching makes sender-side progress events sparser than receiver-side reads. It is *not* a
+guarantee that a healthy peer survives a retransmission timeout — on a lossy or high-latency link the limit
+is inside the noise. It is chosen for the one job it does well, turning a wedged peer's cost from
+payload-sized into constant, and a link dropped for burstiness is re-dialled under the ordinary backoff.
+
+**And per-peer allowances are capped in aggregate per tick.** Giving each peer its own budget fixed the
+attribution — one slow peer no longer evicts the others — and created a global term by doing it, because
+writes are serial and a tick issues a heartbeat, a hint flood, and up to a relay and a reply per source
+link: 32 peers accepting nothing measured 10.10 s of held lock against a ten-second liveness timeout. A
+per-tick ceiling on total write time is what makes the family of bounds close. A burst that exhausts it is
+not lost work — the merge is idempotent and order-free, and the next tick re-arms the budget — and a peer
+the ceiling stopped short of still has its write *attempted*, because the write loop always tries once
+before consulting a deadline. That last detail is what keeps a ceiling from re-creating the eviction bug it
+was added to bound.
 
 A related ordering is load-bearing and easy to get backwards: a node **spawns its reader before** sending
 its own join, so that it drains its peer while writing. Both ends of a pair dial, so both adopt at once;

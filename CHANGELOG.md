@@ -268,6 +268,15 @@ across a ten-second liveness window with no clock control.
     in perpetuity. Four such hosts took the heartbeat period from 0.5 s to a sustained **4.5 s**, where
     0.2.x decayed to one attempt a minute. No exemption is needed — a link that outlasted its own gap
     has already outlived the penalty from the dial that created it.
+  - **A member that cannot be attached backs off, per member.** Deleting the per-tick resolve cap (below)
+    fixed a starvation bug and left one behaviour behind it: a member whose owner is live but unreachable in
+    practice — refusing connections, or at its own connection cap — was retried on every tick for ever,
+    measured at ~9 % of a core in a permanent loop of thousands of connects a second with nothing logged.
+    Attaching now escalates and decays per member, exactly as dialling does per address.
+  - **Establishment uses `thread::Builder`, so a refused thread costs a tick rather than the node.** A bare
+    `thread::spawn` panics when the OS declines, and this runs on the unsupervised maintenance thread — so a
+    container at its pids limit would have taken out the one thread that emits heartbeats, and every peer
+    would then declare a healthy node dead.
   - **Member attachment skips what it cannot resolve, and needs no cap at all.** Each remote member not yet
     replicating costs a bounded resolve, and the count was unbounded: fifty made a tick **10.5 s**. A cap
     alone turned that into something worse — a member whose owner is unreachable can never be resolved,
@@ -322,12 +331,27 @@ across a ten-second liveness window with no clock control.
     to every peer in one pass: at the ≤100-node target, a 250 ms budget made a heartbeat broadcast worth
     25 s.
 
+    Per-peer allowances are **capped in aggregate per tick**. Giving each peer its own budget fixed the
+    attribution and created a global term by doing it — writes are serial, and a tick issues a heartbeat, a
+    hint flood, and up to a relay and a reply per source link, so 32 peers accepting nothing measured
+    **10.10 s** of held lock against a ten-second liveness timeout, declaring a live node dead to its
+    healthy majority. A per-tick ceiling closes that, and the write loop now always attempts one write
+    before consulting any deadline — otherwise a spent ceiling would fail an untried peer with zero bytes
+    written, which is the eviction bug the per-peer budgets were introduced to fix.
+
     A peer that accepts **nothing** is judged separately and far more tightly, by a stall limit rather
     than by its allowance: an allowance sized for a whole payload is too much rope for a peer that is
     not moving at all, which is how one wedged peer held the control plane for 12.8 s on a 36 MiB burst.
-    Bounded by the stall instead, a wedged peer costs a quarter of a second whatever the payload — and
-    the limit is set well above a TCP retransmission timeout so a healthy peer that hits one keeps its
-    link. "Too slow" and "not moving" are different failures and now have different tests.
+    Bounded by the stall instead, a wedged peer costs a quarter of a second whatever the payload. "Too
+    slow" and "not moving" are different failures and now have different tests — including one that pins
+    the mechanism itself, since the entire content of the stall check (that progress advances the clock)
+    passed 148 of 148 tests when mutated away.
+
+    Stated honestly, because the first version of this comment overclaimed: the stall limit is a bound on
+    **burstiness**, not on rate, and it supersedes the rate policy for a peer whose progress is lumpy —
+    measured, a peer sustaining twice the minimum rate is dropped if it takes that throughput in
+    half-second gulps. It is not a guarantee that a healthy peer survives a retransmission timeout; on a
+    lossy or high-latency link it is inside the noise.
 
     What remains, and is documented rather than asserted away: a burst of R bytes may hold the
     dissemination lock for up to `R / rate` per peer that is slow but still accepting bytes — measured as `0.58 s + 1.36 × R/rate`,

@@ -3,7 +3,7 @@
 //!
 //! This crate holds the pieces that have no opinion about *how* bytes move between
 //! nodes (TCP, RDMA, local IPC): the channel identity model, the wire frames the
-//! control and stream protocols exchange, the [`Transport`] abstraction, and the
+//! control and stream protocols exchange, the [`transport::Transport`] abstraction, and the
 //! replication source/sink engines that bridge an xchannel log to a byte stream.
 //!
 //! See `DESIGN.md` at the repo root for the architecture this implements.

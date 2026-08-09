@@ -12,6 +12,10 @@ check:
     cargo check
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
+    # Rustdoc too, and with private items: this codebase's design record lives in its comments, so a
+    # comment that links to something deleted is a defect. Clippy does not run rustdoc lints, so
+    # `-D warnings` on clippy alone left that hole open — three deleted symbols were still being linked.
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --workspace
 
 # list every place a lock guard outlives its own statement, for review
 #
@@ -27,7 +31,9 @@ locks:
     @echo "--- guards in a for-head (alive for the whole loop) ---"
     @grep -rn 'for .* in .*lock_safe()' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client || true
     @echo "--- typed bindings and let-else scrutinees (a let-else guard dies BEFORE the else) ---"
-    @grep -rn 'let [a-z_]*: .*lock_safe()\|let .* else = .*lock_safe()\|else {' --include='*.rs' xchannel-net/src xchannel-net-core/src | grep lock_safe || true
+    @grep -rn 'let [a-z_]*\(: [^=]*\)\? = .*lock_safe()\|else {' --include='*.rs' xchannel-net/src xchannel-net-core/src | grep lock_safe || true
+    @echo "--- match guards taking a lock (a guard is its own temporary scope, but check the arm) ---"
+    @grep -rn 'if .*lock_safe().* =>' --include='*.rs' xchannel-net/src xchannel-net-core/src || true
     @echo "--- multi-line guard bindings (check the following lines by hand) ---"
     @grep -rn -B1 '^\s*\.lock_safe()' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client | grep 'let ' || true
 

@@ -168,7 +168,7 @@ fn put_identity(w: &mut W, id: &ChannelIdentity) {
     }
 }
 
-/// Exactly how many bytes [`put_identity`] will write for `id`.
+/// Exactly how many bytes the identity encoder will write for `id`.
 ///
 /// Exists so a caller can size a write deadline from the real payload rather than from an estimate. An
 /// estimate is the wrong tool for that job in a specific way: guess low and the deadline is too tight,

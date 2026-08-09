@@ -69,7 +69,7 @@ pub enum ControlMsg {
     },
     /// What a peer knows *about a third node* — its addresses, and nothing about its liveness.
     ///
-    /// Deliberately not a relayed [`Heartbeat`]. A heartbeat means "I heard from this node";
+    /// Deliberately not a relayed `Heartbeat`. A heartbeat means "I heard from this node";
     /// forwarding one would make that claim on someone else's behalf, and membership liveness is
     /// specifically *this* node's ability to reach another (DESIGN §5.4). A hint means only "it
     /// exists, here is where" — enough to dial it and find out first-hand.
@@ -111,7 +111,7 @@ pub enum StreamMsg {
     /// `base` is its replica's first absolute index (read from the replica's
     /// `ChannelHeader.base_record_index`) and `n` the records it holds. It is *not* a plain
     /// count — counting breaks for a retention-truncated replica (`base > 0`); see
-    /// [`RecordIndex`](crate::RecordIndex).
+    /// [`RecordIndex`].
     /// `RecordIndex(0)` ⇔ empty replica ⇔ "full retained history". Per the "always full
     /// history" decision there is no other start negotiation.
     Subscribe {

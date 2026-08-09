@@ -92,11 +92,20 @@ const PEER_WRITE_SLICE: Duration = Duration::from_millis(20);
 /// 4 MiB/s is roughly a third of what an idle daemon on a LAN sustains, so a peer three times degraded
 /// still keeps its link. Below it, the peer is dropped rather than allowed to hold the control plane.
 ///
-/// The residual, stated plainly because it cannot be fixed by choosing a better number: a burst of R
-/// bytes may hold the dissemination lock for up to `R / MIN_DRAIN_RATE` **per peer that is slow but still
+/// **This rate is not the whole policy, and it is not even the binding half for a bursty peer.**
+/// `transport::STALL_LIMIT` bounds the largest gap between write-progress events, which is a constraint on
+/// *burstiness*, and it supersedes this rate whenever a peer's progress is lumpy at a quarter-second scale:
+/// measured, a peer sustaining 8 MiB/s — twice this floor — is dropped if it takes that throughput in
+/// 500 ms gulps. So "a peer slower than this is not keeping up" describes the intent, while the code
+/// enforces "and it must show progress at least every `STALL_LIMIT`". Both are stated here because a
+/// reader sizing a deployment needs the second one too.
+///
+/// The residual, stated plainly because it cannot be fixed by choosing a better number: a burst of R bytes
+/// may hold the dissemination lock for up to `R / MIN_DRAIN_RATE` **per peer that is slow but still
 /// accepting bytes**, and a single tick can contain several bursts (a relay and a reply per source link,
-/// plus the hint flood). A peer that accepts *nothing* is bounded far more tightly, by
-/// `transport::STALL_LIMIT`, and no longer contributes here at all.
+/// plus the hint flood). Two things bound that in practice rather than by argument: a peer that accepts
+/// *nothing* is cut off by `STALL_LIMIT` instead, and the sum across peers and bursts is capped by
+/// [`TICK_WRITE_BUDGET`], which is what stops per-peer allowances from adding up past `LIVENESS_TIMEOUT`.
 /// Measured against a peer that never drained, the hold was `0.58 s + 1.36 × (R / rate)`, crossing
 /// `LIVENESS_TIMEOUT` at about **28 MiB of registry, ~300 000 identities** at 48-character names rather
 /// than the 40 MB the arithmetic alone suggests — so treat the arithmetic as ~40 % optimistic. That
@@ -150,11 +159,38 @@ fn burst_allowance(bytes: usize) -> Duration {
 /// to it.
 const MAX_IDENTITIES_PER_FRAME: usize = 256;
 
+/// Total control-plane write time one maintenance tick may spend, across every peer and every burst.
+///
+/// Sized against `LIVENESS_TIMEOUT`: the tick *is* the heartbeat, so this plus the dial budget plus the
+/// rest of the tick has to leave the node inside its peers' live sets. It is deliberately a bound on the
+/// aggregate rather than a per-peer number, because per-peer numbers are what summed past the timeout.
+///
+/// A burst that runs out of budget is not lost work: the peers already written have it, the merge is
+/// idempotent and order-free, and the next tick re-arms the budget. A peer that has *not* been written to
+/// still gets its write attempted — `write_all_by` always tries once before consulting a deadline — so a
+/// healthy peer costs one syscall and keeps its link even when the budget is spent.
+pub(crate) const TICK_WRITE_BUDGET: Duration = Duration::from_millis(2500);
+
 /// Rough encoded size of one `PeerHint`, and of one membership entry in the join-time directory. Used only
 /// to size an allowance — an estimate is acceptable *here*, unlike for a registry burst, because the floor
 /// absorbs it until thousands are pending at once; a registry burst is sized exactly
 /// (`identities_encoded_len`) because there the error scales with the payload.
 const HINT_ENCODED_BYTES: usize = 160;
+
+/// The couplings between these constants, as build errors rather than prose. The slice has to be well
+/// under the stall limit — it is how the write loop learns that nothing moved, so a slice at or above it
+/// makes one blocked syscall indistinguishable from a wedged peer — and under the smallest allowance, or
+/// that allowance cannot be honoured at all (it was 100 ms against a 50 ms budget, and the 50 ms bound
+/// measured at 104 ms).
+const _: () = assert!(
+    PEER_WRITE_SLICE.as_millis() * 2 <= xchannel_net_core::transport::STALL_LIMIT.as_millis(),
+    "PEER_WRITE_SLICE must be well under transport::STALL_LIMIT, or a single blocked syscall is \
+     indistinguishable from a peer that is accepting nothing"
+);
+const _: () = assert!(
+    PEER_WRITE_SLICE.as_millis() < PEER_SMALL_FRAME_BUDGET.as_millis(),
+    "PEER_WRITE_SLICE must be under the smallest allowance, or that allowance cannot be honoured"
+);
 
 /// Cap on remembered addresses claiming our own id. A genuine duplicate is one or two; the bound is
 /// there because the source is unauthenticated gossip.
@@ -209,6 +245,17 @@ pub struct BroadcastDissemination {
     next_peer_id: PeerId,
     hints: Hints,
     link_peers: LinkPeers,
+    /// What is left of this tick's **total** control-plane write time, across every peer and every burst.
+    ///
+    /// Per-peer allowances fixed the attribution — one slow peer no longer evicts the others — and created
+    /// a new global term by doing it: `send_except` is serial, so P peers each spending their own budget
+    /// sum, and a tick issues a heartbeat, a hint flood, and up to one relay and one reply per source link.
+    /// Measured: 32 peers accepting nothing held the dissemination lock for 10.10 s against a
+    /// `LIVENESS_TIMEOUT` of 10 s, and ~31.6 s at the ≤100-node target — so the node was declared dead by
+    /// the healthy majority while alive and serving. This is the ceiling that makes the family of bounds
+    /// finally close: a peer's allowance is the *smaller* of what its payload earns and what the tick has
+    /// left.
+    tick_write_left: Duration,
     /// `NodeId`s seen on two machines, as detected by the reader threads.
     conflicts: Conflicts,
     /// Addresses where a third party has reported *our* id — the twin dial candidates.
@@ -232,6 +279,7 @@ impl BroadcastDissemination {
             next_peer_id: NO_PEER + 1,
             hints: Arc::new(Mutex::new(VecDeque::new())),
             link_peers: Arc::new(Mutex::new(HashMap::new())),
+            tick_write_left: TICK_WRITE_BUDGET,
             conflicts: Arc::new(Mutex::new(HashSet::new())),
             same_id_addrs: Arc::new(Mutex::new(HashSet::new())),
             inbox: Arc::new(Mutex::new(VecDeque::new())),
@@ -362,7 +410,8 @@ impl BroadcastDissemination {
         // rather than drawing on a per-peer budget. Sized the same way.
         let deadline = Instant::now()
             + burst_allowance(
-                identities_encoded_len(initial_sync) + self.membership.lock_safe().len() * 160,
+                identities_encoded_len(initial_sync)
+                    + self.membership.lock_safe().len() * HINT_ENCODED_BYTES,
             );
         // Chunked, because anti-entropy carries the entire registry and one frame of it was measured at
         // 10.6 MB taking 6.1 s to write to a stalled peer. The receiver merges each frame independently
@@ -645,9 +694,18 @@ impl BroadcastDissemination {
         self.send_except(NO_PEER, frame);
     }
 
-    /// Give every peer its own allowance for the burst about to be written. Called once per burst,
-    /// before the frames — so a peer's budget spans its own chunks and nobody else's.
+    /// Re-arm this tick's total write budget. Called once per maintenance tick, before any of its bursts.
+    pub fn begin_tick(&mut self) {
+        self.tick_write_left = TICK_WRITE_BUDGET;
+    }
+
+    /// Give every peer its own allowance for the burst about to be written. Called once per burst, before
+    /// the frames — so a peer's budget spans its own chunks and nobody else's.
+    ///
+    /// Clamped by what the tick has left, which is what stops P per-peer budgets from summing past
+    /// `LIVENESS_TIMEOUT`.
     fn begin_burst(&mut self, allowance: Duration) {
+        let allowance = allowance.min(self.tick_write_left);
         for p in &mut self.peers {
             p.burst_left = allowance;
         }
@@ -655,14 +713,20 @@ impl BroadcastDissemination {
 
     /// Broadcast to every peer except `from`; drops peers whose send fails (disconnected).
     fn send_except(&mut self, from: PeerId, frame: &[u8]) {
+        // Borrowed out so the closure can charge both budgets; `retain_mut` holds `self.peers`.
+        let tick_left = &mut self.tick_write_left;
         self.peers.retain_mut(|p| {
             if p.id == from {
                 return true;
             }
             // Each peer against its own remaining allowance, and charged only for its own time.
             let started = Instant::now();
-            let sent = p.conn.send_frame_by(frame, started + p.burst_left);
-            p.burst_left = p.burst_left.saturating_sub(started.elapsed());
+            let sent = p
+                .conn
+                .send_frame_by(frame, started + p.burst_left.min(*tick_left));
+            let spent = started.elapsed();
+            p.burst_left = p.burst_left.saturating_sub(spent);
+            *tick_left = tick_left.saturating_sub(spent);
             match sent {
                 Ok(()) => true,
                 Err(_) => {
@@ -708,8 +772,12 @@ impl Dissemination for BroadcastDissemination {
                 return Ok(()); // already reaped, by an earlier batch or another send
             };
             let started = Instant::now();
-            let sent = p.conn.send_frame_by(&frame, started + p.burst_left);
-            p.burst_left = p.burst_left.saturating_sub(started.elapsed());
+            let sent = p
+                .conn
+                .send_frame_by(&frame, started + p.burst_left.min(self.tick_write_left));
+            let spent = started.elapsed();
+            p.burst_left = p.burst_left.saturating_sub(spent);
+            self.tick_write_left = self.tick_write_left.saturating_sub(spent);
             if sent.is_err() {
                 let _ = p.conn.shutdown();
                 self.peers.retain(|p| p.id != to);
@@ -945,6 +1013,83 @@ mod tests {
         assert!(
             big > burst_allowance(1 << 20),
             "the allowance must scale with the payload, or it is a registry-size limit in disguise"
+        );
+    }
+
+    /// **P per-peer budgets must not sum past the liveness timeout.** Fixing the attribution of a stall —
+    /// so one slow peer stops evicting the others — created a global term by doing it: writes are serial,
+    /// so every peer spending its own allowance adds up. Measured at 0.316 s per wedged peer, which crosses
+    /// a 10 s `LIVENESS_TIMEOUT` at 32 peers and reaches ~31.6 s at the ≤100-node target, declaring a live
+    /// node dead to its healthy majority.
+    ///
+    /// Also asserts the other half, which is what makes the ceiling safe to have: a peer the budget never
+    /// reached still gets its write *attempted*, so a healthy peer keeps its link even when the tick's
+    /// budget is spent.
+    #[test]
+    fn per_peer_budgets_cannot_sum_past_the_tick_budget() {
+        let mut d = BroadcastDissemination::new(
+            NodeId(1),
+            "127.0.0.1:9601".parse().unwrap(),
+            Duration::from_secs(60),
+        );
+        d.begin_tick();
+
+        // Six peers that accept nothing, then one that drains eagerly — the healthy peer last, so it is
+        // the one the exhausted budget would reach.
+        let mut held = Vec::new();
+        for i in 0..7 {
+            let mut l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap();
+            let accept = std::thread::spawn(move || l.accept().unwrap());
+            let conn = TcpTransport::connect(a).unwrap();
+            let far = accept.join().unwrap();
+            if i == 6 {
+                std::thread::spawn(move || {
+                    let mut c = far.into_stream();
+                    let mut sink = [0u8; 1 << 16];
+                    while std::io::Read::read(&mut c, &mut sink).unwrap_or(0) > 0 {}
+                });
+            } else {
+                held.push(far); // accepted, never read
+            }
+            let (local, peer) = conn.endpoints().unwrap();
+            let id = d.next_peer_id;
+            d.next_peer_id += 1;
+            conn.set_write_timeout(Some(PEER_WRITE_SLICE)).unwrap();
+            d.peers.push(Peer {
+                id,
+                conn,
+                key: link_key(local, peer),
+                outbound: false,
+                burst_left: Duration::ZERO,
+            });
+        }
+
+        // Enough bytes that every peer's socket buffers fill, so the ones accepting nothing actually
+        // stall rather than being absorbed. Below a few MiB per peer the buffers hide the whole effect.
+        let delta: Vec<ChannelIdentity> =
+            (0..200_000).map(|i| ident(&format!("c.{i}"), 1)).collect();
+
+        // A deliberately small ceiling, so the assertion is about the ceiling rather than about how many
+        // peers happen to fit inside the production one.
+        let ceiling = Duration::from_millis(400);
+        d.tick_write_left = ceiling;
+
+        let started = Instant::now();
+        d.announce(&delta).unwrap();
+        let took = started.elapsed();
+
+        // Without a ceiling this is six independent stalls — ~0.32 s each, measured — plus the healthy
+        // peer's write. With one, the whole burst is bounded by what the tick had left.
+        assert!(
+            took < ceiling * 4,
+            "a burst across seven peers took {took:?} against a {ceiling:?} ceiling — per-peer \
+             allowances are summing without one"
+        );
+        assert!(
+            d.peer_count() >= 1,
+            "the peer that drains must keep its link: a budget spent on other peers must not evict it, \
+             which is why the first write is always attempted before any deadline is consulted"
         );
     }
 
