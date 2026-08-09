@@ -46,9 +46,26 @@ pub fn install() {
     }
 }
 
+/// Set when the daemon asks to stop **because its state needs a fresh start** — today, because it
+/// discovered another node using its generated id and stepped aside. Exiting non-zero is what makes
+/// a supervisor bring it back, which is where the fresh id comes from.
+static RESTART_WANTED: AtomicBool = AtomicBool::new(false);
+
 /// Whether a shutdown has been requested.
 pub fn requested() -> bool {
     REQUESTED.load(Ordering::Relaxed)
+}
+
+/// Ask the daemon to stop and be restarted. Goes through the same path as a signal, so the departure
+/// is still announced to peers; only the exit status differs.
+pub fn request_restart() {
+    RESTART_WANTED.store(true, Ordering::Relaxed);
+    REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Whether the stop was to get a restart rather than to go away.
+pub fn restart_wanted() -> bool {
+    RESTART_WANTED.load(Ordering::Relaxed)
 }
 
 /// Block until a shutdown is requested, polling at `interval`.
@@ -73,6 +90,7 @@ mod tests {
         assert!(!requested(), "nothing has asked us to stop");
         on_signal(SIGTERM);
         assert!(requested());
+        assert!(!restart_wanted(), "a signal is not a restart request");
         // Leave it clear for any other test in this binary.
         REQUESTED.store(false, Ordering::Relaxed);
     }

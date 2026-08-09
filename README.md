@@ -19,8 +19,10 @@ its own writer's path, and killing it loses nothing.
 
 ## Status
 
-**Experimental, pre-1.0** (`0.2.0`); the wire protocol and on-disk layout change between
-releases, without migrators. 0.2.0 does not read a 0.1.0 data directory.
+**Experimental, pre-1.0**; the wire protocol, the on-disk layout and the control protocol change
+between releases, without migrators. Treat an upgrade as a fresh start for the whole mesh: a
+mixed-version cluster does not gossip, and a data directory written by an earlier release is not
+carried forward. `CHANGELOG.md` names what breaks in each release.
 
 **Platform: Unix only.** The client plane is a permission-gated Unix domain socket and the
 data directory relies on Unix mode bits (`0700`/`0600`), so the daemon does not build on

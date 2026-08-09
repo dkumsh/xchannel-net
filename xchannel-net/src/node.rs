@@ -289,6 +289,21 @@ impl MuxIdle {
     }
 }
 
+/// What discovering a duplicate `NodeId` calls for.
+///
+/// Returned rather than acted on inside, so the decision is testable without touching the
+/// process-global shutdown flags — and so a library function does not reach out and stop the
+/// process on its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OnDuplicateIdentity {
+    /// Warned; there is nothing safe this node can do about it.
+    Continue,
+    /// This node discarded its **generated** id and should be restarted to take a fresh one. Safe
+    /// only because it owns no channels: changing the id of a node that owns some would leave them
+    /// registered to an owner that never returns.
+    StepAside,
+}
+
 /// What [`Node::reconstruct_from_disk`] rebuilt from the data dir at startup.
 ///
 /// `skipped` counts channels found on disk that could not be re-hosted — a channel whose name is
@@ -1443,7 +1458,7 @@ impl Node {
     /// The case this actually rescues is a golden image snapshotted after the daemon's first start
     /// — every clone carries the same `.node_id` and owns nothing, so every clone but one steps
     /// aside on its own.
-    fn report_duplicate_identity(&self, conflicts: &[NodeId]) {
+    fn report_duplicate_identity(&self, conflicts: &[NodeId]) -> OnDuplicateIdentity {
         for node in conflicts {
             eprintln!(
                 "xchanneld[{}]: WARNING: two peers claim NodeId {} at different control \
@@ -1453,7 +1468,8 @@ impl Node {
             );
         }
         if !conflicts.contains(&self.config.node_id) {
-            return; // someone else's collision; nothing safe for us to do about it
+            // Someone else's collision; nothing safe for us to do about it.
+            return OnDuplicateIdentity::Continue;
         }
         if !self.config.id_generated {
             eprintln!(
@@ -1461,7 +1477,7 @@ impl Node {
                  will not change it — resolve the duplicate and restart.",
                 self.config.node_id.0
             );
-            return;
+            return OnDuplicateIdentity::Continue;
         }
         if !self.hosted.lock_safe().is_empty() {
             eprintln!(
@@ -1469,15 +1485,32 @@ impl Node {
                  orphan them — resolve the duplicate manually.",
                 self.config.node_id.0
             );
-            return;
+            return OnDuplicateIdentity::Continue;
         }
         match crate::node_identity::discard(&self.config.data_dir) {
-            Ok(()) => eprintln!(
-                "xchanneld[{}]: it owns nothing yet, so its generated id has been discarded; \
-                 restart to take a fresh one.",
-                self.config.node_id.0
-            ),
-            Err(e) => eprintln!("xchanneld: could not discard the node id: {e}"),
+            Ok(()) => {
+                // Stepping aside has to be more than deleting a file: the id is already in this
+                // process, so carrying on would keep the duplicate live indefinitely and the only
+                // thing that had changed would be that the file was gone too. Stop, and exit
+                // non-zero so a supervisor brings us back — that restart is where the fresh id
+                // comes from. Safe precisely because we own nothing.
+                eprintln!(
+                    "xchanneld[{}]: it owns nothing yet, so its generated id has been discarded \
+                     and it is stopping; restarting takes a fresh one.",
+                    self.config.node_id.0
+                );
+                OnDuplicateIdentity::StepAside
+            }
+            // Only step aside if the id was actually discarded. Exiting on a failed discard would
+            // come back to the same duplicate and exit again — a restart loop, not a repair.
+            Err(e) => {
+                eprintln!(
+                    "xchanneld[{}]: could not discard the duplicate node id ({e}) — continuing \
+                     with it; resolve this manually.",
+                    self.config.node_id.0
+                );
+                OnDuplicateIdentity::Continue
+            }
         }
     }
 
@@ -1560,7 +1593,10 @@ impl Node {
                 let conflicts = d.dedup_links();
                 if !conflicts.is_empty() {
                     drop(d);
-                    self.report_duplicate_identity(&conflicts);
+                    if self.report_duplicate_identity(&conflicts) == OnDuplicateIdentity::StepAside
+                    {
+                        crate::shutdown::request_restart();
+                    }
                     self.dissemination.lock_safe().pump()?
                 } else {
                     d.pump()?
@@ -2695,6 +2731,85 @@ mod tests {
                 "the surviving link must not be dropped by a later dedup pass"
             );
         }
+    }
+
+    /// Discovering that another machine shares our **generated** id must actually make this node
+    /// step aside — not merely delete the id file and carry on with the duplicate still live.
+    ///
+    /// Deleting the file alone would be the worst of both: the id is already in this process, so
+    /// nothing about the collision changes, and now the record of it is gone too. The rescue this
+    /// exists for is a golden image snapshotted after first start, where every clone shares one id
+    /// and owns nothing; if the clones do not actually stop, none of them ever takes a fresh id.
+    #[test]
+    fn a_duplicate_generated_id_makes_an_empty_node_step_aside() {
+        let dir = temp_dir("dup-step-aside");
+        let node = Node::new(NodeConfig {
+            id_generated: true,
+            ..config(4242, dir.clone())
+        });
+        // Pretend the id came from `.node_id`, as a generated one does.
+        std::fs::write(crate::node_identity::id_path(&dir), "id=4242\n").unwrap();
+
+        assert_eq!(
+            node.report_duplicate_identity(&[NodeId(4242)]),
+            OnDuplicateIdentity::StepAside,
+            "it owns nothing, so it must stand down rather than keep the duplicate live"
+        );
+        assert!(
+            !crate::node_identity::is_persisted(&dir),
+            "and the id must actually be discarded, or the restart changes nothing"
+        );
+    }
+
+    /// Once a node owns a channel its id is referenced by that channel's registry entry, so
+    /// changing it would leave the channel owned by an id that never comes back — frozen until an
+    /// operator reclaims the name. Past that point the only safe action is to complain.
+    #[test]
+    fn a_duplicate_id_is_only_warned_about_once_the_node_owns_something() {
+        let dir = temp_dir("dup-owns");
+        let node = Node::new(NodeConfig {
+            id_generated: true,
+            ..config(4243, dir.clone())
+        });
+        std::fs::write(crate::node_identity::id_path(&dir), "id=4243\n").unwrap();
+        drop(node.host_channel("md.aapl", 1 << 20, 0, |x| x).unwrap());
+
+        assert_eq!(
+            node.report_duplicate_identity(&[NodeId(4243)]),
+            OnDuplicateIdentity::Continue
+        );
+        assert!(
+            crate::node_identity::is_persisted(&dir),
+            "a node that owns channels must keep its id"
+        );
+    }
+
+    /// An operator-set id is not ours to discard, and someone else's collision is not ours to act
+    /// on at all.
+    #[test]
+    fn a_configured_id_and_a_third_partys_collision_are_only_warned_about() {
+        let dir = temp_dir("dup-configured");
+        let configured = Node::new(NodeConfig {
+            id_generated: false,
+            ..config(4244, dir.clone())
+        });
+        std::fs::write(crate::node_identity::id_path(&dir), "id=4244\n").unwrap();
+        assert_eq!(
+            configured.report_duplicate_identity(&[NodeId(4244)]),
+            OnDuplicateIdentity::Continue,
+            "an explicitly configured id is the operator's to fix"
+        );
+        assert!(crate::node_identity::is_persisted(&dir));
+
+        let other = Node::new(NodeConfig {
+            id_generated: true,
+            ..config(4245, temp_dir("dup-other"))
+        });
+        assert_eq!(
+            other.report_duplicate_identity(&[NodeId(9999)]),
+            OnDuplicateIdentity::Continue,
+            "two other nodes colliding is not this node's problem to solve"
+        );
     }
 
     /// A clean shutdown makes a peer drop the departing node from its live set **at once**,

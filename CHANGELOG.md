@@ -6,6 +6,21 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 
 ## Unreleased
 
+### Added
+- **Graceful shutdown on `SIGTERM`/`SIGINT`.** The daemon exits of its own accord, tells its peers it
+  is leaving (a new `ControlMsg::Leaving`) so they mark it not-live immediately instead of waiting
+  out the ten-second liveness timeout, and removes its client socket. Hand-rolled against `signal(2)`
+  rather than adding a `libc` dependency, and covered end to end by a test that sends a real
+  `SIGTERM` and requires a successful exit — "did the signal reach a handler" is not something a
+  unit test on the flag can answer.
+
+  Explicitly **courtesy, not safety**: it exists for promptness and has nothing to unwind. A hard
+  kill was already safe and remains so. That property is now stated in the READMEs, where it belongs
+  — it is unusual enough to be worth advertising: the daemon is never in a writer's path, committed
+  records are durable in their mmap, merge cursors and resume positions are recomputed from the logs
+  rather than saved, and a restart reconstructs rather than restores. The cross-process tests
+  `SIGKILL` a running daemon and assert contiguous resume.
+
 ### Changed
 - **The default data directory is now `$HOME/.xchannel-net`, not `/tmp/xchanneld`** (breaking, for
   the daemon *and* the client). The old default was wrong in ways that got worse as durability work
@@ -35,21 +50,10 @@ experimental: the wire protocol and on-disk layout may change without notice (se
   Running several nodes on one host still means giving each its own `XCHANNELD_DATA_DIR`; the default
   is deliberately one flat per-user directory, since one daemon per user is the case that should need
   no configuration at all.
-
-### Added
-- **Graceful shutdown on `SIGTERM`/`SIGINT`.** The daemon exits of its own accord, tells its peers it
-  is leaving (a new `ControlMsg::Leaving`) so they mark it not-live immediately instead of waiting
-  out the ten-second liveness timeout, and removes its client socket. Hand-rolled against `signal(2)`
-  rather than adding a `libc` dependency, and covered end to end by a test that sends a real
-  `SIGTERM` and requires a successful exit — "did the signal reach a handler" is not something a
-  unit test on the flag can answer.
-
-  Explicitly **courtesy, not safety**: it exists for promptness and has nothing to unwind. A hard
-  kill was already safe and remains so. That property is now stated in the READMEs, where it belongs
-  — it is unusual enough to be worth advertising: the daemon is never in a writer's path, committed
-  records are durable in their mmap, merge cursors and resume positions are recomputed from the logs
-  rather than saved, and a restart reconstructs rather than restores. The cross-process tests
-  `SIGKILL` a running daemon and assert contiguous resume.
+- **Wire (breaking):** `ControlMsg::Heartbeat` gains `control_addr`, and `ControlMsg::PeerHint` is
+  new. A 0.2.x daemon and a newer one cannot share a control plane.
+- `Dissemination::pump` returns each identity with the peer link it arrived on, and gains
+  `relay`, so an implementation can forward without echoing the source.
 
 ### Fixed
 - **`XCHANNELD_CLIENT_PATH` outside the data dir killed startup.** Binding the client plane chmod'ed
@@ -144,12 +148,6 @@ experimental: the wire protocol and on-disk layout may change without notice (se
   converge** — the new link delivers the registry as join-time anti-entropy anyway. Relay covers
   the window before the mesh closes and any pair that never manages to link. The tests say so
   rather than implying otherwise.
-
-### Changed
-- **Wire (breaking):** `ControlMsg::Heartbeat` gains `control_addr`, and `ControlMsg::PeerHint` is
-  new. A 0.2.x daemon and a newer one cannot share a control plane.
-- `Dissemination::pump` returns each identity with the peer link it arrived on, and gains
-  `relay`, so an implementation can forward without echoing the source.
 
 ## 0.2.1 (2026-08-09)
 

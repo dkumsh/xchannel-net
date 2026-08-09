@@ -263,6 +263,10 @@ fn main() -> std::io::Result<()> {
     xchannel_net::shutdown::wait(Duration::from_millis(100));
     eprintln!("xchanneld[{node_id}]: shutting down");
     node.shutdown();
+    if xchannel_net::shutdown::restart_wanted() {
+        // Non-zero so a supervisor restarts us: this stop exists *to be* restarted.
+        std::process::exit(3);
+    }
     Ok(())
 }
 
