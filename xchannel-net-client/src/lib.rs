@@ -11,6 +11,34 @@
 //! * [`Client::connect`] — an explicit socket path (run multiple daemons yourself and pick one);
 //! * [`Client::connect_or_spawn`] — the well-known default socket, auto-starting a daemon
 //!   if none is running (single-instance falls out of bind contention on the path).
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use xchannel_net_client::{Client, SubscribeMode};
+//! use xchannel_net_core::wire::ChannelOptions;
+//!
+//! let mut client = Client::connect_or_spawn()?;
+//!
+//! // Produce: the daemon registers the name, you get the channel's single Writer.
+//! let mut w = client.create_channel("md.aapl", &ChannelOptions::default())?;
+//! let buf = w.try_reserve(4)?;
+//! buf.copy_from_slice(b"tick");
+//! w.commit(0, 4, 0)?;
+//!
+//! // Consume: the daemon locates the owner and keeps a local replica synced; you read it.
+//! let mut r = client.subscribe(
+//!     "fills.prod.mm",
+//!     SubscribeMode::LateJoin,
+//!     Some(Duration::from_secs(5)),
+//! )?;
+//! while let Some(msg) = r.try_read()? {
+//!     let _ = msg.payload();
+//! }
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! `no_run` because it would start a daemon; it is still compiled, so the shape of this
+//! example — which the crate README repeats — cannot drift away from the API.
 
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};

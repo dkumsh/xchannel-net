@@ -4,6 +4,25 @@ All notable changes to xchannel-net are documented here. Versioning is pre-1.0 a
 experimental: the wire protocol and on-disk layout may change without notice (see
 `SECURITY.md`).
 
+## Unreleased
+
+### Added
+- **Per-crate READMEs**, and the workspace docs now ship *inside* each published crate. Until now
+  the tarballs were source only: `README`, `LICENSE`, `SECURITY.md`, `CHANGELOG.md` and `doc/` all
+  live at the workspace root, and cargo packages only what sits inside a crate's own directory — so
+  a crates.io page showed no description of the crate and a vendored copy carried none of the
+  reasoning. Each crate now symlinks the root documents into itself, which cargo dereferences when
+  packaging (verified: the archives contain regular files, no links), keeping one source of truth
+  rather than three drifting copies.
+- The client crate's usage example is a **compiled `no_run` doctest** on the crate root, so the
+  snippet its README shows cannot drift away from the API.
+
+### Fixed
+- **The root README was stale.** It linked to `DESIGN.md` at a path the file left when docs moved
+  to `doc/`, claimed `version = 0.0.1`, and listed restart-time reconstruction, registry tombstones
+  and collision-rejection notices as unimplemented — all three have shipped. It also never
+  mentioned topics.
+
 ## 0.2.0 (2026-08-09)
 
 **The data plane became a duty cycle** (`doc/TOPICS.md` §4.1): one loop polls replication sources,
