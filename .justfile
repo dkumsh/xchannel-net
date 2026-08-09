@@ -11,7 +11,7 @@ init:
 check:
     cargo check
     cargo fmt --all -- --check
-    cargo clippy --all-targets --all-features
+    cargo clippy --all-targets --all-features -- -D warnings
 
 # list every place a lock guard outlives its own statement, for review
 #

@@ -143,14 +143,6 @@ const _: () = assert!(
 /// measurement of that work — a floor under what is left for it.
 const TICK_RESERVE: Duration = Duration::from_secs(3);
 
-/// Member resolves attempted per tick by `attach_pending_members`.
-///
-/// Each unattached remote member costs a `RESOLVE_TIMEOUT`, and the count was unbounded: fifty
-/// unattached members made a tick 10.5 s, which is a node declared dead by every peer and its live
-/// members' names then tombstoned by the reaper. Attachment is idempotent and retried every tick, so
-/// capping it delays attachment rather than losing it.
-const MAX_ATTACH_RESOLVES_PER_TICK: usize = 4;
-
 /// First retry gap after a failed dial, doubling to [`DIAL_BACKOFF_MAX`].
 ///
 /// Backoff is per *address* rather than per node, because the failing case is an address with no
@@ -450,13 +442,17 @@ pub struct TopicStatus {
 /// |---|---|
 /// | `if <guard-expr> { }` / `while <guard-expr> { }` | no |
 /// | `a && <guard-expr>` / `<guard-expr> && b` | no |
-/// | `let P = <guard-expr> else { };` | no |
+/// | `let P = <guard-expr> else { };` | **no** in the else block — dropped *before* it — and no after |
 /// | `if let P = <guard-expr> { }` | **yes**, in the then-block |
 /// | `match <guard-expr> { }` | **yes**, in every arm |
 /// | `f(<guard-expr>, g())` | **yes**, for the whole call |
 /// | `for p in <guard-expr> { }` | **yes**, for the whole loop |
 /// | `while let P = <guard-expr> { }` | **yes**, in the body |
 /// | `let g = <guard-expr>;` | **yes**, to the end of the block |
+///
+/// `let … else` is worth its own row rather than being lumped with `if let`, because its temporaries
+/// drop *before* the else block runs while `if let`'s survive the then-block: the two forms that look
+/// most alike behave oppositely.
 ///
 /// The last row is the one that bites hardest, because it looks like the fix for the fourth:
 ///
@@ -474,6 +470,10 @@ pub struct TopicStatus {
 /// `self_control → {conflicts, same_id_addrs}`), exercised by reader threads that hold no
 /// `dissemination` guard at all. It is acyclic, and "no reader takes `connected` under `membership`"
 /// is load-bearing there.
+/// Subscriptions the duty cycle services, by name, held weakly so that dropping the handle is enough
+/// to stop servicing one.
+type Conducted = Arc<Mutex<Vec<(String, Weak<SubShared>)>>>;
+
 #[derive(Clone)]
 pub struct Node {
     config: Arc<NodeConfig>,
@@ -505,9 +505,6 @@ pub struct Node {
     dial_cursor_learned: Arc<Mutex<usize>>,
     /// Walk position over addresses claiming this node's own id (the twin candidates).
     dial_cursor_twins: Arc<Mutex<usize>>,
-    /// Walk position over a topic's members, so a per-tick resolve cap cannot starve the tail of a
-    /// deterministically-ordered member list.
-    attach_cursor: Arc<Mutex<usize>>,
     /// Channels this node hosts (is the origin for): name → where + geometry to serve.
     hosted: Arc<Mutex<HashMap<String, ChannelSource>>>,
     /// Network-wide channel directory (CRDT), converged via dissemination.
@@ -550,7 +547,7 @@ pub struct Node {
     /// because the healing lived in its own thread. Keying the conductor off the map instead would
     /// have quietly made self-healing conditional on registration. Weak so that dropping the
     /// handle is enough to stop servicing it, with no deregistration step to forget.
-    conducted: Arc<Mutex<Vec<(String, Weak<SubShared>)>>>,
+    conducted: Conducted,
 }
 
 impl Node {
@@ -578,7 +575,6 @@ impl Node {
             dial_cursor_seeds: Arc::new(Mutex::new(0)),
             dial_cursor_learned: Arc::new(Mutex::new(0)),
             dial_cursor_twins: Arc::new(Mutex::new(0)),
-            attach_cursor: Arc::new(Mutex::new(0)),
             config: Arc::new(config),
         }
     }
@@ -917,24 +913,16 @@ impl Node {
     /// a member whose replica isn't ready yet is retried on the next call. Runs on the
     /// maintenance loop, so it reacts as `member_of` registrations gossip in.
     pub fn attach_pending_members(&self) {
-        // **Bounded per tick.** Each remote member that is not yet replicating costs a
-        // `RESOLVE_TIMEOUT`, and this runs on the heartbeat loop: fifty of them made a tick 10.5 s,
-        // which is long enough for every peer to declare this node dead and for their topic reapers to
-        // tombstone its live members' names. Attachment is idempotent and retried every tick, so a cap
-        // delays it rather than losing it — and the members that are already replicating, which is the
-        // steady state, cost nothing here and are not counted against it.
-        let mut resolves = 0usize;
+        // The live set once, not once per member: this used to take the dissemination lock for every
+        // member of every topic on every tick — ten thousand acquisitions for a ten-thousand-member
+        // topic, to answer a question that does not change during the pass.
+        let live_nodes: HashSet<NodeId> = self
+            .dissemination
+            .lock_safe()
+            .live_members()
+            .into_iter()
+            .collect();
         for (topic, mux) in self.mux_handles() {
-            // Rotate the starting point, for the same reason `dial_some` does: a cap over a walk in a
-            // deterministic order (the registry is a `BTreeMap`) starves whatever sorts last. The
-            // liveness skip above removes the population that used to fill the budget, so this is
-            // belt-and-braces — but a cap without rotation is a starvation machine, and that lesson
-            // has now been learned twice in this file.
-            let rotate = {
-                let mut c = self.attach_cursor.lock_safe();
-                *c = c.wrapping_add(1);
-                *c
-            };
             // Members the registry says belong to this topic right now (live, non-tombstoned).
             let live: Vec<ChannelIdentity> = {
                 let reg = self.registry.lock_safe();
@@ -944,38 +932,31 @@ impl Node {
                     .collect()
             };
 
-            for i in 0..live.len() {
-                let m = &live[(rotate + i) % live.len()];
+            for m in &live {
                 let remote = m.owner != self.config.node_id;
-                let owner_live = !remote
-                    || self
-                        .dissemination
-                        .lock_safe()
-                        .live_addr_of(m.owner)
-                        .is_some();
                 // Keep a **remote** member's replica fresh whether or not it's attached yet.
                 // This is essential after a restart: reconstruct may re-attach a member from a
                 // *stale* replica, so we must (re)start its subscription to resume its stream —
                 // idempotent, a no-op if already replicating.
-                // **Never spend a resolve on an owner we already know we cannot reach.** This is the
-                // whole starvation fix: such a member can never be resolved, so it consumed a budget
-                // slot on every tick for ever — and because the walk is over a `BTreeMap`, the same
-                // few names took every slot in the same order each time, and every member behind them
-                // was never attempted at all. Three separate reproductions: four dead-owner members
+                // **Never spend a resolve on an owner we already know we cannot reach.** Such a member
+                // can never resolve, and it used to be attempted on every tick for ever — which was
+                // survivable until a per-tick cap was added, at which point the same few names (registry
+                // order is `BTreeMap` order) took every slot in the same order and every member behind
+                // them was never attempted at all. Three separate reproductions: eight dead-owner members
                 // sorting early by name stopped a hosted topic from ever merging *any* of its live
-                // members, silently, where the previous release attached them slowly.
+                // members, silently.
                 //
-                // The owner's liveness is already known here for free, so the members that used to
-                // starve the queue now cost nothing and leave it.
-                if remote && !owner_live {
-                    continue;
-                }
-                if remote && resolves < MAX_ATTACH_RESOLVES_PER_TICK {
-                    // Only a member that is *not* already replicating can block, and only that case is
-                    // charged: `ensure_member_subscription` returns immediately for a live one.
-                    if !self.is_replicating(&m.name) {
-                        resolves += 1;
-                    }
+                // With this gate the cap became unnecessary rather than merely sufficient: a charged
+                // resolve is now one whose owner is live, which `resolve` satisfies on its first
+                // iteration, and the connect runs on a thread of its own. Measured at ~1 µs per skipped
+                // member — five thousand of them cost a tick 5 ms — where the cap needed forty-eight
+                // ticks to attach two hundred members. So the cap, its counter and its rotation cursor
+                // are gone; deleting a mechanism beats testing one.
+                //
+                // The gate covers the *subscription* only. Attaching from a replica already on disk
+                // needs no reachable owner, and skipping that too meant a member whose owner had merely
+                // gone quiet was left unattached even with a complete local replica.
+                if remote && live_nodes.contains(&m.owner) {
                     self.ensure_member_subscription(&m.name);
                 }
 
@@ -1080,16 +1061,6 @@ impl Node {
     /// Ensure a self-healing subscription is replicating remote member `name` locally, so its
     /// replica can feed the mux. Reuses the subscription map (idempotent); a short resolve
     /// timeout keeps the maintenance loop responsive if the owner isn't reachable yet.
-    /// Whether a live subscription for `name` already exists, so the caller can tell a free call to
-    /// [`ensure_member_subscription`](Self::ensure_member_subscription) from one that may block on a
-    /// resolve.
-    fn is_replicating(&self, name: &str) -> bool {
-        self.subscriptions
-            .lock_safe()
-            .get(name)
-            .is_some_and(|s| s.is_active())
-    }
-
     fn ensure_member_subscription(&self, name: &str) {
         let live = self
             .subscriptions
@@ -1099,7 +1070,10 @@ impl Node {
         if live {
             return;
         }
-        if let Ok(sub) = self.subscribe(name, Some(Duration::from_millis(200))) {
+        // Zero, not a short wait: this is only reached for a member whose owner is already a live
+        // member, so `resolve` succeeds on its first pass. A timeout here could only ever be *spent*,
+        // never useful — and spending it on the heartbeat's thread is what made a cap seem necessary.
+        if let Ok(sub) = self.subscribe(name, Some(Duration::ZERO)) {
             self.subscriptions.lock_safe().insert(name.to_string(), sub);
         }
     }
@@ -1871,9 +1845,13 @@ impl Node {
     /// so the next tick found it unlinked, un-penalised, and due, and spent a dial on it again. Two
     /// such addresses starved every live peer behind them permanently.
     ///
-    /// A dial that completes its whole join resets the gap to the floor; one that fails — including an
-    /// address that accepts the connection and then drops the link — keeps its escalation. There is no
-    /// refund keyed on having *once* worked; [`dial_due`](Self::dial_due) explains why that was removed.
+    /// **No outcome-based reset either.** Resetting the gap when the join returned `Ok` looked like the
+    /// principled version of this and is not: a write returning `Ok` means the bytes reached a socket
+    /// buffer, not that a peer took them. Measured — a far end that accepts, *reads* the join, and hangs
+    /// up returns `Ok` every time, so exactly the two cases this comment used to cite (a peer on an
+    /// incompatible release, a seed naming a stream port) were pinned at the one-second floor for ever,
+    /// each cycle costing a full registry-snapshot clone and a whole-registry write under the
+    /// dissemination lock. The escalate-and-decay rule below needs no notion of success at all.
     fn dial_peer(&self, addr: SocketAddr) {
         {
             let now = Instant::now();
@@ -1898,29 +1876,10 @@ impl Node {
                 },
             );
         }
-        let joined = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT).and_then(|conn| {
+        if let Ok(conn) = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT) {
             let mut d = self.dissemination.lock_safe();
             let snapshot = self.registry_snapshot();
-            d.add_outbound_peer(conn, addr, &snapshot)
-        });
-        // **Reset on a link that actually formed.** The escalation above keys on the interval between
-        // *attempts*, which cannot tell a dial that failed from one that succeeded and served — so a
-        // link repeatedly established and repeatedly closed by the far end ratcheted to the ceiling
-        // although nothing about it was flapping, and `DESIGN.md` claimed the escalation keyed on
-        // outcome when it did not. Success here means the whole join completed, not merely that
-        // `connect` returned: an address that accepts and then drops the link fails the join, keeps its
-        // escalation, and so is still held off — which is the property the charge-every-attempt rule
-        // was introduced to get.
-        if joined.is_ok() {
-            let now = Instant::now();
-            self.dial_backoff.lock_safe().insert(
-                addr,
-                DialPenalty {
-                    attempted_at: now,
-                    next: now + DIAL_BACKOFF_MIN,
-                    gap: DIAL_BACKOFF_MIN,
-                },
-            );
+            let _ = d.add_outbound_peer(conn, addr, &snapshot);
         }
     }
 
@@ -4263,11 +4222,18 @@ mod tests {
             .then_some(())
         });
 
-        // A live owner is refused however long the configured floor is — B's `reclaim_after`
-        // is zero, so only the liveness check can be stopping this.
-        let err = b.force_deregister("md.aapl").unwrap_err();
+        // A live owner is refused however long the configured floor is — B's `reclaim_after` is zero,
+        // so only the liveness check can be stopping this.
+        //
+        // Retried rather than asserted once: liveness is a ten-second window with no clock control here,
+        // so on a loaded machine this thread can be descheduled long enough for A to fall out of it
+        // between the poll above and the call below, and the refusal then cites silence instead. A
+        // retries because A is still heartbeating, so the window reopens.
+        let err = poll_until(|| {
+            let err = b.force_deregister("md.aapl").unwrap_err();
+            err.to_string().contains("live member").then_some(err)
+        });
         assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
-        assert!(err.to_string().contains("live member"), "{err}");
 
         // The owner must use the ordinary owner-only path for its own channels.
         let err = a.force_deregister("md.aapl").unwrap_err();

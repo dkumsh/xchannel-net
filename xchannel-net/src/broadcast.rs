@@ -74,9 +74,11 @@ fn link_key(local: SocketAddr, peer: SocketAddr) -> LinkKey {
     }
 }
 
-/// Per-syscall slice, so no single `write` parks indefinitely. The frame budget above is what actually
-/// decides; this only keeps a blocked syscall from outliving it.
-const PEER_WRITE_SLICE: Duration = Duration::from_millis(100);
+/// Per-syscall slice, so no single `write` parks indefinitely. The per-peer allowance is what actually
+/// decides; this only keeps a blocked syscall from outliving it — which means it has to be **smaller
+/// than the smallest allowance**, or that allowance cannot be honoured at all. It was 100 ms against a
+/// 50 ms small-frame budget, so the 50 ms bound was measured at 104 ms.
+const PEER_WRITE_SLICE: Duration = Duration::from_millis(20);
 
 /// The minimum rate a peer must sustain to keep its link during a registry burst.
 ///
@@ -91,9 +93,16 @@ const PEER_WRITE_SLICE: Duration = Duration::from_millis(100);
 /// still keeps its link. Below it, the peer is dropped rather than allowed to hold the control plane.
 ///
 /// The residual, stated plainly because it cannot be fixed by choosing a better number: a burst of R
-/// bytes may hold the dissemination lock for up to `R / MIN_DRAIN_RATE`. At 10 MB that is 2.5 s; at
-/// 40 MB it exceeds `LIVENESS_TIMEOUT`. Bounding *that* requires not holding the lock across the write
-/// — a per-peer outbox, as the stream plane already has (`FramedConn`). That is post-0.3.0 work.
+/// bytes may hold the dissemination lock for up to `R / MIN_DRAIN_RATE` **per unresponsive peer**.
+/// Measured against a peer that never drains, the hold is `0.58 s + 1.36 × (R / rate)` — so it crosses
+/// `LIVENESS_TIMEOUT` at about **28 MiB of registry, ~300 000 identities** at 48-character names, not the
+/// 40 MB the arithmetic alone suggests. The 1.36× is unexplained; payload accounting was verified to
+/// 0.04 % and the snapshot clone measured at 34–48 ms, so it is a property of the write loop. Treat the
+/// arithmetic as ~40 % optimistic.
+///
+/// Bounding this requires not holding the lock across the write — a per-peer outbox, as the stream plane
+/// already has (`FramedConn`). That is post-0.3.0 work, and ~28 MiB is the number that says when it stops
+/// being optional.
 const MIN_DRAIN_RATE: u64 = 4 << 20;
 
 /// Floor under a burst's deadline, so a small delta is not given a microscopic budget.
@@ -103,35 +112,44 @@ const PEER_BURST_MIN: Duration = Duration::from_millis(500);
 /// peer that cannot take one in this long is wedged rather than slow.
 ///
 /// Deliberately much smaller than a burst's, because these are the frames sent to **every** peer in one
-/// pass: the cost of a heartbeat broadcast is P times this, and at the ≤100-node target a 250 ms budget
-/// made that 25 s. Each failed write also drops its peer, so the cost is paid once.
+/// pass: each peer gets this allowance of its own, so a heartbeat broadcast costs P times it in the worst
+/// case, and at the ≤100-node target a 250 ms budget would have made that 25 s. Each failed write also
+/// drops its peer, so the cost is paid once per wedged peer, not once per round.
 const PEER_SMALL_FRAME_BUDGET: Duration = Duration::from_millis(50);
 
-/// How long a burst of `bytes` may take in total before the peer is treated as not keeping up.
+/// How long **each peer** may take over a burst of `bytes` before it is treated as not keeping up.
+///
+/// A `Duration`, not an `Instant`: the allowance belongs to a peer, and turning it into a shared
+/// wall-clock deadline made one peer's stall everybody's eviction.
 ///
 /// `bytes` is the **exact** encoded size (`identities_encoded_len`), not an estimate. An estimate is the
 /// wrong tool here in a specific direction: guess low and the deadline is too tight, so a healthy peer
 /// is dropped because somebody else's channel names were long. A 128-byte-per-identity guess undercounts
 /// a member with a 48-character name and a 48-character topic by about 12 %.
-fn burst_deadline(bytes: usize) -> Instant {
+fn burst_allowance(bytes: usize) -> Duration {
     let allowed = Duration::from_micros((bytes as u64).saturating_mul(1_000_000) / MIN_DRAIN_RATE);
     // The ceiling is defensive arithmetic, not policy. `Instant + Duration` panics on overflow, and a
     // saturating multiply feeding it could produce a duration measured in geological time; an hour is
     // already 14 GB at this rate, far past any registry that fits in memory, so no realistic payload is
     // affected. The *absence* of a policy ceiling is deliberate and documented on `MIN_DRAIN_RATE`: a
     // real ceiling would drop healthy peers again, which is the whole thing this shape avoids.
-    let allowed = allowed.clamp(PEER_BURST_MIN, Duration::from_secs(3600));
-    Instant::now() + allowed
+    allowed.clamp(PEER_BURST_MIN, Duration::from_secs(3600))
 }
 
 /// Identities per control frame.
 ///
 /// Anti-entropy sends the whole registry on every reconnect, and a coalesced relay can carry a whole
 /// pump cycle, so without a cap one frame could be megabytes — a 10.6 MB frame was measured taking
-/// 6.1 s to write to a stalled peer, all of it under the dissemination lock. Chunking keeps every frame
-/// small enough that the frame budget is generous rather than marginal. The receiver merges each frame
-/// independently, and the merge is idempotent and order-free, so splitting is invisible to it.
+/// 6.1 s to write to a stalled peer, all of it under the dissemination lock. Chunking keeps any single
+/// frame far below `MAX_FRAME_LEN` and bounds what a receiver must buffer to decode one. It no longer
+/// interacts with the write bound at all — that is sized by total bytes, not by frame count. The receiver
+/// merges each frame independently, and the merge is idempotent and order-free, so splitting is invisible
+/// to it.
 const MAX_IDENTITIES_PER_FRAME: usize = 256;
+
+/// Rough encoded size of one `PeerHint`. Only used to size a deadline, and the 500 ms floor absorbs
+/// the error until thousands of hints are pending at once.
+const HINT_ENCODED_BYTES: usize = 160;
 
 /// Cap on remembered addresses claiming our own id. A genuine duplicate is one or two; the bound is
 /// there because the source is unauthenticated gossip.
@@ -147,6 +165,19 @@ struct Peer {
     /// `self_node` for an outbound link and the peer's for an inbound one, and both ends compute
     /// the same value for the same link.
     outbound: bool,
+    /// What is left of **this peer's own** allowance for the burst currently being written, drawn
+    /// down by the time its own writes actually cost.
+    ///
+    /// This exists because the alternative — one absolute deadline shared by every peer — is a global
+    /// budget with a per-peer charge, and those do not compose. `write_all_by` checks its deadline
+    /// *before* the first syscall, so once one slow peer had spent the shared instant, every peer
+    /// visited afterwards failed with **zero bytes written** and was shut down and evicted for a stall
+    /// that was not its own. Measured three ways independently: where the previous release kept 4 of 5
+    /// peers and delivered the full delta, the shared deadline kept **0 of 5** and held the lock 7×
+    /// longer. A per-peer budget also means the loop order stops being load-bearing — with a shared
+    /// instant, iterating peers outer instead of chunks outer silently dropped 3 of 4 *healthy* peers,
+    /// and nothing said so.
+    burst_left: Duration,
 }
 
 /// Which node opened a link: ourselves if we dialled, otherwise the peer. Both ends of a link
@@ -300,6 +331,7 @@ impl BroadcastDissemination {
                     conn: transport,
                     key,
                     outbound: addr.is_some(),
+                    burst_left: PEER_BURST_MIN,
                 });
                 Ok(())
             }
@@ -321,9 +353,12 @@ impl BroadcastDissemination {
         // fit a healthy peer's whole registry, so it turned "this peer is too slow" into "this registry
         // is too big" and made large deployments unable to form links at all. The floor keeps a small
         // join generous.
-        let deadline = burst_deadline(
-            identities_encoded_len(initial_sync) + self.membership.lock_safe().len() * 128,
-        );
+        // A join writes to one socket that is not yet in `peers`, so it carries its own deadline
+        // rather than drawing on a per-peer budget. Sized the same way.
+        let deadline = Instant::now()
+            + burst_allowance(
+                identities_encoded_len(initial_sync) + self.membership.lock_safe().len() * 160,
+            );
         // Chunked, because anti-entropy carries the entire registry and one frame of it was measured at
         // 10.6 MB taking 6.1 s to write to a stalled peer. The receiver merges each frame independently
         // and the merge is idempotent and order-free, so splitting is invisible to it.
@@ -479,9 +514,12 @@ impl BroadcastDissemination {
     /// with cycles goes quiet once everyone knows everyone.
     pub fn relay_hints(&mut self) {
         let pending: Vec<_> = self.hints.lock_safe().drain(..).collect();
-        // One deadline across every hint and every peer. Each hint used to get its own, so a forming
-        // 20-node mesh meant 19 hints × 19 peers = 361 independent budgets in a single tick.
-        let deadline = burst_deadline(pending.len() * 160);
+        // One allowance per peer, spanning every hint. Each hint used to get its own budget, so a
+        // forming 20-node mesh meant 19 hints × 19 peers = 361 independent ones in a single tick — and
+        // then sizing it by `pending.len()` alone undercounted by the peer multiplier, since every hint
+        // goes to every peer. Per-peer, the size each peer actually receives *is* `pending.len()`, so
+        // the multiplier disappears rather than needing to be remembered.
+        self.begin_burst(burst_allowance(pending.len() * HINT_ENCODED_BYTES));
         for (from, node, addr, control_addr, name) in pending {
             if node == self.self_node {
                 continue; // never gossip about ourselves second-hand; our heartbeat says it
@@ -492,7 +530,7 @@ impl BroadcastDissemination {
                 control_addr,
                 name,
             });
-            self.send_except(from, &frame, deadline);
+            self.send_except(from, &frame);
         }
     }
 
@@ -503,7 +541,8 @@ impl BroadcastDissemination {
         let frame = encode_control(&ControlMsg::Leaving {
             node: self.self_node,
         });
-        self.broadcast(&frame, Instant::now() + PEER_SMALL_FRAME_BUDGET);
+        self.begin_burst(PEER_SMALL_FRAME_BUDGET);
+        self.broadcast(&frame);
     }
 
     /// Addresses a third party has reported *our own* `NodeId` at, and which we hold no link to.
@@ -563,7 +602,8 @@ impl BroadcastDissemination {
         // A per-peer budget, and a small one: this frame goes to *every* peer in one pass, so its cost
         // is P times whatever is chosen here. At the ≤100-node target a 250 ms budget made the
         // heartbeat broadcast — the very thing the liveness timeout measures — worth 25 s.
-        self.broadcast(&hb, Instant::now() + PEER_SMALL_FRAME_BUDGET);
+        self.begin_burst(PEER_SMALL_FRAME_BUDGET);
+        self.broadcast(&hb);
         Ok(())
     }
 
@@ -596,17 +636,29 @@ impl BroadcastDissemination {
     }
 
     /// Best-effort broadcast to all peers; drops peers whose send fails (disconnected).
-    fn broadcast(&mut self, frame: &[u8], deadline: Instant) {
-        self.send_except(NO_PEER, frame, deadline);
+    fn broadcast(&mut self, frame: &[u8]) {
+        self.send_except(NO_PEER, frame);
+    }
+
+    /// Give every peer its own allowance for the burst about to be written. Called once per burst,
+    /// before the frames — so a peer's budget spans its own chunks and nobody else's.
+    fn begin_burst(&mut self, allowance: Duration) {
+        for p in &mut self.peers {
+            p.burst_left = allowance;
+        }
     }
 
     /// Broadcast to every peer except `from`; drops peers whose send fails (disconnected).
-    fn send_except(&mut self, from: PeerId, frame: &[u8], deadline: Instant) {
+    fn send_except(&mut self, from: PeerId, frame: &[u8]) {
         self.peers.retain_mut(|p| {
             if p.id == from {
                 return true;
             }
-            match p.conn.send_frame_by(frame, deadline) {
+            // Each peer against its own remaining allowance, and charged only for its own time.
+            let started = Instant::now();
+            let sent = p.conn.send_frame_by(frame, started + p.burst_left);
+            p.burst_left = p.burst_left.saturating_sub(started.elapsed());
+            match sent {
                 Ok(()) => true,
                 Err(_) => {
                     // Shut it down rather than just dropping our handle, so the reader thread on
@@ -626,31 +678,34 @@ impl Dissemination for BroadcastDissemination {
         // enough to clear each 250 ms check individually held the lock for the sum of them: measured at
         // 13.4 s for a 600 000-identity relay, four times over the liveness budget, with no bound
         // firing at any point and the peer never dropped.
-        let deadline = burst_deadline(identities_encoded_len(delta));
+        self.begin_burst(burst_allowance(identities_encoded_len(delta)));
         for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
             let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
-            self.broadcast(&frame, deadline);
+            self.broadcast(&frame);
         }
         Ok(())
     }
 
     fn relay(&mut self, from: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
-        let deadline = burst_deadline(identities_encoded_len(delta));
+        self.begin_burst(burst_allowance(identities_encoded_len(delta)));
         for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
             let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
-            self.send_except(from, &frame, deadline);
+            self.send_except(from, &frame);
         }
         Ok(())
     }
 
     fn reply(&mut self, to: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
-        let deadline = burst_deadline(identities_encoded_len(delta));
+        self.begin_burst(burst_allowance(identities_encoded_len(delta)));
         for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
             let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
             let Some(p) = self.peers.iter_mut().find(|p| p.id == to) else {
                 return Ok(()); // already reaped, by an earlier batch or another send
             };
-            if p.conn.send_frame_by(&frame, deadline).is_err() {
+            let started = Instant::now();
+            let sent = p.conn.send_frame_by(&frame, started + p.burst_left);
+            p.burst_left = p.burst_left.saturating_sub(started.elapsed());
+            if sent.is_err() {
                 let _ = p.conn.shutdown();
                 self.peers.retain(|p| p.id != to);
                 return Ok(());
@@ -800,13 +855,13 @@ fn spawn_reader(
                 // topology this produces every node is already adjacent to the departing one. A
                 // node that somehow is not adjacent falls back to the liveness timeout, exactly as
                 // it would for a peer that crashed.
-                ControlMsg::Leaving { node } => {
-                    // Only the peer on *this* link may announce its own departure. Accepting a
-                    // third party's id would let one node mark another not-live, which under a
-                    // duplicate id meant a departing twin silenced its still-serving sibling.
-                    if link_peers.lock_safe().get(&id).map(|(n, _)| *n) == Some(node) {
-                        membership.lock_safe().retire(node);
-                    }
+                // Only the peer on *this* link may announce its own departure. Accepting a third
+                // party's id would let one node mark another not-live, which under a duplicate id
+                // meant a departing twin silenced its still-serving sibling.
+                ControlMsg::Leaving { node }
+                    if link_peers.lock_safe().get(&id).map(|(n, _)| *n) == Some(node) =>
+                {
+                    membership.lock_safe().retire(node);
                 }
                 _ => {} // not expected on a peer link
             }
@@ -862,30 +917,96 @@ mod tests {
         }
     }
 
-    /// **A burst's deadline must scale with the burst.** A fixed one turned "this peer is too slow"
+    /// **A burst's allowance must scale with the burst.** A fixed one turned "this peer is too slow"
     /// into "this registry is too big": at the ~13.6 MB/s a real daemon drains at, 500 ms buys 6.8 MB,
-    /// so a *healthy* peer holding a 200 000-channel registry could not complete a join at all. The
-    /// deadline is therefore derived from the payload against a minimum rate.
+    /// so a *healthy* peer holding a 200 000-channel registry could not have completed a join. Measured
+    /// since: a fast peer takes a 35.9 MiB join in 0.030 s, which the size-derived allowance gives it
+    /// nine seconds to do.
     #[test]
-    fn a_bursts_deadline_scales_with_its_payload() {
-        let small = burst_deadline(0);
-        let floor = Instant::now() + PEER_BURST_MIN;
-        assert!(
-            small >= floor - Duration::from_millis(50),
-            "a small burst still gets the floor, not a microscopic budget"
+    fn a_bursts_allowance_scales_with_its_payload() {
+        assert_eq!(
+            burst_allowance(0),
+            PEER_BURST_MIN,
+            "a small burst gets the floor, not a microscopic budget"
         );
+        let big = burst_allowance(40 << 20);
+        assert!(
+            big > Duration::from_secs(9) && big < Duration::from_secs(11),
+            "a 40 MiB burst should be allowed about 10 s at 4 MiB/s, got {big:?}"
+        );
+        assert!(
+            big > burst_allowance(1 << 20),
+            "the allowance must scale with the payload, or it is a registry-size limit in disguise"
+        );
+    }
 
-        // 40 MiB against a 4 MiB/s floor is ten seconds of allowance; the point is that it grows, so a
-        // healthy peer is never dropped for the size of someone else's registry.
-        let big = burst_deadline(40 << 20);
-        let grown = big.duration_since(Instant::now());
-        assert!(
-            grown > Duration::from_secs(9) && grown < Duration::from_secs(11),
-            "a 40 MiB burst should be allowed about 10 s at 4 MiB/s, got {grown:?}"
+    /// **One slow peer must not evict the others.** The allowance is per peer precisely because a shared
+    /// deadline is a global budget with a per-peer charge: `write_all_by` checks its deadline before its
+    /// first syscall, so every peer written *after* the budget was spent failed with zero bytes and was
+    /// evicted for somebody else's stall. Three reviewers measured the same thing independently — 4 of 5
+    /// peers kept before the change, 0 of 5 after.
+    ///
+    /// Exercises `send_except` directly with explicit budgets rather than going through `announce`,
+    /// because otherwise the outcome turns on whether the payload happens to exceed this machine's
+    /// socket buffers — which is a property of the machine, not of the code under test.
+    #[test]
+    fn a_stalled_peer_does_not_spend_another_peers_budget() {
+        let mut wedged_l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut healthy_l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (wa, ha) = (
+            wedged_l.local_addr().unwrap(),
+            healthy_l.local_addr().unwrap(),
+        );
+        let wedged_accept = std::thread::spawn(move || wedged_l.accept().unwrap());
+        let healthy_accept = std::thread::spawn(move || healthy_l.accept().unwrap());
+        let wedged = TcpTransport::connect(wa).unwrap();
+        let healthy = TcpTransport::connect(ha).unwrap();
+        // Accepted and never read from, versus accepted and drained eagerly.
+        let _held = wedged_accept.join().unwrap();
+        let drain = healthy_accept.join().unwrap();
+        std::thread::spawn(move || {
+            let mut conn = drain.into_stream();
+            let mut sink = [0u8; 1 << 16];
+            while std::io::Read::read(&mut conn, &mut sink).unwrap_or(0) > 0 {}
+        });
+
+        let mut d = BroadcastDissemination::new(
+            NodeId(1),
+            "127.0.0.1:9501".parse().unwrap(),
+            Duration::from_secs(60),
+        );
+        // The wedged peer goes in **first**: that is the ordering where a shared deadline did the most
+        // damage, because everything after it was evicted without a byte attempted.
+        for (conn, budget) in [
+            (wedged, Duration::from_millis(50)),
+            (healthy, Duration::from_secs(10)),
+        ] {
+            let (local, peer) = conn.endpoints().unwrap();
+            let id = d.next_peer_id;
+            d.next_peer_id += 1;
+            conn.set_write_timeout(Some(PEER_WRITE_SLICE)).unwrap();
+            d.peers.push(Peer {
+                id,
+                conn,
+                key: link_key(local, peer),
+                outbound: false,
+                burst_left: budget,
+            });
+        }
+
+        // Larger than any socket buffer, so the peer that never reads must exhaust its own budget.
+        let frame = vec![0u8; 16 << 20];
+        d.send_except(NO_PEER, &frame);
+
+        assert_eq!(
+            d.peer_count(),
+            1,
+            "the peer that stalled should be the only one dropped; the draining peer must keep its \
+             link and its own budget"
         );
         assert!(
-            big > small,
-            "the deadline must scale with the payload, or it is a registry-size limit in disguise"
+            d.peers[0].burst_left > Duration::from_secs(5),
+            "the surviving peer was charged for the stalled peer's time"
         );
     }
 

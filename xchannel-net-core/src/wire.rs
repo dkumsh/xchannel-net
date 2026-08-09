@@ -240,7 +240,7 @@ impl Default for ChannelOptions {
 
 /// Options for creating a topic (multi-producer fan-in, `doc/TOPICS.md` §3.1). Wraps the
 /// topic channel's geometry plus mux policy; serializable so it crosses the client↔daemon link.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TopicOptions {
     /// Geometry/retention of the topic channel itself (the merged output).
     pub channel: ChannelOptions,
@@ -249,16 +249,6 @@ pub struct TopicOptions {
     /// Auto-reap a member whose owner has been an unreachable member for at least this long
     /// (§6.1). `0` ⇒ **never** reap (the default; reaping is an operator opt-in).
     pub member_reap_after_ms: u64,
-}
-
-impl Default for TopicOptions {
-    fn default() -> Self {
-        Self {
-            channel: ChannelOptions::default(),
-            max_batch_per_member: 0,
-            member_reap_after_ms: 0,
-        }
-    }
 }
 
 /// One channel as reported by discovery. Flattened rather than wrapping a `ChannelIdentity`,

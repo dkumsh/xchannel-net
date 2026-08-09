@@ -291,7 +291,11 @@ bound on a sequence of them, and every path that carries a whole registry is suc
 draining just fast enough to clear each individual check held the control plane for 13.4 s, four times
 the liveness budget, without any bound firing.
 
-That deadline is **derived from the burst's size against a minimum drain rate**, not fixed. A fixed one
+That allowance is **per peer** and **derived from the burst's size against a minimum drain rate**, not
+fixed. Per peer because a single deadline shared across peers is a global budget with a per-peer charge:
+the write path checks its deadline before the first syscall, so once one slow peer had spent it, every
+peer written afterwards failed with zero bytes and was evicted for a stall that was not its own —
+measured at 0 of 5 peers surviving where the previous release kept 4 of 5 and delivered the whole delta. A fixed one
 cannot be both large enough for a healthy peer and small enough to bound the tick, because the payload
 is a whole registry: at the rate a real daemon drains, half a second buys under 7 MB, so a *healthy*
 peer holding a large registry would have been unable to form a link at all. Expressed as a rate, the
@@ -311,21 +315,24 @@ and both drop the link — then retry identically for ever. Relays and
 replies are coalesced to one frame per *source link* per pump cycle rather than one per identity: that
 alone took a 200 000-identity delta from a 40 s heartbeat gap to 0.7 s.
 
-**Member attachment skips what it cannot resolve, and rotates the rest.** Each remote member not yet
-replicating costs a bounded resolve, and the count used to be unbounded: fifty of them made a tick
-10.5 s. But a cap alone was worse than the problem — a member whose owner is unreachable can *never* be
-resolved, so it consumed a slot on every tick for ever, and because the registry is a `BTreeMap` the
-same few names took every slot in the same order, so members behind them were never attempted at all. A
-topic silently stopped merging its live members. Two changes: a member whose owner is not a live member
-is skipped for free (the liveness is already known, and that is the entire population that used to clog
-the queue), and the walk rotates, because a cap over a deterministically-ordered list starves whatever
-sorts last — the same lesson as the dial cursors, learned twice.
+**Member attachment skips what it cannot resolve.** Each remote member not yet replicating used to cost
+a resolve with no bound on the count: fifty of them made a tick 10.5 s. A per-tick cap was worse than the
+problem it fixed — a member whose owner is unreachable can *never* resolve, so it consumed a slot on every
+tick for ever, and since the registry is a `BTreeMap` the same names took every slot in the same order and
+members behind them were never attempted at all, so a topic silently stopped merging its live members.
+Skipping a member whose owner is not a live member costs nothing (the liveness is already known) and
+removes exactly that population, which made the cap unnecessary rather than merely sufficient: what
+remains is a resolve that succeeds on its first pass and a connect on a thread of its own. The skip covers
+the subscription only — attaching from a replica already on disk needs no reachable owner.
 
-A build-time assertion ties the worst-case dial spend — count × (connect timeout + frame budget) — to
-`LIVENESS_TIMEOUT`, keeping a fixed reserve back for everything else in the tick. Read it as a bound on
-*dialling*, which is what it computes, and not as a bound on the tick: the earlier version of it was
-written in truncating whole seconds and omitted the frame budget entirely, so it passed for any dial
-count whatever while the real worst case was ninety seconds.
+A build-time assertion ties the worst-case **connect** spend — count × connect timeout — to
+`LIVENESS_TIMEOUT`, keeping a reserve back for the rest of the tick. That is all it computes, and its
+docstring enumerates what it does not: the bursts, the heartbeat's per-peer allowances, and member
+attachment. Two earlier versions claimed more — one written in truncating whole seconds, so a 900 ms
+timeout counted as zero and it passed for any dial count whatever; one charging a join budget that is no
+longer a constant. The reserve is a floor under what is left for the rest of the tick, not a proof that
+the rest fits: at a 200 000-channel registry the uncovered terms can exceed it, and the term that makes
+that possible is the burst, which the outbox closes.
 
 **`NodeId`s must be unique; nothing negotiates them, and a duplicate is detected rather than
 prevented.** A node generates 64 random bits from `/dev/urandom` on first start and keeps them in

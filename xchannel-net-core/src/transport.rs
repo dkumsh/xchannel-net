@@ -156,32 +156,19 @@ impl TcpTransport {
         self.stream.set_write_timeout(timeout)
     }
 
-    /// Send a length-delimited frame, giving up after `budget` **in total**.
+    /// Send a length-delimited frame, abandoning it once `deadline` passes.
     ///
-    /// The bound the control plane actually needs. Every control-plane write happens while holding
-    /// the dissemination lock, which is also what the heartbeat needs, so an unbounded write is a
-    /// node-wide stall: three unresponsive peers produced a 15 s heartbeat gap against a 10 s liveness
-    /// timeout, and the node was declared dead by every peer while alive and serving.
+    /// The bound the control plane needs, and it is a *deadline* rather than a per-frame budget for two
+    /// reasons learned the hard way. A budget per frame is not a bound on a sequence of frames — the
+    /// join handshake chunks a whole registry, and a peer draining just fast enough to clear each frame
+    /// individually stalled the sequence for the sum of them, all under the dissemination lock. And the
+    /// deadline must be derived from *one peer's* allowance, not shared across peers: `write_all_by`
+    /// checks it before the first syscall, so a deadline already spent by somebody else fails this peer
+    /// with zero bytes written.
     ///
-    /// A frame abandoned part-way leaves the stream desynchronized, so the error is not recoverable
-    /// for this connection: every caller must drop **and shut down** the peer. That is what they
-    /// already do for any send error, which is why this returns a plain error rather than something
-    /// more descriptive.
-    pub fn send_frame_within(
-        &mut self,
-        bytes: &[u8],
-        budget: std::time::Duration,
-    ) -> io::Result<()> {
-        self.send_frame_by(bytes, std::time::Instant::now() + budget)
-    }
-
-    /// [`send_frame_within`](Self::send_frame_within) against an **absolute** deadline, so a sequence of
-    /// frames can share one.
-    ///
-    /// A per-frame budget is the wrong bound for a burst: the join-time handshake chunks the whole
-    /// registry, so a peer draining just fast enough to pass each frame's check individually could stall
-    /// the sequence for as long as it had frames — a minute and a half for a large registry, all of it
-    /// under the dissemination lock. One deadline for the whole exchange is what actually bounds it.
+    /// A frame abandoned part-way leaves the stream desynchronized, so the error is not recoverable for
+    /// this connection: every caller must drop **and shut down** the peer, which is what they already do
+    /// for any send error.
     pub fn send_frame_by(&mut self, bytes: &[u8], deadline: std::time::Instant) -> io::Result<()> {
         if bytes.len() > MAX_FRAME_LEN {
             return Err(io::Error::new(
@@ -546,7 +533,9 @@ mod tests {
         let big = vec![0u8; 8 << 20];
         let budget = std::time::Duration::from_millis(300);
         let started = std::time::Instant::now();
-        let err = conn.send_frame_within(&big, budget).unwrap_err();
+        let err = conn
+            .send_frame_by(&big, std::time::Instant::now() + budget)
+            .unwrap_err();
         let took = started.elapsed();
 
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -590,7 +579,9 @@ mod tests {
         let big = vec![0u8; 8 << 20];
         let budget = std::time::Duration::from_millis(300);
         let started = std::time::Instant::now();
-        let err = conn.send_frame_within(&big, budget).unwrap_err();
+        let err = conn
+            .send_frame_by(&big, std::time::Instant::now() + budget)
+            .unwrap_err();
         let took = started.elapsed();
 
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -620,8 +611,11 @@ mod tests {
         conn.set_write_timeout(Some(std::time::Duration::from_millis(50)))
             .unwrap();
         let big = vec![7u8; 8 << 20];
-        conn.send_frame_within(&big, std::time::Duration::from_secs(10))
-            .expect("a peer that reads must never be dropped for the size of a frame");
+        conn.send_frame_by(
+            &big,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .expect("a peer that reads must never be dropped for the size of a frame");
         drop(conn);
         assert_eq!(reader.join().unwrap(), big.len() + 4);
     }

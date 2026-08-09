@@ -191,7 +191,12 @@ node before starting any new one; see *Upgrading from 0.2.x* in the README.
   since two wildcard-bound machines advertise the *same* address.
 
 ### Fixed
-Everything from here down was found by a pre-release review of the four changes above.
+Everything from here down was found by pre-release review — four rounds of it, each reviewing the
+previous round's fixes. Three rounds introduced regressions while fixing others, every one of which was
+caught by the next round and is recorded below alongside what it was fixing; the fourth introduced none.
+Two process gaps came out of it as well: `just check` ran clippy without `-D warnings`, so "check clean"
+meant "compiles" (now enforced, and the five warnings it had been hiding are fixed), and one test asserted
+across a ten-second liveness window with no clock control.
 
 - **A dropped peer link leaked its fd, its thread and its send half — and could silently wedge the
   node.** The reader owns a `try_clone` dup of the socket, so when its loop exited, dropping it left
@@ -250,27 +255,37 @@ Everything from here down was found by a pre-release review of the four changes 
     healthy right until every peer declares this node dead. It is a bound on *dialling*, not on the
     tick; the first version of it was written in truncating whole seconds and omitted the frame budget,
     so it passed for any dial count whatever while the real worst case was ninety seconds.
-  - **The gap escalates on a failed attempt, resets when a link actually forms, and decays once attempts
-    stop — with no exemption for an address that once worked.** "Success" means the whole join completed,
-    not merely that `connect` returned, so an address that accepts and then drops the link still backs
-    off. Keying the escalation on the interval between attempts alone could not tell a dial that failed
-    from one that succeeded and served, so a link repeatedly closed by the far end ratcheted to the
-    ceiling although nothing about it was flapping. An exemption keyed on "has identified itself over a link we dialled
+  - **The gap escalates while attempts continue and decays once they stop, with no exemption of any kind
+    — not for an address that once worked, and not for one whose write returned `Ok`.** Both exemptions
+    were tried and both were wrong. Keying on "has identified itself" used a memo that is never pruned,
+    so it applied every tick for ever. Keying on "the join completed" mistook buffering for delivery: a
+    far end that accepts, reads the join and hangs up returns `Ok` every time, which pinned exactly the
+    cases the code cited — a peer on an incompatible release, a seed naming a stream port — at the
+    one-second floor permanently, each cycle costing a registry-snapshot clone and a whole-registry write
+    under the dissemination lock. Escalate-and-decay needs no notion of success at all. An exemption keyed on "has identified itself over a link we dialled
     there" was a straight regression: that memo is never pruned, so it applied every tick forever and
     cleared the penalty before it could double, and a host powered off overnight was dialled every tick
     in perpetuity. Four such hosts took the heartbeat period from 0.5 s to a sustained **4.5 s**, where
     0.2.x decayed to one attempt a minute. No exemption is needed — a link that outlasted its own gap
     has already outlived the penalty from the dial that created it.
-  - **Member attachment skips what it cannot resolve, and rotates the rest.** Each remote member not yet
+  - **Member attachment skips what it cannot resolve, and needs no cap at all.** Each remote member not yet
     replicating costs a bounded resolve, and the count was unbounded: fifty made a tick **10.5 s**. A cap
     alone turned that into something worse — a member whose owner is unreachable can never be resolved,
     so it consumed a slot every tick for ever, and since the registry is a `BTreeMap` the same names took
     every slot in the same order and members behind them were never attempted at all. A hosted topic
     silently stopped merging its live members; three independent reproductions, one showing eight
     dead-owner members stopping a topic from merging *any* live member for 120 s where the previous
-    release attached them slowly. Now a member whose owner is not a live member is skipped for free, and
-    the walk rotates — a cap over a deterministically-ordered list starves whatever sorts last, which is
-    why the dial paths already had cursors.
+    release attached them slowly, and a measurement of the cost — 0.500 s + 4 × the resolve timeout,
+    observed at 1.306 s on every single tick.
+
+    A member whose owner is not a live member is now skipped for free, which made the cap unnecessary
+    rather than merely survivable: a charged resolve is one whose owner is live, which resolves on its
+    first pass, and the connect runs on a thread of its own. Measured at ~1 µs per skipped member — five
+    thousand of them cost a tick 5 ms, and twenty live members behind them all merged in 1.8 s — where the
+    cap needed forty-eight ticks to attach two hundred members. So the cap, its counter, its rotation
+    cursor and a redundant predicate are deleted rather than tested. The gate covers the *subscription*
+    only; attaching from a replica already on disk needs no reachable owner, and skipping that too left a
+    member whose owner had merely gone quiet unattached despite a complete local replica.
 
 - **A peer that stopped reading could stall the entire node.** Every control-plane write is a blocking
   write made while holding the dissemination lock, so one unresponsive peer stalled the heartbeat along
@@ -292,9 +307,13 @@ Everything from here down was found by a pre-release review of the four changes 
     such a peer was dropped on the first chunk; above 8 MB/s it finished. It is the *middling* peer that
     stalls a node.
 
-    The deadline scales with the payload — its **exact** encoded size, since an estimate that guesses low
-    makes the deadline too tight and drops a healthy peer for the length of someone else's channel names —
-    against a minimum drain rate rather than being a constant,
+    The allowance is **per peer** — a single deadline shared across peers is a global budget with a
+    per-peer charge, and the write path checks its deadline before the first syscall, so once one slow peer
+    spent it every peer written afterwards failed with **zero bytes** and was evicted for a stall that was
+    not its own: measured at 0 of 5 peers surviving where the previous release kept 4 of 5 and delivered
+    the full delta, with the lock held 7× longer. And it scales with the payload — its **exact** encoded
+    size, since an estimate that guesses low drops a healthy peer for the length of someone else's channel
+    names — against a minimum drain rate rather than being a constant,
     because a constant cannot be both large enough for a healthy peer and small enough to bound a tick:
     at the ~13.6 MB/s a real daemon sustains, half a second buys under 7 MB, so a **healthy** peer with a
     200 000-channel registry would have failed to form a link at all. As a rate the policy reads "a peer
@@ -304,7 +323,9 @@ Everything from here down was found by a pre-release review of the four changes 
     25 s.
 
     What remains, and is documented rather than asserted away: a burst of R bytes may hold the
-    dissemination lock for up to `R / rate`. Bounding that means not holding the lock across the write —
+    dissemination lock for up to `R / rate` per unresponsive peer — measured as `0.58 s + 1.36 × R/rate`,
+    so it crosses the liveness timeout at about **28 MiB of registry (~300 000 identities)** rather than
+    the 40 MB the arithmetic alone suggests. Bounding that means not holding the lock across the write —
     a per-peer outbox, as the stream plane already has — and is post-0.3.0. A socket send timeout is not a
     substitute and it was a mistake to ship one as if it were: `write_all` retries whenever a syscall
     moved a byte, so three unresponsive peers produced a **15.03 s** heartbeat gap against a 2 s

@@ -176,6 +176,10 @@ impl ReplicationSink {
     /// identifying a replica is the directory it sits in, and a replica directory that has been
     /// renamed or moved would be extended with another channel's records — with the generation
     /// check none the wiser, since two never-reclaimed channels both carry generation 0.
+    // Geometry and identity travel together by design (`doc/TOPICS.md`): a replica built with a
+    // different region size, mtu, roll size or retention than its origin is not a replica. Splitting
+    // them into a struct here would hide the coupling the parameter list makes obvious.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         path: &Path,
         name: &str,

@@ -584,8 +584,7 @@ impl Mux {
         // instead — a restart resets the counter and recovery re-keys on (name, epoch).
         let member_ref = self.next_ref;
         self.next_ref = self.next_ref.checked_add(1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 "mux member_ref space exhausted (65536 attaches this session) — restart the mux",
             )
         })?;
