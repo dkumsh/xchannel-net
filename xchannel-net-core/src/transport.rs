@@ -137,7 +137,27 @@ impl Transport for TcpTransport {
 /// subscriber that stops reading must stop us reading its source, not grow a buffer without
 /// bound. A subscriber held off long enough falls behind the origin's retention and is told so
 /// with a `Gap` on its next resume — the documented outcome, reached honestly.
-pub const MAX_PENDING_OUT: usize = 8 << 20; // 8 MiB
+///
+/// **Measured**, not guessed — see `stream::bench::measure_outbound_high_water_mark`, which sweeps
+/// this against record size. Two runs agreed on the finding that matters: **throughput is flat
+/// from 4 KiB to 32 MiB**, at every record size from 64 B to 256 KiB. The cap simply is not what
+/// limits a subscriber that is keeping up; the earlier 8 MiB was never even approached (peak
+/// buffered stayed under 3.5 MiB with a 32 MiB cap, and under 300 KiB for records ≤ 1 KiB).
+///
+/// So the number buys nothing but exposure, and the right size is the smallest that still leaves
+/// margin. That follows from no-custody (DESIGN.md §5) rather than from the benchmark: **the real
+/// buffer is the origin's log on disk.** Holding megabytes of records in RAM duplicates what the
+/// log already holds durably, and buys only a slightly later throttle — while throttling costs
+/// nothing, because the records stay in the log and the subscriber resumes from them. What decides
+/// whether a slow subscriber survives is *retention*, not this.
+///
+/// 1 MiB keeps roughly 4× margin over the largest peak seen under a keeping-up subscriber, leaves
+/// headroom for links less forgiving than the loopback the sweep runs on, and cuts the worst case
+/// at [`MAX_CONNECTIONS`](https://docs.rs/) — 4096 connections — from 32 GiB to 4 GiB.
+///
+/// The bound is `MAX_PENDING_OUT + one record`: a record is always queued whole, and the cap only
+/// gates *starting* another. `a_stalled_subscriber_cannot_grow_the_origins_buffer` pins that.
+pub const MAX_PENDING_OUT: usize = 1 << 20; // 1 MiB — see the measurement above
 
 /// How much to try to read from a socket per attempt.
 const READ_CHUNK: usize = 64 << 10;

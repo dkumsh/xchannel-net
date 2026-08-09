@@ -6,6 +6,29 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 
 ## Unreleased
 
+### Changed
+- **`MAX_PENDING_OUT` reduced 8 MiB → 1 MiB, from measurement.** The 8 MiB was a guess made while
+  building the duty cycle. `stream::bench::measure_outbound_high_water_mark` (an ignored harness;
+  `cargo test -p xchannel-net-core --release -- --ignored --nocapture measure_`) sweeps the cap
+  against record size, and two runs agreed on the finding that matters: **throughput is flat from
+  4 KiB to 32 MiB**, at every record size from 64 B to 256 KiB. The cap is simply not what limits a
+  subscriber that keeps up — 8 MiB was never approached (peak buffered stayed under 3.5 MiB with a
+  32 MiB cap, and under 300 KiB for records ≤ 1 KiB).
+
+  Since it buys no throughput, it should be as small as still leaves margin — and that follows from
+  no-custody rather than from the benchmark: **the real buffer is the origin's log on disk.**
+  Holding megabytes in RAM duplicates what the log already holds durably and only delays the
+  throttle, while throttling costs nothing, because the records stay in the log and the subscriber
+  resumes from them. What decides whether a slow subscriber survives is *retention*, not this.
+  1 MiB keeps ~4× margin over the largest peak seen under a keeping-up subscriber and cuts the
+  worst case at `MAX_CONNECTIONS` (4096) from 32 GiB to 4 GiB. `ServerPollItem::set_max_pending_out`
+  / `pending_out` exist so the sweep can measure it rather than assert it.
+- **The bound is now pinned by a test.** `a_stalled_subscriber_cannot_grow_the_origins_buffer`
+  asserts a subscriber that stops reading cannot push the origin past `MAX_PENDING_OUT + one
+  record` — one record, not one batch, because a record is always queued whole and the cap only
+  gates starting another. It also asserts the throttle actually engaged, so the bound is not
+  vacuously satisfied by the socket absorbing everything.
+
 ### Added
 - **Per-topic promotion** (`doc/TOPICS.md` §4.1 rung 2, resolving §9's open *trigger* question).
   `XCHANNELD_PROMOTED_TOPICS` — comma-separated topic names — gives a topic its own mux thread, and

@@ -277,6 +277,12 @@ remaining topics still merge. Retirement is enforced by the engine rather than b
 locking — `finish` marks the mux inert, so a poll still holding a handle sampled just before
 `deregister_topic` cannot commit past the terminal marker.
 
+Backpressure on the *replication* side is now explicit rather than implicit: the duty cycle cannot
+block in `write_all`, so a poll-item stops reading its source once `MAX_PENDING_OUT` bytes are
+buffered for a peer. Measurement showed that cap does not limit a subscriber that keeps up at any
+record size, so it is sized to bound memory, not throughput — the durable buffer is the origin's
+log, and duplicating it in RAM only delays a throttle that costs nothing.
+
 Backpressure posture is inherited and honest: the mux is a reader of its members
 (cannot slow them — no-custody holds) and the single writer of the topic (cannot be
 slowed by topic consumers). The mux itself must be provisioned to sustain the **sum**

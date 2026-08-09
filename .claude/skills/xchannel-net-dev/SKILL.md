@@ -280,6 +280,14 @@ table is emitted at the **head of every segment**, so one is always inside the r
 Proven by a cross-process daemon-restart test. Chose option (a) content-sniff over (b) an
 xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
 
+**`MAX_PENDING_OUT` = 1 MiB, measured** (was a guessed 8 MiB). `stream::bench::measure_outbound_high_water_mark`
+(ignored; `--release -- --ignored --nocapture measure_`) sweeps cap × record size: **throughput is
+flat 4 KiB → 32 MiB**, so the cap never limits a keeping-up subscriber and only buys memory
+exposure. Chosen small because **the real buffer is the origin's log** (no-custody) — RAM buffering
+duplicates it and only delays a throttle that costs nothing; *retention* is what decides whether a
+slow subscriber survives. Worst case at MAX_CONNECTIONS: 32 GiB → 4 GiB. The guaranteed bound is
+`cap + one record` (a record is always queued whole; the cap gates only *starting* another).
+
 **Promotion trigger** (§9, resolved): `NodeConfig::promoted_topics` / `XCHANNELD_PROMOTED_TOPICS`
 gives named topics their own mux thread (§4.1 rung 2); `poll_muxes` **skips** them, so a promoted
 topic leaves the shared budget rather than gaining a second poller. The thread exits on *identity*

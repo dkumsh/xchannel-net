@@ -379,6 +379,7 @@ impl<T: Transport> StreamClient<T> {
 pub struct ServerPollItem {
     conn: FramedConn,
     source: ReplicationSource,
+    max_pending_out: usize,
 }
 
 impl ServerPollItem {
@@ -388,7 +389,20 @@ impl ServerPollItem {
         Ok(Self {
             conn: FramedConn::new(transport.into_stream())?,
             source,
+            max_pending_out: MAX_PENDING_OUT,
         })
+    }
+
+    /// Override the outbound high-water mark. Exists so the bound can be *measured* rather than
+    /// asserted — see `measure_outbound_high_water_mark` in this module's tests, which is how
+    /// [`MAX_PENDING_OUT`] was chosen.
+    pub fn set_max_pending_out(&mut self, bytes: usize) {
+        self.max_pending_out = bytes;
+    }
+
+    /// Bytes currently buffered for the peer.
+    pub fn pending_out(&self) -> usize {
+        self.conn.pending_out()
     }
 
     /// Forward up to `max_batch` records. Returns how many were queued for the peer.
@@ -398,7 +412,7 @@ impl ServerPollItem {
     /// it a subscriber that stops reading would be answered by unbounded memory growth here
     /// instead of by falling behind its origin's retention.
     pub fn poll(&mut self, max_batch: usize) -> io::Result<usize> {
-        if !self.conn.flush()? || self.conn.pending_out() >= MAX_PENDING_OUT {
+        if !self.conn.flush()? || self.conn.pending_out() >= self.max_pending_out {
             return Ok(0);
         }
         let mut sent = 0;
@@ -411,7 +425,7 @@ impl ServerPollItem {
                 frame,
             }))?;
             sent += 1;
-            if self.conn.pending_out() >= MAX_PENDING_OUT {
+            if self.conn.pending_out() >= self.max_pending_out {
                 break;
             }
         }
@@ -747,6 +761,77 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// The bound `MAX_PENDING_OUT` actually promises: a subscriber that stops reading cannot make
+    /// the origin buffer without limit. The origin throttles at the cap and stops reading its
+    /// source — the records stay in the log, which is where the durable buffer belongs
+    /// (no-custody, DESIGN.md §5), rather than being duplicated into RAM.
+    ///
+    /// Asserts `cap + one record`, not `cap`, because a record is always queued whole and the cap
+    /// only gates *starting* another. The measurement sweep shows the same shape (peak/cap of
+    /// 6250% at a 4 KiB cap with 256 KiB records — one record, not one batch).
+    #[test]
+    fn a_stalled_subscriber_cannot_grow_the_origins_buffer() {
+        const RECORD: usize = 64 << 10;
+        const CAP: usize = 256 << 10;
+        let origin = temp_base("stalled-origin");
+        let replica = temp_base("stalled-replica");
+        {
+            let mut w = WriterBuilder::new(&origin)
+                .region_size(1 << 24)
+                .build()
+                .unwrap();
+            let payload = vec![0x7Eu8; RECORD];
+            for i in 0..256u64 {
+                let buf = w.try_reserve(payload.len()).unwrap();
+                buf.copy_from_slice(&payload);
+                w.commit(1, payload.len() as u32, i).unwrap();
+            }
+        }
+
+        let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let origin_path = origin.clone();
+        let server = std::thread::spawn(move || {
+            let conn = listener.accept().unwrap();
+            let resolve = |n: &str| {
+                (n == "md.aapl").then(|| ChannelSource {
+                    path: origin_path.clone(),
+                    region_size: 1 << 24,
+                    mtu: 0,
+                    file_roll_size: 0,
+                    keep_files: 0,
+                })
+            };
+            let mut item =
+                ServerPollItem::adopt(accept_subscription(conn, resolve).unwrap()).unwrap();
+            item.set_max_pending_out(CAP);
+            // Poll well past the point where the socket stops accepting, as the duty cycle would.
+            let mut peak = 0usize;
+            for _ in 0..2000 {
+                let _ = item.poll(256);
+                peak = peak.max(item.pending_out());
+            }
+            peak
+        });
+
+        // Handshake, then never read another byte.
+        let conn = TcpTransport::connect(addr).unwrap();
+        let _stalled = subscribe(conn, "md.aapl", RecordIndex(0), 0, &replica).unwrap();
+        let peak = server.join().unwrap();
+
+        let bound = CAP + RECORD + 64; // + one whole record, + framing slack
+        assert!(
+            peak <= bound,
+            "a stalled subscriber pushed the origin to {peak} buffered bytes, past the \
+             {bound}-byte bound (cap {CAP} + one {RECORD}-byte record)"
+        );
+        // And the throttle really engaged, or the assertion above proves nothing.
+        assert!(
+            peak >= CAP,
+            "the socket absorbed everything ({peak} buffered) — this test never exercised the cap"
+        );
+    }
+
     #[test]
     fn unknown_channel_is_rejected() {
         let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -773,5 +858,124 @@ mod tests {
         ));
         let server_err = server.join().unwrap();
         assert_eq!(server_err.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    //! Measurement harness for [`MAX_PENDING_OUT`]. Ignored by default (it moves ~64 MiB per
+    //! configuration); run with:
+    //!
+    //! ```text
+    //! cargo test -p xchannel-net-core --release -- --ignored --nocapture measure_
+    //! ```
+    use super::*;
+    use crate::transport::{Listener, TcpListener, TcpTransport};
+    use std::time::Instant;
+    use xchannel::WriterBuilder;
+
+    const REGION: usize = 1 << 24; // 16 MiB, room for the biggest run
+
+    fn origin_with(name: &str, count: u64, record: usize) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("xchnet-bench-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("chan");
+        let mut w = WriterBuilder::new(&base)
+            .region_size(REGION)
+            .build()
+            .unwrap();
+        let payload = vec![0xA5u8; record];
+        for i in 0..count {
+            let buf = w.try_reserve(payload.len()).unwrap();
+            buf.copy_from_slice(&payload);
+            w.commit(1, payload.len() as u32, i).unwrap();
+        }
+        base
+    }
+
+    /// Replicate `count` records of `record` bytes with the outbound cap set to `cap`, driving the
+    /// server exactly as the duty cycle does (bounded batches, poll until done). Returns
+    /// (elapsed, peak bytes ever buffered outbound).
+    fn run(label: &str, count: u64, record: usize, cap: usize) -> (std::time::Duration, usize) {
+        let origin = origin_with(label, count, record);
+        let mut replica_dir = std::env::temp_dir();
+        replica_dir.push(format!("xchnet-bench-{label}-replica"));
+        let _ = std::fs::remove_dir_all(&replica_dir);
+        std::fs::create_dir_all(&replica_dir).unwrap();
+        let replica = replica_dir.join("chan");
+
+        let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let origin_path = origin.clone();
+        let server = std::thread::spawn(move || {
+            let conn = listener.accept().unwrap();
+            let resolve = |n: &str| {
+                (n == "bench").then(|| ChannelSource {
+                    path: origin_path.clone(),
+                    region_size: REGION as u32,
+                    mtu: 0,
+                    file_roll_size: 0,
+                    keep_files: 0,
+                })
+            };
+            let mut item =
+                ServerPollItem::adopt(accept_subscription(conn, resolve).unwrap()).unwrap();
+            item.set_max_pending_out(cap);
+            let mut peak = 0usize;
+            let mut sent = 0u64;
+            // Poll like the duty cycle: bounded batch, keep going until everything is out.
+            while sent < count || item.pending_out() > 0 {
+                sent += item.poll(256).unwrap() as u64;
+                peak = peak.max(item.pending_out());
+                if sent >= count && item.pending_out() > 0 {
+                    let _ = item.conn.flush();
+                }
+            }
+            peak
+        });
+
+        let conn = TcpTransport::connect(addr).unwrap();
+        let mut client = subscribe(conn, "bench", RecordIndex(0), 0, &replica).unwrap();
+        let started = Instant::now();
+        for _ in 0..count {
+            client.recv_one().unwrap();
+        }
+        let elapsed = started.elapsed();
+        let peak = server.join().unwrap();
+        (elapsed, peak)
+    }
+
+    /// **How `MAX_PENDING_OUT` was chosen.** Sweeps the outbound cap against record size and
+    /// reports throughput plus the peak the origin actually buffered.
+    ///
+    /// The question is not "which cap is fastest" but "does the cap constrain a subscriber that is
+    /// keeping up at all" — because if it does not, the only thing the number buys is memory
+    /// exposure, and it should be as small as still saturates the link.
+    #[test]
+    #[ignore = "measurement harness; run with --ignored --nocapture"]
+    fn measure_outbound_high_water_mark() {
+        const TOTAL: usize = 64 << 20; // hold bytes moved constant across record sizes
+        println!(
+            "{:>10} {:>10} {:>12} {:>12} {:>12}",
+            "record", "cap", "MiB/s", "peak_out", "peak/cap"
+        );
+        for record in [64usize, 1 << 10, 16 << 10, 256 << 10] {
+            let count = (TOTAL / record) as u64;
+            for cap in [4 << 10, 64 << 10, 256 << 10, 1 << 20, 8 << 20, 32 << 20] {
+                let label = format!("r{record}-c{cap}");
+                let (elapsed, peak) = run(&label, count, record, cap);
+                let mib = (count as f64 * record as f64) / (1 << 20) as f64;
+                println!(
+                    "{:>10} {:>10} {:>12.0} {:>12} {:>11.0}%",
+                    record,
+                    cap,
+                    mib / elapsed.as_secs_f64(),
+                    peak,
+                    100.0 * peak as f64 / cap as f64
+                );
+            }
+        }
     }
 }
