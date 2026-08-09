@@ -56,6 +56,30 @@ fn main() -> std::io::Result<()> {
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(300));
 
+    // Topics promoted onto a thread of their own — rung 2 of doc/TOPICS.md §4.1's promotion
+    // path. Comma-separated topic names; empty (the default) leaves everything on the shared duty
+    // cycle. Deliberately node config rather than a `TopicOptions` field: spawning a thread is the
+    // operator's call, not any client's, and unlike `TopicOptions` this survives a restart (see
+    // `NodeConfig::promoted_topics`).
+    let promoted_topics: std::collections::HashSet<String> =
+        env_or("XCHANNELD_PROMOTED_TOPICS", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+
+    // How the duty cycle — and each promoted topic's own loop — waits when it finds no work.
+    // `XCHANNELD_MUX_MAX_PARK_US` caps the park; `0` means never park (keep yielding), for a box
+    // where the data plane is worth a core.
+    let mux_idle = MuxIdle {
+        max_park: std::env::var("XCHANNELD_MUX_MAX_PARK_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(MuxIdle::default().max_park, Duration::from_micros),
+        ..MuxIdle::default()
+    };
+
     let config = NodeConfig {
         node_id: NodeId(node_id),
         data_dir,
@@ -64,6 +88,8 @@ fn main() -> std::io::Result<()> {
         client_path,
         seeds,
         reclaim_after,
+        promoted_topics,
+        mux_idle,
     };
     std::fs::create_dir_all(&config.data_dir)?;
     #[cfg(unix)]
@@ -161,19 +187,11 @@ fn main() -> std::io::Result<()> {
     }
     {
         // **The duty cycle** (doc/TOPICS.md §4.1): one thread polling every replication source,
-        // replication sink and mux as peer poll-items. It backs off only when a whole cycle found
-        // nothing to do, so a producing member or a streaming subscriber is never waiting on a
-        // clock. `XCHANNELD_MUX_MAX_PARK_US` caps how long an idle cycle parks; `0` means never
-        // park (keep yielding), for a box where the data plane is worth a core.
-        let idle = MuxIdle {
-            max_park: std::env::var("XCHANNELD_MUX_MAX_PARK_US")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map_or(MuxIdle::default().max_park, Duration::from_micros),
-            ..MuxIdle::default()
-        };
+        // replication sink and mux as peer poll-items — except topics promoted onto their own
+        // thread, which it skips. It backs off only when a whole cycle found nothing to do, so a
+        // producing member or a streaming subscriber is never waiting on a clock.
         let node = node.clone();
-        std::thread::spawn(move || node.run_duty_cycle(idle));
+        std::thread::spawn(move || node.run_duty_cycle(mux_idle));
     }
     node.serve_stream(stream_listener)
 }

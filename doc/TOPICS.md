@@ -404,11 +404,23 @@ mux without lag metrics is shipping the §4.3 provisioning hazard blind.
   topic (muxes compose trivially since a topic is a channel). Allowed by construction;
   decide whether to *permit* it in v-topics-1 or gate it until cycle detection exists
   in the registry (a topic that is transitively a member of itself must be rejected).
-- **Per-topic promotion policy** — the execution rungs are settled (§4.1: shared-loop
-  poll-item → dedicated thread → separate process/standalone binary); open is the
-  *trigger*: operator-configured per topic in `TopicOptions`, or automatic based on
-  measured merge lag? (Default answer: operator-configured; automation later, with
-  evidence.)
+- **Per-topic promotion policy** — **resolved: operator-configured, in node config.** Rung 2
+  (a topic on a thread of its own) is selected by `NodeConfig::promoted_topics`
+  (`XCHANNELD_PROMOTED_TOPICS`); the shared duty cycle **skips** those topics, so a promoted
+  topic leaves the shared budget entirely rather than gaining a second poller.
+  `TopicStatus::promoted` reports the effective state. Automation on measured merge lag is
+  deliberately still not built: it needs evidence, and a daemon that spawned threads in reaction
+  to a load spike would be the kind of emergent behavior the design refuses elsewhere (§2).
+
+  This lands in **node config rather than the `TopicOptions` field originally proposed here**,
+  for three reasons. **Authority:** `TopicOptions` is client-supplied, so a client could make
+  the daemon spawn threads — a resource lever no client should hold on a plane that is trusted
+  rather than authenticated. **Durability:** `TopicOptions`' policy fields are not persisted
+  (`doc/RESTART.md`), so a promoted topic would silently drop back to the shared loop on the next
+  restart, a latency regression exactly where nobody would look; node config *is* durable state
+  by design (`DESIGN.md` §5). **Locality:** promotion describes how this node schedules, not what
+  the topic is — a topic reclaimed by another owner should not carry the previous owner's core
+  budget. Rung 3 (a separate process) remains unbuilt.
 - **Standalone mux discovery** — the library-crate engine hosted outside `xchanneld`
   needs member discovery without the registry; the filesystem-watch scheme (channel
   files appearing under a watched dir, headers self-describing) is the candidate.

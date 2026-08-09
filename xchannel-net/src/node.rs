@@ -294,6 +294,9 @@ pub struct TopicStatus {
     pub topic_head: u64,
     pub gaps_emitted: u64,
     pub slot_table_version: u64,
+    /// This topic merges on a thread of its own rather than on the shared duty cycle (§4.1
+    /// rung 2). Reported so an operator can confirm the promotion config actually took effect.
+    pub promoted: bool,
 }
 
 #[derive(Clone)]
@@ -656,10 +659,15 @@ impl Node {
         // geometry: `create_for_client` precreated the file with the client's rolling/retention,
         // but those live on the `Writer` xchannel drops there, so a mux opened with geometry alone
         // would leave the topic growing as one unbounded file.
-        let mux = Mux::open(&path, &mux::TopicGeometry::from(&options.channel), batch)?;
+        let mux = Arc::new(Mutex::new(Mux::open(
+            &path,
+            &mux::TopicGeometry::from(&options.channel),
+            batch,
+        )?));
         self.muxes
             .lock_safe()
-            .insert(name.to_string(), Arc::new(Mutex::new(mux)));
+            .insert(name.to_string(), Arc::clone(&mux));
+        self.promote_if_configured(name, &mux);
         if options.member_reap_after_ms != 0 {
             self.topic_reap.lock_safe().insert(
                 name.to_string(),
@@ -846,7 +854,14 @@ impl Node {
         let mut failure = None;
         // Handles first, map lock released — then each topic merges under its own lock, so a busy
         // topic delays neither its neighbours nor anything else that needs the map.
-        for (_, mux) in self.mux_handles() {
+        for (name, mux) in self.mux_handles() {
+            // A promoted topic has a thread of its own (§4.1 rung 2). Skipping it here is what
+            // makes that thread *dedicated* rather than a second poller of a shared topic — and
+            // what keeps the promoted topic's records off the shared loop's budget, which is the
+            // whole reason to promote one.
+            if self.config.promoted_topics.contains(&name) {
+                continue;
+            }
             match mux.lock_safe().poll() {
                 Ok(n) => total += n,
                 // One topic failing must not abandon the rest of the sweep: they are independent
@@ -877,6 +892,40 @@ impl Node {
             .iter()
             .map(|(name, mux)| (name.clone(), Arc::clone(mux)))
             .collect()
+    }
+
+    /// Give `topic` its own thread if the operator configured it as promoted (§4.1 rung 2).
+    /// Called wherever a mux enters the map, so creation and restart-reconstruction behave alike.
+    fn promote_if_configured(&self, topic: &str, mux: &Arc<Mutex<Mux>>) {
+        if !self.config.promoted_topics.contains(topic) {
+            return;
+        }
+        let (node, topic, mux) = (self.clone(), topic.to_string(), Arc::clone(mux));
+        std::thread::spawn(move || node.run_promoted_mux(topic, mux));
+    }
+
+    /// Poll one promoted topic on this thread until it stops being this node's mux for that name.
+    ///
+    /// Exits on **identity**, not on absence: the thread holds the very `Arc` it was promoted for
+    /// and stops when the map no longer maps `topic` to *that* mux. Checking only "is the name
+    /// still hosted" would leave a stale thread polling a retired mux alongside the new one after
+    /// a retire-and-recreate.
+    fn run_promoted_mux(&self, topic: String, mux: Arc<Mutex<Mux>>) {
+        let idle = self.config.mux_idle;
+        let mut round = 0u32;
+        loop {
+            match self.mux_of(&topic) {
+                Some(current) if Arc::ptr_eq(&current, &mux) => {}
+                _ => return, // retired, or replaced by a topic with its own thread
+            }
+            match mux.lock_safe().poll() {
+                Ok(n) if n > 0 => round = 0,
+                _ => {
+                    idle.wait(round);
+                    round = round.saturating_add(1);
+                }
+            }
+        }
     }
 
     /// Drive the muxes and nothing else, on their own thread.
@@ -1016,6 +1065,7 @@ impl Node {
         self.muxes
             .lock_safe()
             .insert(name.to_string(), Arc::clone(&mux));
+        self.promote_if_configured(name, &mux);
         for (member, epoch) in &cfg.members {
             // A member with a **local origin** is one we own: re-register it with `member_of`
             // (recovering its geometry via the header accessor) so it's back in the topic's live
@@ -1093,6 +1143,7 @@ impl Node {
                 topic_head: s.topic_head,
                 gaps_emitted: s.gaps_emitted,
                 slot_table_version: s.slot_table_version,
+                promoted: self.config.promoted_topics.contains(topic),
             }
         });
         Some(status)
@@ -2184,6 +2235,24 @@ mod tests {
             // Tests assert the guard's behavior explicitly; a long default would make every
             // reclaim test sleep.
             reclaim_after: Duration::from_millis(0),
+            promoted_topics: Default::default(),
+            mux_idle: MuxIdle::default(),
+        }
+    }
+
+    /// [`config`] with `topics` promoted onto threads of their own (§4.1 rung 2).
+    fn config_promoting(id: u64, data_dir: PathBuf, topics: &[&str]) -> NodeConfig {
+        NodeConfig {
+            promoted_topics: topics.iter().map(|t| t.to_string()).collect(),
+            // A park-heavy idle so a promoted topic's loop is not hammering its mux lock while a
+            // test tries to take it. Not what is under test — just keeps the test prompt.
+            mux_idle: MuxIdle {
+                max_spins: 0,
+                max_yields: 0,
+                min_park: Duration::from_micros(200),
+                max_park: Duration::from_millis(1),
+            },
+            ..config(id, data_dir)
         }
     }
 
@@ -3421,6 +3490,102 @@ mod tests {
             bad.topic_head, 1,
             "and nothing but its slot table reached the broken topic's log"
         );
+    }
+
+    /// Promotion (§4.1 rung 2, and §9's promotion *trigger*): a configured topic merges on a
+    /// thread of its own, and the shared duty cycle stops polling it.
+    ///
+    /// The skip is asserted independently of the dedicated thread by **pinning** the promoted
+    /// topic's mux: with its own loop blocked, `poll_muxes` — the shared loop's merge step — must
+    /// still merge the unpromoted topic and must not touch the promoted one. Without the skip a
+    /// "dedicated" thread would just be a second poller, and the promoted topic's records would
+    /// still be spending the shared loop's budget, which is the whole reason to promote it.
+    #[test]
+    fn a_promoted_topic_merges_on_its_own_thread_and_leaves_the_shared_loop() {
+        let node = Node::new(config_promoting(1, temp_dir("promote"), &["agg.fast"]));
+        let opts = ChannelOptions::default();
+        node.create_topic("agg.fast", TopicOptions::default())
+            .unwrap();
+        node.create_topic("agg.slow", TopicOptions::default())
+            .unwrap();
+        let fast_member = node.publish_to_topic("agg.fast", "mem.f", opts).unwrap();
+        let slow_member = node.publish_to_topic("agg.slow", "mem.s", opts).unwrap();
+
+        assert!(
+            node.topic_status("agg.fast").unwrap().unwrap().promoted,
+            "status must report the promotion so an operator can confirm it took effect"
+        );
+        assert!(!node.topic_status("agg.slow").unwrap().unwrap().promoted);
+
+        // Pin the promoted topic before there is anything to merge, so its own loop cannot get
+        // there first and make the assertion below ambiguous.
+        let fast_mux = node.mux_of("agg.fast").expect("hosted");
+        let pinned = fast_mux.lock_safe();
+
+        for path in [&fast_member, &slow_member] {
+            let mut w = WriterBuilder::new(path)
+                .region_size(1 << 20)
+                .build()
+                .unwrap();
+            let buf = w.try_reserve(4).unwrap();
+            buf.copy_from_slice(b"tick");
+            w.commit(1, 4, 0).unwrap();
+        }
+
+        // The shared loop merges the unpromoted topic and skips the promoted one — note it does
+        // not even block on the pinned mux, because it never reaches for it.
+        assert_eq!(
+            node.poll_muxes().unwrap(),
+            1,
+            "the shared loop must merge agg.slow and skip agg.fast"
+        );
+
+        // Released, the promoted topic's own thread merges its record with nobody else's help.
+        drop(pinned);
+        poll_until(|| {
+            let s = node.topic_status("agg.fast").unwrap().unwrap();
+            (s.members[0].merged == 1).then_some(())
+        });
+    }
+
+    /// A promoted topic's thread exits when the topic is retired, rather than polling a mux that
+    /// is no longer this node's. Exiting on *identity* (not merely on the name being absent) is
+    /// what stops a retire-and-recreate leaving the old thread running beside the new one.
+    #[test]
+    fn a_promoted_topics_thread_exits_when_the_topic_is_retired() {
+        let dir = temp_dir("promote-retire");
+        let node = Node::new(config_promoting(1, dir, &["agg"]));
+        node.create_topic("agg", TopicOptions::default()).unwrap();
+        let first = node.mux_of("agg").expect("hosted");
+        assert!(node.deregister_topic("agg").unwrap());
+
+        // Re-create under the same name: a *different* mux, with its own thread.
+        node.create_topic("agg", TopicOptions::default()).unwrap();
+        let second = node.mux_of("agg").expect("re-hosted");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "re-creating a topic must yield a new mux"
+        );
+        // The old thread must have let go of the retired mux; once it has, this is the only
+        // remaining reference to it.
+        poll_until(|| (Arc::strong_count(&first) == 1).then_some(()));
+
+        // And the new topic still merges on its own thread.
+        let member = node
+            .publish_to_topic("agg", "mem.a", ChannelOptions::default())
+            .unwrap();
+        let mut w = WriterBuilder::new(&member)
+            .region_size(1 << 20)
+            .build()
+            .unwrap();
+        let buf = w.try_reserve(4).unwrap();
+        buf.copy_from_slice(b"tick");
+        w.commit(1, 4, 0).unwrap();
+        drop(w);
+        poll_until(|| {
+            let s = node.topic_status("agg").unwrap().unwrap();
+            (s.members[0].merged == 1).then_some(())
+        });
     }
 
     #[test]

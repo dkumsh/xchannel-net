@@ -6,6 +6,21 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 
 ## Unreleased
 
+### Added
+- **Per-topic promotion** (`doc/TOPICS.md` §4.1 rung 2, resolving §9's open *trigger* question).
+  `XCHANNELD_PROMOTED_TOPICS` — comma-separated topic names — gives a topic its own mux thread, and
+  the shared duty cycle **skips** it, so a promoted topic leaves the shared budget rather than
+  merely gaining a second poller. `TopicStatus::promoted` reports the effective state. The thread
+  exits when the map no longer holds *that* mux (identity, not name), so retire-and-recreate cannot
+  leave a stale thread polling alongside the new one.
+
+  §9 proposed this as a `TopicOptions` field; it is node config instead. `TopicOptions` is
+  client-supplied, and a client that could set it could make the daemon spawn threads; its policy
+  fields do not survive a restart, so a promotion would silently lapse; and promotion describes how
+  a *node* schedules rather than what a topic is. Automatic, lag-driven promotion remains unbuilt
+  on purpose — it needs evidence, and a daemon that spawned threads in reaction to load would be
+  the kind of emergent behavior the design refuses elsewhere.
+
 ### Changed
 - **The data plane is now a duty cycle** (`doc/TOPICS.md` §4.1). `Node::run_duty_cycle` polls
   replication sources, replication sinks and mux slots as peer poll-items in one loop, each bounded

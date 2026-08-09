@@ -43,4 +43,26 @@ pub struct NodeConfig {
     /// human to assert "that host is gone" makes that an operator error rather than an
     /// emergent behavior; this threshold is the guard against asserting it too soon.
     pub reclaim_after: std::time::Duration,
+
+    /// Topics promoted off the shared duty cycle onto a **thread of their own** — rung 2 of
+    /// `doc/TOPICS.md` §4.1's promotion path. Empty (the default) leaves every topic on the
+    /// shared loop.
+    ///
+    /// §9 left the promotion *trigger* open and offered "operator-configured per topic in
+    /// `TopicOptions`" as its default answer. It lives here instead, in node config, for three
+    /// reasons — see §9 for the full argument:
+    ///
+    /// 1. **Authority.** `TopicOptions` is client-supplied. A client that could set
+    ///    `dedicated: true` could make the daemon spawn threads, which is a resource lever no
+    ///    client should hold on a plane that is trusted rather than authenticated.
+    /// 2. **Durability.** `TopicOptions`' policy fields are not persisted, so a promoted topic
+    ///    would silently drop back to the shared loop on the next daemon restart — a latency
+    ///    regression precisely where it would go unnoticed. Node config *is* durable state by
+    ///    design (DESIGN.md §5: "the only durable node-owned state is stable `NodeId` + config").
+    /// 3. **Locality.** Promotion describes how *this node* schedules, not what the topic is. A
+    ///    topic reclaimed by another owner should not carry the previous owner's core budget.
+    pub promoted_topics: std::collections::HashSet<String>,
+
+    /// How the duty cycle — and each promoted topic's own loop — waits when it finds no work.
+    pub mux_idle: node::MuxIdle,
 }

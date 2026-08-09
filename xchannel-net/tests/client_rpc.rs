@@ -42,6 +42,8 @@ fn client_creates_and_subscribes_via_daemon() {
         client_path: client_path.clone(),
         seeds: vec![],
         reclaim_after: Duration::from_secs(300),
+        promoted_topics: Default::default(),
+        mux_idle: MuxIdle::default(),
     });
 
     let stream_l = node.bind_stream().unwrap();
@@ -125,6 +127,8 @@ fn client_lists_and_watches_channels() {
         client_path: client_path.clone(),
         seeds: vec![],
         reclaim_after: Duration::from_secs(300),
+        promoted_topics: Default::default(),
+        mux_idle: MuxIdle::default(),
     });
     let client_l = node.bind_client().unwrap();
     {
@@ -187,6 +191,8 @@ fn subscribe_to_unknown_channel_times_out() {
         client_path: client_path.clone(),
         seeds: vec![],
         reclaim_after: Duration::from_secs(300),
+        promoted_topics: Default::default(),
+        mux_idle: MuxIdle::default(),
     });
     let stream_l = node.bind_stream().unwrap();
     let client_l = node.bind_client().unwrap();

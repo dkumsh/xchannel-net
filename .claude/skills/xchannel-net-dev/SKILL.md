@@ -280,6 +280,16 @@ table is emitted at the **head of every segment**, so one is always inside the r
 Proven by a cross-process daemon-restart test. Chose option (a) content-sniff over (b) an
 xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
 
+**Promotion trigger** (§9, resolved): `NodeConfig::promoted_topics` / `XCHANNELD_PROMOTED_TOPICS`
+gives named topics their own mux thread (§4.1 rung 2); `poll_muxes` **skips** them, so a promoted
+topic leaves the shared budget rather than gaining a second poller. The thread exits on *identity*
+(`Arc::ptr_eq` against the current mux), not on the name being absent — otherwise a
+retire-and-recreate leaves a stale thread beside the new one. `TopicStatus::promoted` reports it.
+Deliberately node config, **not** the `TopicOptions` field §9 proposed: a client must not be able
+to make the daemon spawn threads, `TopicOptions` policy fields don't survive restart, and
+scheduling is the node's business not the topic's. Automatic (lag-driven) promotion stays unbuilt
+by choice.
+
 **Duty cycle** (post-0.1.0, §4.1): `xchanneld` runs **one** `Node::run_duty_cycle` thread polling
 replication sources + sinks + muxes as peer poll-items (256 records each per turn). Not
 thread-per-connection: 32 subscriptions cost 0 extra threads (6 idle → 6). Required building what

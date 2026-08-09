@@ -87,7 +87,9 @@ not have).
   `region_size`, `mtu`, **and `file_roll_size`/`keep_files`** — rides the slot table and is restored
   (and re-advertised to subscribers, so their replicas stay bounded too). The mux *policy* fields
   (`member_reap_after_ms`, `max_batch_per_member`) are not persisted; re-host uses defaults (reap
-  reverts to *never* — safe; batch to default).
+  reverts to *never* — safe; batch to default). **Promotion is unaffected**: it lives in node
+  config, not `TopicOptions`, precisely so that a re-hosted topic keeps the thread the operator
+  gave it (§9).
 - **Remote members** resume from their on-disk replica and refresh once the owner is reachable
   again (membership rebuilt from heartbeats).
 - **General origin re-registration** for non-topic channels **is now implemented** too:
