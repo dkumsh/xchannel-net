@@ -21,16 +21,18 @@ Configuration is environment only:
 | Variable | Default | |
 |---|---|---|
 | `XCHANNELD_NODE_ID` | `1` | Stable identity. Must be unique in the mesh. |
-| `XCHANNELD_DATA_DIR` | `/tmp/xchanneld` | Channel files, replicas, and the client socket. |
+| `XCHANNELD_DATA_DIR` | `$HOME/.xchannel-net` | Channel files, replicas, the node's identity, and the client socket. One daemon per directory, enforced by a lock. |
 | `XCHANNELD_STREAM_ADDR` | `127.0.0.1:7000` | Data plane. |
 | `XCHANNELD_CONTROL_ADDR` | `127.0.0.1:7001` | Registry gossip and heartbeats. |
 | `XCHANNELD_SEEDS` | — | Comma-separated peer control addresses to form the mesh. |
-| `XCHANNELD_CLIENT_PATH` | `<data_dir>/client.sock` | Local client plane. |
+| `XCHANNELD_CLIENT_PATH` | `<data_dir>/client.sock` | Local client plane. Must match what clients look for, so change both or neither. |
 | `XCHANNELD_RECLAIM_AFTER_MS` | `300000` | How long an owner must be unreachable before an operator may reclaim its name. |
 | `XCHANNELD_PROMOTED_TOPICS` | — | Topics given a merge thread of their own instead of the shared duty cycle. |
 | `XCHANNELD_MUX_MAX_PARK_US` | `5000` | Cap on how long an idle duty cycle parks; `0` never parks. |
 
-One daemon per data directory, enforced by an exclusive lock — a second exits immediately.
+One daemon per data directory, enforced by an exclusive lock — a second exits immediately. To run
+more than one node on a host, give each its own `XCHANNELD_DATA_DIR`; the default is deliberately a
+single per-user directory, because one daemon per user is the case that should need no configuration.
 
 ## How it behaves
 

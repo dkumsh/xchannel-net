@@ -6,6 +6,36 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 
 ## Unreleased
 
+### Changed
+- **The default data directory is now `$HOME/.xchannel-net`, not `/tmp/xchanneld`** (breaking, for
+  the daemon *and* the client). The old default was wrong in ways that got worse as durability work
+  landed:
+  - `/tmp` is `tmpfs` on most systems, so channels — memory-mapped *files* — were held in RAM. That
+    silently contradicts the durability the design rests on: a power cut lost everything, and channel
+    bytes counted against memory.
+  - `/tmp` is cleared on reboot, so a node lost its `.node_id` with its channels and came back as a
+    **different node** every time. Peers keep the earlier registration, so its old channels stayed
+    owned by an id that never returned — frozen until an operator reclaimed the names. The default
+    arranged for exactly the orphaning the previous release added a warning about.
+  - `/tmp` has a world-writable parent and a predictable path, so the directory or a symlink at it
+    could be pre-created by anyone. The daemon fails closed, but a per-user directory removes the
+    possibility instead of surviving it.
+  - Two users on one machine collided, and the data-dir lock meant the second daemon just exited.
+
+  There is **no fallback** when `HOME` is unset — it is an error naming `XCHANNELD_DATA_DIR`. A
+  silent second choice is how data ends up somewhere nobody looks, and a service without `HOME` is
+  exactly the deployment that should say where its data goes.
+
+  The default now lives in `xchannel_net_core::paths`, shared by both sides, because
+  `Client::connect_or_spawn` finds the implicit daemon by that path: if the two computed it
+  differently, zero-config startup would fail looking like "no daemon running". Consequently
+  `xchannel_net_client::DEFAULT_CLIENT_PATH` (a `&'static str`) is **replaced** by
+  `default_client_path() -> io::Result<PathBuf>` — a per-user path cannot be a constant.
+
+  Running several nodes on one host still means giving each its own `XCHANNELD_DATA_DIR`; the default
+  is deliberately one flat per-user directory, since one daemon per user is the case that should need
+  no configuration at all.
+
 ### Added
 - **Graceful shutdown on `SIGTERM`/`SIGINT`.** The daemon exits of its own accord, tells its peers it
   is leaving (a new `ControlMsg::Leaving`) so they mark it not-live immediately instead of waiting

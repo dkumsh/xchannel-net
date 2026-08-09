@@ -55,8 +55,8 @@ pub use xchannel_net_core::wire::ChannelOptions as Options;
 pub use xchannel_net_core::wire::SubscriptionStatus;
 
 /// Well-known default client-plane socket path for the implicit single local daemon. Mirrors
-/// the daemon's `XCHANNELD_CLIENT_PATH` default (under its `/tmp/xchanneld` data dir).
-pub const DEFAULT_CLIENT_PATH: &str = "/tmp/xchanneld/client.sock";
+/// the daemon's `XCHANNELD_CLIENT_PATH` default (inside its `$HOME/.xchannel-net` data dir).
+pub use xchannel_net_core::paths::default_client_path;
 
 /// Where a subscriber's returned `Reader` starts. The replica always holds full retained
 /// history; this only selects the read position.
@@ -92,12 +92,12 @@ impl Client {
         })
     }
 
-    /// Connect to the default local daemon ([`DEFAULT_CLIENT_PATH`]), auto-starting one if
+    /// Connect to the default local daemon ([`default_client_path`]), auto-starting one if
     /// none is running. The spawned `xchanneld` (located via `$XCHANNELD_BIN` or beside the
     /// current executable) uses its own default socket/data dir; if two clients race, only
     /// one daemon wins the `bind()` and the rest connect to it.
     pub fn connect_or_spawn() -> io::Result<Self> {
-        let path = PathBuf::from(DEFAULT_CLIENT_PATH);
+        let path = default_client_path()?;
         if let Ok(client) = Self::connect(&path) {
             return Ok(client);
         }

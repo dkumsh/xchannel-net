@@ -112,7 +112,7 @@ xchannel-net/                 (workspace root; crates live at root, NOT under cr
 │   │                         addr_of/live_members. Implements core::dissemination trait.
 └── xchannel-net-client/      external client↔daemon RPC over a Unix socket.
                               Client::connect(path) / connect_or_spawn() (auto-starts
-                              xchanneld at DEFAULT_CLIENT_PATH; single-instance via socket
+                              xchanneld at paths::default_client_path(); single-instance via socket
                               bind contention + stale-socket reclaim). create_channel
                               (→ Writer) / subscribe (→ Reader) / subscribe_path. Cross-
                               process ⇒ serializable ChannelOptions, NOT a closure (a
@@ -416,6 +416,13 @@ Follow-up (perf, not correctness): reconstruct double-scans each topic.
   discovery (filesystem-watch candidate), cross-topic txns (explicitly out of scope).
 - Client RPC surfaces `create_topic`/`publish_to_topic`; `deregister_topic`/`topic_status` are
   Node APIs (thin client-RPC wrappers are a trivial future add).
+
+**Default data dir = `$HOME/.xchannel-net`** (`core::paths`, shared by daemon + client because
+`connect_or_spawn` finds the implicit daemon by that path). **No fallback if `HOME` is unset** — an
+error naming `XCHANNELD_DATA_DIR`. Was `/tmp/xchanneld`, which was tmpfs (channels in RAM, lost on
+power cut), wiped on reboot (node lost `.node_id` → came back as a *different* node → its channels
+orphaned in peers' registries), world-writable parent, and collided between users. Several nodes on
+one host = one `XCHANNELD_DATA_DIR` each; the default is flat on purpose.
 
 **`NodeId` is self-assigned** (`node_identity.rs`): 64 random bits from `/dev/urandom` on first
 start, persisted in `<data_dir>/.node_id` as `key=value` with `created_at_ms`. **No default** —

@@ -31,13 +31,19 @@ fn main() -> std::io::Result<()> {
     let control_addr: SocketAddr = env_or("XCHANNELD_CONTROL_ADDR", "127.0.0.1:7001")
         .parse()
         .expect("XCHANNELD_CONTROL_ADDR must be host:port");
-    let data_dir = PathBuf::from(env_or("XCHANNELD_DATA_DIR", "/tmp/xchanneld"));
+    // Per-user and persistent by default (`$HOME/.xchannel-net`). Shared with the client through
+    // `core::paths`, because `Client::connect_or_spawn` finds the implicit daemon by this path and
+    // the two computing it differently would look like "no daemon running".
+    let data_dir = match std::env::var_os("XCHANNELD_DATA_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => xchannel_net_core::paths::default_data_dir()?,
+    };
     // Client plane is a Unix domain socket (local-only, permission-gated); defaults under
     // the data dir so the 0700 directory restricts who can reach the daemon.
-    let client_path = PathBuf::from(env_or(
-        "XCHANNELD_CLIENT_PATH",
-        &data_dir.join("client.sock").to_string_lossy(),
-    ));
+    let client_path = match std::env::var_os("XCHANNELD_CLIENT_PATH") {
+        Some(p) => PathBuf::from(p),
+        None => data_dir.join(xchannel_net_core::paths::CLIENT_SOCKET_NAME),
+    };
 
     // Seed peers to exchange registry state with on startup: `XCHANNELD_SEEDS` is a
     // comma-separated list of control-plane `host:port` addresses. Without it a daemon runs
