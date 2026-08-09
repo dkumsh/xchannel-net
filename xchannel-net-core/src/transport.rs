@@ -106,12 +106,29 @@ impl TcpTransport {
         self.stream.shutdown(std::net::Shutdown::Both)
     }
 
+    /// Bound how long a blocking write may wait. Without this, a peer that stops reading blocks
+    /// the writer inside `write_all` indefinitely — and on the control plane that writer is holding
+    /// a lock, so one wedged socket stalls the whole node.
+    pub fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(timeout)
+    }
+
     /// Bound how long a blocking read may wait. Used on the handshake, so a peer that connects
     /// and then says nothing cannot pin the thread performing it. Cleared by
     /// [`FramedConn::new`](crate::transport::FramedConn::new), which makes the socket
     /// non-blocking instead.
     pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(timeout)
+    }
+
+    /// The connection's two endpoints, `(local, peer)`.
+    ///
+    /// Used to key a link identically at both of its ends: the pair is the same two addresses on
+    /// either side, merely swapped, so ordering it yields a name for the *connection* that both
+    /// nodes compute without exchanging anything. The ephemeral port makes it unique per
+    /// connection.
+    pub fn endpoints(&self) -> io::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
+        Ok((self.stream.local_addr()?, self.stream.peer_addr()?))
     }
 
     /// Give up the wrapped stream, to hand a connection from a blocking handshake to a polled

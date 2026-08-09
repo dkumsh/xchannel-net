@@ -435,7 +435,7 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
     // long test name can exceed.
     let client_path = std::path::PathBuf::from("/tmp/xchnet-sigterm.sock");
     let _ = std::fs::remove_file(&client_path);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_xchanneld"))
+    let child = Command::new(env!("CARGO_BIN_EXE_xchanneld"))
         .env("XCHANNELD_DATA_DIR", &data_dir)
         .env("XCHANNELD_CLIENT_PATH", &client_path)
         .env("XCHANNELD_STREAM_ADDR", "127.0.0.1:0")

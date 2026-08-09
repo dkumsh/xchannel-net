@@ -18,7 +18,7 @@ use crate::NodeConfig;
 use crate::broadcast::BroadcastDissemination;
 use crate::registry::Registry;
 use crate::util::MutexExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -60,6 +60,27 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Bounded dial, so an unreachable owner costs one establishment thread a moment, not minutes.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Peer dials attempted per maintenance tick.
+///
+/// The maintenance loop is also the heartbeat loop, and a dial to a blackholed address costs a
+/// full `CONNECT_TIMEOUT`. Unbounded dialling therefore let the *number of addresses this node has
+/// ever heard of* set its heartbeat period: a dozen decommissioned hosts pushed a tick past
+/// `LIVENESS_TIMEOUT` and every peer declared this healthy node dead. Two dials per 500 ms tick
+/// still closes a fresh mesh in well under a second per peer, while keeping the worst-case tick
+/// far below the liveness budget.
+const MAX_DIALS_PER_TICK: usize = 2;
+
+/// First retry gap after a failed dial, doubling to [`DIAL_BACKOFF_MAX`].
+///
+/// Backoff is per *address* rather than per node, because the failing case is an address with no
+/// node behind it — a stale hint, a decommissioned host — which by definition cannot be keyed on
+/// an identity we never learned.
+const DIAL_BACKOFF_MIN: Duration = Duration::from_secs(1);
+
+/// Ceiling on the retry gap. A departed peer stays a candidate forever (it may come back), so this
+/// is what makes remembering it cheap: one dial a minute, not one a tick.
+const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Bounded handshake read. A peer that connects and then says nothing must not pin the thread
 /// performing the handshake — which, now that handshakes are not one-thread-per-connection for
@@ -341,7 +362,19 @@ pub struct Node {
     /// When this node started. Bounds how long an owner can be *known* to have been silent:
     /// a daemon that just came up has heard from nobody, and must not conclude every channel
     /// in the registry is abandoned.
-    started_at: Instant,
+    /// `NodeId`s already complained about, so a permanent duplicate produces one warning rather
+    /// than one per maintenance tick.
+    dup_reported: Arc<Mutex<HashSet<NodeId>>>,
+    /// Per-owner "unreachable from here since" clock, for owners we have never had contact with.
+    /// Bounded by the registry's owner set, which `note_unreachable_owners` prunes it to.
+    owner_unreachable_since: Arc<Mutex<HashMap<NodeId, Instant>>>,
+    /// Per-address dial backoff: when this address may next be tried, and the gap that produced
+    /// that instant. Bounded by the candidate set, and only ever holding addresses we have failed
+    /// to reach.
+    dial_backoff: Arc<Mutex<HashMap<SocketAddr, (Instant, Duration)>>>,
+    /// Where the last tick's dial budget stopped, so the candidate list is walked round-robin
+    /// rather than always from its head.
+    dial_cursor: Arc<Mutex<usize>>,
     /// Channels this node hosts (is the origin for): name → where + geometry to serve.
     hosted: Arc<Mutex<HashMap<String, ChannelSource>>>,
     /// Network-wide channel directory (CRDT), converged via dissemination.
@@ -406,7 +439,10 @@ impl Node {
             conducted: Arc::new(Mutex::new(Vec::new())),
             discovery: Arc::new(Mutex::new(None)),
             discovery_generation: now_nanos(),
-            started_at: Instant::now(),
+            dup_reported: Arc::new(Mutex::new(HashSet::new())),
+            owner_unreachable_since: Arc::new(Mutex::new(HashMap::new())),
+            dial_backoff: Arc::new(Mutex::new(HashMap::new())),
+            dial_cursor: Arc::new(Mutex::new(0)),
             config: Arc::new(config),
         }
     }
@@ -422,10 +458,12 @@ impl Node {
     /// owner is alive and still writing on the far side. A human asserting "that host is gone"
     /// turns that into an operator error rather than an emergent one.
     ///
-    /// Refuses unless the owner has been unreachable for at least `config.reclaim_after`.
-    /// An owner never heard from is judged against this node's own uptime, so a freshly
-    /// started daemon — which has heard from nobody — cannot immediately declare every channel
-    /// in the registry abandoned.
+    /// Refuses unless the owner has been **unreachable from this node** for at least
+    /// `config.reclaim_after` — measured either as silence since the last direct contact, or, for an
+    /// owner we have never had contact with, as how long we have known of it and failed to reach it
+    /// (`owner_unreachable_since`). Both are observations about the owner. A freshly started daemon
+    /// has made neither for long enough, so it cannot declare every channel in the registry
+    /// abandoned the moment it comes up.
     ///
     /// After this returns `Ok(true)` the name is free: registering it produces `epoch + 1`, a
     /// distinct incarnation, and subscribers holding replicas of the old one are told they
@@ -457,13 +495,7 @@ impl Node {
                 ),
             ));
         }
-        // Silence we can actually vouch for: how long since we last heard from the owner, or
-        // how long we have been listening at all if we never have.
-        let unreachable_for = self
-            .dissemination
-            .lock_safe()
-            .silent_for(id.owner)
-            .unwrap_or_else(|| self.started_at.elapsed());
+        let unreachable_for = self.unreachable_for(id.owner);
         if unreachable_for < self.config.reclaim_after {
             return Err(io::Error::new(
                 io::ErrorKind::ResourceBusy,
@@ -1402,11 +1434,19 @@ impl Node {
 
     /// Accept peer control connections forever, adopting each as a dissemination peer
     /// (which sends our current registry as join-time anti-entropy + a heartbeat).
+    ///
+    /// Both take the registry snapshot **while holding the dissemination lock**, which is the only
+    /// way the join-time anti-entropy can be complete. Snapshotting first and locking second left a
+    /// window: a local registration in between broadcast its delta to the peers that existed at that
+    /// moment — not including this one, which was not adopted yet — and then handed the new peer a
+    /// snapshot taken before the change. The delta was lost to it until some later reconnect, and
+    /// until then the two nodes disagreed about that channel.
     pub fn serve_control(&self, mut listener: TcpListener) -> io::Result<()> {
         loop {
             let conn = listener.accept()?;
+            let mut d = self.dissemination.lock_safe();
             let snapshot = self.registry_snapshot();
-            let _ = self.dissemination.lock_safe().add_peer(conn, &snapshot);
+            let _ = d.add_peer(conn, &snapshot);
         }
     }
 
@@ -1418,15 +1458,11 @@ impl Node {
             return Ok(());
         }
         let conn = TcpTransport::connect(addr)?;
+        let mut d = self.dissemination.lock_safe();
         let snapshot = self.registry_snapshot();
-        self.dissemination
-            .lock_safe()
-            .add_outbound_peer(conn, addr, &snapshot)
+        d.add_outbound_peer(conn, addr, &snapshot)
     }
 
-    /// (Re)connect to any configured seed peer not currently linked. Called at startup and
-    /// each maintenance tick, so a dropped seed link is re-established. Uses a bounded dial
-    /// timeout so a down seed doesn't stall the loop.
     /// Shut down cleanly: tell peers we are leaving so they stop treating this node's channels as
     /// reachable, and remove the client socket so nothing is left claiming to be a live daemon.
     ///
@@ -1437,6 +1473,58 @@ impl Node {
     pub fn shutdown(&self) {
         self.dissemination.lock_safe().announce_leaving();
         let _ = std::fs::remove_file(&self.config.client_path);
+    }
+
+    /// How long the owner has been unreachable **from this node**, which is the only thing a
+    /// reclaim may be judged on.
+    ///
+    /// Direct silence is preferred when we have it. When we do not — and relay plus `PeerHint` have
+    /// made that the ordinary case, since a registry entry routinely arrives second-hand for a node
+    /// we hold no link to — the answer is how long this node has known of the owner and failed to
+    /// reach it, tracked by `note_unreachable_owners` on the maintenance tick and reset the instant
+    /// contact is made.
+    ///
+    /// What it must **never** be is this node's own uptime, which is what it used to fall back to.
+    /// That is not an observation about the owner at all: every daemon older than `reclaim_after`
+    /// satisfied the floor unconditionally, so an owner that was alive and writing but merely
+    /// unreachable from here could have its channel tombstoned on the strength of our having been up
+    /// for a while. The field that held the start time is gone, so it cannot come back by accident.
+    fn unreachable_for(&self, owner: NodeId) -> Duration {
+        if let Some(silence) = self.dissemination.lock_safe().silent_for(owner) {
+            return silence;
+        }
+        // Stamped here as well as on the tick, so the clock starts at the first question even if
+        // maintenance is not running (a library embedding, or a node that has only just come up).
+        // Starting at zero is the point: it means "we have no idea yet", which no non-zero floor
+        // accepts.
+        self.owner_unreachable_since
+            .lock_safe()
+            .entry(owner)
+            .or_insert_with(Instant::now)
+            .elapsed()
+    }
+    /// Keep the unreachable-since clock honest: start it for any registered owner we cannot reach,
+    /// and **stop** it the moment we can. Called on the maintenance tick.
+    ///
+    /// Clearing matters more than starting. A node that flaps must not accumulate credit towards a
+    /// reclaim across the reachable stretches in between, or a peer with an intermittent link would
+    /// eventually look permanently gone.
+    fn note_unreachable_owners(&self) {
+        let owners: HashSet<NodeId> = self
+            .registry
+            .lock_safe()
+            .iter()
+            .filter(|i| !i.deleted && i.owner != self.config.node_id)
+            .map(|i| i.owner)
+            .collect();
+        let d = self.dissemination.lock_safe();
+        let live: HashSet<NodeId> = d.live_members().into_iter().collect();
+        drop(d);
+        let mut since = self.owner_unreachable_since.lock_safe();
+        since.retain(|node, _| owners.contains(node) && !live.contains(node));
+        for owner in owners.difference(&live) {
+            since.entry(*owner).or_insert_with(Instant::now);
+        }
     }
 
     /// A node's label for messages a person reads: its name if it advertised one, else its id.
@@ -1459,7 +1547,19 @@ impl Node {
     /// — every clone carries the same `.node_id` and owns nothing, so every clone but one steps
     /// aside on its own.
     fn report_duplicate_identity(&self, conflicts: &[NodeId]) -> OnDuplicateIdentity {
-        for node in conflicts {
+        // Once per id, not once per tick. Detection is a standing condition, not an event: for the
+        // cases below that can only warn, the maintenance loop re-detects the same duplicate twice a
+        // second, which at forty lines every twenty seconds buries whatever else the operator was
+        // reading — and none of the repeats say anything the first did not.
+        let fresh: Vec<NodeId> = {
+            let mut seen = self.dup_reported.lock_safe();
+            conflicts
+                .iter()
+                .copied()
+                .filter(|n| seen.insert(*n))
+                .collect()
+        };
+        for node in &fresh {
             eprintln!(
                 "xchanneld[{}]: WARNING: two peers claim NodeId {} at different control \
                  addresses — NodeIds must be unique. Channel ownership, membership and peer links \
@@ -1469,6 +1569,11 @@ impl Node {
         }
         if !conflicts.contains(&self.config.node_id) {
             // Someone else's collision; nothing safe for us to do about it.
+            return OnDuplicateIdentity::Continue;
+        }
+        // Below this point the id is ours. Either we step aside — which happens once, because it
+        // stops the daemon — or we can only advise, and that advice is worth printing once.
+        if !fresh.contains(&self.config.node_id) {
             return OnDuplicateIdentity::Continue;
         }
         if !self.config.id_generated {
@@ -1532,14 +1637,69 @@ impl Node {
         }
     }
 
-    /// Dial `addr` as a peer, best-effort.
+    /// Dial `addr` as a peer, best-effort, recording the outcome so a repeatedly unreachable
+    /// address backs off instead of costing a full `CONNECT_TIMEOUT` every tick.
     fn dial_peer(&self, addr: SocketAddr) {
-        if let Ok(conn) = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT) {
+        let outcome = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT).and_then(|conn| {
+            let mut d = self.dissemination.lock_safe();
             let snapshot = self.registry_snapshot();
-            let _ = self
-                .dissemination
-                .lock_safe()
-                .add_outbound_peer(conn, addr, &snapshot);
+            d.add_outbound_peer(conn, addr, &snapshot)
+        });
+        let mut backoff = self.dial_backoff.lock_safe();
+        match outcome {
+            // Reached it: forget the penalty entirely, so a peer that flaps is dialled promptly
+            // the next time rather than serving out a gap it earned an hour ago.
+            Ok(()) => {
+                backoff.remove(&addr);
+            }
+            Err(_) => {
+                let gap = backoff
+                    .get(&addr)
+                    .map_or(DIAL_BACKOFF_MIN, |(_, g)| (*g * 2).min(DIAL_BACKOFF_MAX));
+                backoff.insert(addr, (Instant::now() + gap, gap));
+            }
+        }
+    }
+
+    /// Whether `addr` has served out its backoff. Unknown addresses are always due — the first
+    /// attempt is never delayed.
+    fn dial_due(&self, addr: SocketAddr) -> bool {
+        self.dial_backoff
+            .lock_safe()
+            .get(&addr)
+            .is_none_or(|(next, _)| Instant::now() >= *next)
+    }
+
+    /// Dial at most [`MAX_DIALS_PER_TICK`] of `candidates`, skipping those already linked, those
+    /// still in backoff, and those with no dialable address.
+    ///
+    /// Rotating rather than restarting is what keeps a long candidate list fair: taking the first
+    /// two every time would let two permanently-dead addresses at the head of the list starve
+    /// every live peer behind them, which is the same starvation the cap was added to prevent.
+    fn dial_some(&self, candidates: &[SocketAddr]) {
+        if candidates.is_empty() {
+            return;
+        }
+        let start = {
+            let mut c = self.dial_cursor.lock_safe();
+            let start = *c % candidates.len();
+            *c = start + 1;
+            start
+        };
+        let mut spent = 0;
+        for i in 0..candidates.len() {
+            if spent == MAX_DIALS_PER_TICK {
+                break;
+            }
+            let addr = candidates[(start + i) % candidates.len()];
+            // An unspecified address (`0.0.0.0`, `[::]`) is a bind wildcard, never a destination:
+            // dialling it means dialling *this* host, so a peer that advertised its listen address
+            // verbatim would have every one of its peers open a link to itself.
+            if addr.ip().is_unspecified() || !self.dial_due(addr) || !self.should_dial(addr) {
+                continue;
+            }
+            self.dial_peer(addr);
+            spent += 1;
         }
     }
 
@@ -1553,22 +1713,27 @@ impl Node {
     /// have worked first time. So both dial, and the resulting duplicate is collapsed afterwards
     /// by `dedup_links`, which can decide it knowing who is actually reachable.
     pub fn connect_learned_peers(&self) {
-        let candidates = self.dissemination.lock_safe().unconnected_peers();
-        for (_, control_addr) in candidates {
-            if self.should_dial(control_addr) {
-                self.dial_peer(control_addr);
-            }
-        }
+        let candidates: Vec<SocketAddr> = self
+            .dissemination
+            .lock_safe()
+            .unconnected_peers()
+            .into_iter()
+            .map(|(_, control_addr)| control_addr)
+            .collect();
+        self.dial_some(&candidates);
     }
 
+    /// (Re)connect to configured seeds not currently linked. Called each maintenance tick, so a
+    /// dropped seed link is re-established.
+    ///
+    /// Seeds and learned peers get **separate** budgets deliberately. Sharing one would let a long
+    /// list of learned ghosts crowd out the seeds, and the seeds are the only addresses an operator
+    /// actually chose — they are how a partitioned node finds its way back.
     pub fn connect_seeds(&self) {
-        for addr in self.config.seeds.clone() {
-            // Same identity check as a learned peer. Without it, a seed link that lost the
-            // duplicate tie-break would be re-dialled every tick and dropped again every tick.
-            if self.should_dial(addr) {
-                self.dial_peer(addr);
-            }
-        }
+        // Same identity check as a learned peer (inside `dial_some`). Without it, a seed link that
+        // lost the duplicate tie-break would be re-dialled every tick and dropped again every tick.
+        let seeds = self.config.seeds.clone();
+        self.dial_some(&seeds);
     }
 
     fn registry_snapshot(&self) -> Vec<ChannelIdentity> {
@@ -1579,8 +1744,14 @@ impl Node {
     /// identities into the registry. Runs forever; the caller drives it on its own thread.
     pub fn run_maintenance(&self, interval: Duration) -> io::Result<()> {
         loop {
-            self.connect_seeds();
-            self.connect_learned_peers();
+            // **Heartbeat first, dial second, and cap the dials.** Dialling is serial with a 1 s
+            // timeout per unreachable address, and the candidate set grows with every node the mesh
+            // has ever mentioned (membership is never pruned, and each new link re-teaches the whole
+            // directory). Dialling first meant a dozen decommissioned hosts pushed the tick past
+            // `LIVENESS_TIMEOUT`, so a healthy node was reported dead by everyone — and because the
+            // topic member reaper keys on that same predicate, it then tombstoned live members'
+            // names. Observed directly: 12 unreachable addresses were enough to flip a live,
+            // actively-writing owner to `owner_live = false`.
             let pumped = {
                 let mut d = self.dissemination.lock_safe();
                 let _ = d.emit_heartbeat();
@@ -1606,6 +1777,7 @@ impl Node {
                 let mut retired = Vec::new();
                 for (from, id) in pumped {
                     let name = id.name.clone();
+                    let incoming = id.clone();
                     let merged = self.merge_and_publish(id);
                     // **Relay on change.** Without this a delta reaches only the originator's
                     // direct peers and a node two hops away stays ignorant until it opens a fresh
@@ -1618,6 +1790,18 @@ impl Node {
                             .dissemination
                             .lock_safe()
                             .relay(from, std::slice::from_ref(&merged.winner));
+                    } else if merged.winner != incoming {
+                        // **The sender is behind: tell it.** Our map did not move, so there is
+                        // nothing to flood — but the peer that sent this is holding a state that
+                        // lost, and nothing else will ever correct it. Anti-entropy only runs when a
+                        // link is established, so on a link that stays up the two of us would have
+                        // disagreed about this channel indefinitely: it would keep resolving the
+                        // wrong owner, and after a reclaim it would keep serving a replica of an
+                        // incarnation the mesh has retired.
+                        let _ = self
+                            .dissemination
+                            .lock_safe()
+                            .reply(from, std::slice::from_ref(&merged.winner));
                     }
                     if merged.winner.deleted {
                         retired.push(name);
@@ -1634,8 +1818,12 @@ impl Node {
             }
             // Retire members whose owner has been dead too long (opt-in), then react to
             // `member_of` registrations: attach live members, detach reaped/tombstoned ones.
+            self.note_unreachable_owners();
             self.reap_dead_members();
             self.attach_pending_members();
+            // After the heartbeat and the merge, never before, and bounded per tick.
+            self.connect_seeds();
+            self.connect_learned_peers();
             // Reconnect any subscription the duty cycle dropped — the self-healing half.
             self.service_subscriptions();
             std::thread::sleep(interval);
@@ -2573,6 +2761,138 @@ mod tests {
         panic!("condition not met within timeout");
     }
 
+    /// The maintenance loop is also the heartbeat loop, so what it spends on dialling is taken
+    /// directly out of this node's liveness. Unbounded, the candidate set — which grows with every
+    /// address the mesh has ever mentioned — set the heartbeat period, and a dozen decommissioned
+    /// hosts were enough to have every peer declare this healthy node dead, at which point the topic
+    /// member reaper began tombstoning its live members' names.
+    #[test]
+    fn dialling_is_capped_per_tick_and_backs_off_per_address() {
+        // Six addresses with nothing behind them: bind, keep the port, drop the listener.
+        let dead: Vec<SocketAddr> = (0..6)
+            .map(|_| {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap()
+            })
+            .collect();
+        let node = Node::new(NodeConfig {
+            seeds: dead.clone(),
+            ..config(120, temp_dir("dial-budget"))
+        });
+
+        node.connect_seeds();
+        assert_eq!(
+            node.dial_backoff.lock_safe().len(),
+            MAX_DIALS_PER_TICK,
+            "a tick must attempt at most MAX_DIALS_PER_TICK addresses, whatever the candidate count"
+        );
+
+        // A second tick must move on to *fresh* addresses rather than retry the two already known
+        // to be unreachable — otherwise a permanently dead address at the head of the list starves
+        // every live peer behind it, which is the same starvation the cap exists to prevent.
+        node.connect_seeds();
+        assert_eq!(
+            node.dial_backoff.lock_safe().len(),
+            2 * MAX_DIALS_PER_TICK,
+            "addresses in backoff must be skipped, and the walk must continue where it left off"
+        );
+
+        // Every attempt is one that failed, so each carries a penalty that grows.
+        for (addr, (_, gap)) in node.dial_backoff.lock_safe().iter() {
+            assert!(
+                *gap >= DIAL_BACKOFF_MIN && *gap <= DIAL_BACKOFF_MAX,
+                "{addr} has an out-of-range backoff {gap:?}"
+            );
+        }
+    }
+
+    /// A wildcard address is a bind target, never a destination. A peer that advertises the address
+    /// it bound — which is what every node does — teaches the mesh `0.0.0.0:7001`, and dialling that
+    /// opens a link to *this* host instead of to the peer.
+    #[test]
+    fn a_wildcard_candidate_is_never_dialled() {
+        let node = Node::new(NodeConfig {
+            seeds: vec!["0.0.0.0:7001".parse().unwrap()],
+            ..config(121, temp_dir("dial-wildcard"))
+        });
+        node.connect_seeds();
+        assert!(
+            node.dial_backoff.lock_safe().is_empty(),
+            "an unspecified address must not even be attempted"
+        );
+    }
+
+    /// **Convergence has to work in both directions.** A peer that sends a registry state which
+    /// *loses* the merge learns nothing from the recipient's silence, and join-time anti-entropy
+    /// only runs when a link is established — so on a link that stays up, the two would disagree
+    /// about who owns a channel indefinitely.
+    ///
+    /// Arranged so only the reply can carry the winner: the link is established while A's registry
+    /// is empty (so its anti-entropy snapshot is empty), and A learns the winner afterwards by a
+    /// merge that announces nothing. That is the ordinary steady state — a node does not re-announce
+    /// entries it registered long ago — and it is exactly the case a fresh node's late registration
+    /// lands in.
+    #[test]
+    fn a_peer_holding_a_losing_state_is_told_the_winner() {
+        let (a, _a_stream, a_control) = start(130, "reply-winner-a");
+        let mut peer = TcpTransport::connect(a_control).unwrap();
+
+        // A learns the winner *after* the link, and by merging rather than registering, so nothing
+        // is announced and the snapshot the peer already received cannot have carried it.
+        let winner = ChannelIdentity {
+            name: "md.aapl".into(),
+            owner: NodeId(130),
+            region_size: 1 << 20,
+            mtu: 0,
+            earliest_index: RecordIndex(0),
+            registered_at_nanos: 1,
+            epoch: 0,
+            deleted: false,
+            member_of: None,
+        };
+        // Wait until A has actually adopted the link, so the merge below cannot land in the window
+        // before the (empty) anti-entropy snapshot is sent.
+        poll_until(|| (a.dissemination.lock_safe().peer_count() > 0).then_some(()));
+        a.registry.lock_safe().merge(winner.clone());
+
+        // The peer announces a state that loses: same name, later registration.
+        let loser = ChannelIdentity {
+            owner: NodeId(999),
+            registered_at_nanos: u64::MAX,
+            ..winner.clone()
+        };
+        peer.send_frame(&codec::encode_control(
+            &xchannel_net_core::wire::ControlMsg::RegistryDelta(vec![loser.clone()]),
+        ))
+        .unwrap();
+
+        // A's map did not move, so there is nothing to flood — but the peer must still be corrected.
+        // Bounded by frames as well as by time: A heartbeats continuously, so a test that only
+        // relied on a read timeout would never stop reading if the reply never came.
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut replied = false;
+        for _ in 0..500 {
+            let Ok(frame) = peer.recv_frame() else { break };
+            if let Ok(xchannel_net_core::wire::ControlMsg::RegistryDelta(ids)) =
+                codec::decode_control(&frame)
+            {
+                assert!(
+                    !ids.contains(&loser),
+                    "A must not echo the losing state back as though it had won"
+                );
+                if ids.contains(&winner) {
+                    replied = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            replied,
+            "A held the winner and said nothing: the peer that sent the losing state would keep it \
+             forever, since anti-entropy only runs when a link is established"
+        );
+    }
+
     #[test]
     fn two_nodes_discover_and_replicate() {
         let (a, _a_stream, a_control) = start(1, "two-a");
@@ -2629,7 +2949,7 @@ mod tests {
     #[test]
     fn a_seed_chain_closes_into_a_full_mesh() {
         let (a, _a_stream, a_control) = start(80, "mesh-a");
-        let (b, _b_stream, b_control) = start_seeded(81, "mesh-b", &[a_control]);
+        let (_b, _b_stream, b_control) = start_seeded(81, "mesh-b", &[a_control]);
         let (c, _c_stream, _c_control) = start_seeded(82, "mesh-c", &[b_control]);
 
         // A registers a channel. Only B is adjacent to it at this point.
@@ -2673,7 +2993,7 @@ mod tests {
     /// the duplicate is collapsed afterwards, so A's outbound link is the one that survives.
     #[test]
     fn a_node_reachable_only_outbound_still_joins_the_mesh() {
-        let (b, _b_stream, b_control) = start(85, "asym-b");
+        let (_b, _b_stream, b_control) = start(85, "asym-b");
         // A is unreachable inbound from the outset: it only ever advertises an address that
         // refuses connections, so no peer can dial it.
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -3332,10 +3652,12 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("use deregister"), "{err}");
 
-        // A daemon that just started has heard from nobody; it must not conclude on that basis
-        // that every channel in the registry is abandoned.
+        // A node that has never had contact with an owner must judge it on how long *the owner* has
+        // been unreachable from here — which for a daemon that has only just learned of it is no
+        // time at all. It must not substitute its own uptime, which is not an observation about the
+        // owner and which every long-running daemon satisfies unconditionally.
         let mut cfg = config(113, temp_dir("reclaim-guard-c"));
-        cfg.reclaim_after = Duration::from_secs(3600);
+        cfg.reclaim_after = Duration::from_secs(300);
         let fresh = Node::new(cfg);
         fresh.registry.lock_safe().merge(ChannelIdentity {
             name: "theirs".into(),
@@ -3352,8 +3674,34 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
         assert!(err.to_string().contains("unreachable for"), "{err}");
 
+        // Once the owner *has* been unreachable from here for the whole floor, the reclaim is
+        // allowed — otherwise a survivor could never relocate the name of a host that was
+        // decommissioned before it ever met it.
+        fresh
+            .owner_unreachable_since
+            .lock_safe()
+            .insert(NodeId(999), Instant::now() - Duration::from_secs(600));
+        assert!(fresh.force_deregister("theirs").unwrap());
+
         // An unknown name is simply nothing to do.
         assert!(!fresh.force_deregister("nope").unwrap());
+
+        // ...but a node that *has* had contact can still reclaim once the owner is gone. Refusing
+        // here too would have made the guard useless: a graceful departure clears liveness, and if
+        // that also erased the record that we ever had contact, no node could ever reclaim a name
+        // from a peer that said goodbye.
+        a.shutdown();
+        poll_until(|| {
+            b.dissemination
+                .lock_safe()
+                .live_addr_of(NodeId(111))
+                .is_none()
+                .then_some(())
+        });
+        assert!(
+            b.force_deregister("md.aapl").unwrap(),
+            "B heard from A and then A left, so B can say how long it has been gone"
+        );
     }
 
     /// When the owner withdraws a channel, a subscriber must learn that its source is *gone*

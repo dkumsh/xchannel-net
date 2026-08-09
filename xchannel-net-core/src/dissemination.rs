@@ -55,6 +55,20 @@ pub trait Dissemination: Send {
     /// is what keeps the redundancy to one round instead of one round per peer.
     fn relay(&mut self, from: PeerId, delta: &[ChannelIdentity]) -> io::Result<()>;
 
+    /// Send a change back to **only** the peer it came from, because that peer is behind.
+    ///
+    /// [`relay`](Dissemination::relay) covers the case where the arriving state wins; this covers
+    /// the case where it *loses*. Without it, convergence was one-directional: a peer holding a
+    /// stale entry sent it, every recipient's merge left its own map unchanged, nothing was sent
+    /// back, and the sender kept its stale entry indefinitely — anti-entropy only runs when a link
+    /// is established, so a link that stays up never corrects it. Two nodes could then disagree
+    /// about who owns a channel for as long as they stayed connected.
+    ///
+    /// Terminates for the same reason `relay` does, with one extra step: a reply is only sent when
+    /// the arriving state differs from the winner, so the reply itself — which *is* the winner —
+    /// cannot provoke another.
+    fn reply(&mut self, to: PeerId, delta: &[ChannelIdentity]) -> io::Result<()>;
+
     /// Drive inbound traffic and housekeeping (anti-entropy exchange, heartbeats /
     /// failure detection) and return any channel identities received from peers for the
     /// caller to merge into its registry. Does the work that is currently available and

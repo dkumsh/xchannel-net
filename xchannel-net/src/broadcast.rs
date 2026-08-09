@@ -14,7 +14,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use xchannel_net_core::NodeId;
@@ -40,11 +39,42 @@ type Connected = Arc<Mutex<HashSet<SocketAddr>>>;
 /// Which node sits at the far end of each link, learned from its first heartbeat. Written by
 /// reader threads; read when deduplicating links.
 type LinkPeers = Arc<Mutex<HashMap<PeerId, (NodeId, SocketAddr)>>>;
+/// Which node was found at a **dial address**, remembered after its first heartbeat.
+///
+/// A peer's advertised control address and the address we happened to dial it on need not be the
+/// same — a seed list naming `127.0.0.1:7001` for a node that advertises `10.0.0.5:7001` is the
+/// ordinary case — so membership alone cannot answer "is the node at this dial address already
+/// linked?". Without an answer the dial was repeated every tick, deduplicated every tick, and the
+/// pair churned at the maintenance cadence forever.
+type DialIdentity = Arc<Mutex<HashMap<SocketAddr, NodeId>>>;
+/// The control address this node advertises. Shared with the reader threads because it is the only
+/// way to tell a *twin* (another machine claiming our `NodeId`) from a *self-link* (a seed list that
+/// names this node), and it is not known until the control listener has bound.
+type SelfControl = Arc<Mutex<SocketAddr>>;
+/// `NodeId`s a reader has caught being used by more than one machine, including our own. Reader
+/// threads cannot resolve this — they have no send halves and no access to the data directory — so
+/// they record it and [`BroadcastDissemination::dedup_links`] hands it to the node.
+type Conflicts = Arc<Mutex<HashSet<NodeId>>>;
+
+/// A name for a connection that **both** of its ends compute identically: its two endpoint
+/// addresses, ordered. One end's `(local, peer)` is the other's `(peer, local)`, so ordering the
+/// pair cancels the asymmetry.
+type LinkKey = (SocketAddr, SocketAddr);
+
+fn link_key(local: SocketAddr, peer: SocketAddr) -> LinkKey {
+    if local <= peer {
+        (local, peer)
+    } else {
+        (peer, local)
+    }
+}
 
 /// One peer link: the send half, plus what is needed to resolve a duplicate deterministically.
 struct Peer {
     id: PeerId,
     conn: TcpTransport,
+    /// This connection's symmetric name — the second half of the tie-break.
+    key: LinkKey,
     /// Whether **we** dialled this link. Half of the tie-break: the initiator's `NodeId` is
     /// `self_node` for an outbound link and the peer's for an inbound one, and both ends compute
     /// the same value for the same link.
@@ -66,7 +96,7 @@ pub struct BroadcastDissemination {
     liveness_timeout: Duration,
     /// The control address this node advertises, so peers can dial it back and a node that
     /// learns of us second-hand can form a direct link.
-    self_control_addr: SocketAddr,
+    self_control_addr: SelfControl,
     /// Human-readable label for this node, gossiped for display only.
     self_name: String,
     /// Send halves of peer connections, each with a stable id (broadcast target for
@@ -75,12 +105,13 @@ pub struct BroadcastDissemination {
     next_peer_id: PeerId,
     hints: Hints,
     link_peers: LinkPeers,
-    /// Whether we have already complained that another node is using our `NodeId`.
-    dup_warned: Arc<AtomicBool>,
+    /// `NodeId`s seen on two machines, as detected by the reader threads.
+    conflicts: Conflicts,
     /// Filled by per-peer reader threads; drained by [`pump`](Self::pump).
     inbox: Inbox,
     membership: SharedMembership,
     connected: Connected,
+    dial_identity: DialIdentity,
 }
 
 impl BroadcastDissemination {
@@ -88,17 +119,18 @@ impl BroadcastDissemination {
         Self {
             self_node,
             self_addr,
-            self_control_addr: self_addr,
+            self_control_addr: Arc::new(Mutex::new(self_addr)),
             self_name: String::new(),
             liveness_timeout,
             peers: Vec::new(),
             next_peer_id: NO_PEER + 1,
             hints: Arc::new(Mutex::new(VecDeque::new())),
             link_peers: Arc::new(Mutex::new(HashMap::new())),
-            dup_warned: Arc::new(AtomicBool::new(false)),
+            conflicts: Arc::new(Mutex::new(HashSet::new())),
             inbox: Arc::new(Mutex::new(VecDeque::new())),
             membership: Arc::new(Mutex::new(Membership::new())),
             connected: Arc::new(Mutex::new(HashSet::new())),
+            dial_identity: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -128,6 +160,11 @@ impl BroadcastDissemination {
         r
     }
 
+    /// How many peer links are currently held, in either direction.
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
     /// Whether an outbound link to `addr` is currently believed connected.
     pub fn is_connected(&self, addr: SocketAddr) -> bool {
         self.connected.lock_safe().contains(&addr)
@@ -142,6 +179,8 @@ impl BroadcastDissemination {
         initial_sync: &[ChannelIdentity],
     ) -> io::Result<()> {
         let reader = transport.try_clone()?;
+        let (local, peer) = transport.endpoints()?;
+        let key = link_key(local, peer);
         let id = self.next_peer_id;
         self.next_peer_id += 1;
         spawn_reader(
@@ -154,7 +193,9 @@ impl BroadcastDissemination {
             Arc::clone(&self.link_peers),
             addr,
             self.self_node,
-            Arc::clone(&self.dup_warned),
+            Arc::clone(&self.self_control_addr),
+            Arc::clone(&self.conflicts),
+            Arc::clone(&self.dial_identity),
         );
 
         let mut send = transport;
@@ -164,7 +205,11 @@ impl BroadcastDissemination {
         send.send_frame(&encode_control(&self.heartbeat()))?;
         // Introduce everyone we already know, so a joiner learns the whole mesh from one link
         // instead of only its seed. Sent once per link, not periodically.
-        for (node, addr, control_addr, name) in self.membership.lock_safe().directory() {
+        // Bind the directory *before* the loop: a guard temporary in a `for` head lives to the end
+        // of the loop, so this held the membership lock across every blocking send. One peer that
+        // stopped reading would stall every reader thread waiting on that lock.
+        let directory = self.membership.lock_safe().directory();
+        for (node, addr, control_addr, name) in directory {
             if node == self.self_node {
                 continue;
             }
@@ -178,6 +223,7 @@ impl BroadcastDissemination {
         self.peers.push(Peer {
             id,
             conn: send,
+            key,
             outbound: addr.is_some(),
         });
         Ok(())
@@ -194,8 +240,11 @@ impl BroadcastDissemination {
     /// Resolution must be one both ends reach independently, or they would drop opposite links
     /// and be left with none. **Keep the link whose initiator has the lower `NodeId`** — each end
     /// knows, for each link, whether it dialled and who the peer is, so both compute the same
-    /// initiator for the same link. The `PeerId` tie-break below is for two links with the same
-    /// initiator, which `connected` already prevents; it exists only to make the ordering total.
+    /// initiator for the same link. Ties (two links with the *same* initiator, which two dial
+    /// addresses for one peer produce) break on the link's own symmetric name, so that ordering is
+    /// shared too. It used to break on `PeerId`, a per-process counter: the two ends numbered the
+    /// same pair of links differently, each kept the one the other dropped, and the peers were left
+    /// with **no** link at all — then re-dialled and did it again every tick.
     /// Returns any `NodeId` found on **two different machines** — see the note in the body.
     pub fn dedup_links(&mut self) -> Vec<NodeId> {
         let ids = self.link_peers.lock_safe().clone();
@@ -212,11 +261,18 @@ impl BroadcastDissemination {
                 addrs.entry(node).or_default().insert(control);
             }
         }
-        let conflicted: HashSet<NodeId> = addrs
+        let mut conflicted: HashSet<NodeId> = addrs
             .iter()
             .filter(|(_, a)| a.len() > 1)
             .map(|(&n, _)| n)
             .collect();
+        // Two links are only *one* of the two ways a duplicate shows up, and not the way that
+        // matters most. When the duplicated id is **ours**, there is nothing to compare: a twin
+        // claiming our id appears on a single link, so this set was empty and the node never learned
+        // it had to step aside — the exact case (a cloned image) that the step-aside exists for.
+        // The readers catch it instead, by noticing a heartbeat that claims our id from an address
+        // that is not ours, and leave it here.
+        conflicted.extend(self.conflicts.lock_safe().iter().copied());
 
         let key = |p: &Peer| {
             ids.get(&p.id)
@@ -225,10 +281,10 @@ impl BroadcastDissemination {
         };
 
         // The winning (initiator, link) per node.
-        let mut winner: HashMap<NodeId, (NodeId, PeerId)> = HashMap::new();
+        let mut winner: HashMap<NodeId, (NodeId, LinkKey)> = HashMap::new();
         for p in &self.peers {
             if let Some((node, init)) = key(p) {
-                let cand = (init, p.id);
+                let cand = (init, p.key);
                 winner
                     .entry(node)
                     .and_modify(|best| {
@@ -244,7 +300,7 @@ impl BroadcastDissemination {
             self.peers.drain(..).partition(|p| match key(p) {
                 // Identity not learned yet — keep it; the next tick decides.
                 None => true,
-                Some((node, init)) => winner.get(&node) == Some(&(init, p.id)),
+                Some((node, init)) => winner.get(&node) == Some(&(init, p.key)),
             });
         for p in drop {
             // Shut the socket so the far end's reader unblocks now rather than whenever the OS
@@ -266,9 +322,17 @@ impl BroadcastDissemination {
             .collect()
     }
 
-    /// Which node is known to sit at `control`, if any.
-    pub fn node_at(&self, control: SocketAddr) -> Option<NodeId> {
-        self.membership.lock_safe().node_at(control)
+    /// Which node is known to sit at `addr`, if any — by its advertised control address first, and
+    /// otherwise by what a previous dial to that exact address turned out to reach.
+    ///
+    /// Membership takes precedence because it is current: a cached dial outcome is only evidence
+    /// about the past, and a node whose address was reused by another would otherwise keep answering
+    /// with the wrong identity.
+    pub fn node_at(&self, addr: SocketAddr) -> Option<NodeId> {
+        self.membership
+            .lock_safe()
+            .node_at(addr)
+            .or_else(|| self.dial_identity.lock_safe().get(&addr).copied())
     }
 
     /// This node's own heartbeat frame.
@@ -276,7 +340,7 @@ impl BroadcastDissemination {
         ControlMsg::Heartbeat {
             node: self.self_node,
             addr: self.self_addr,
-            control_addr: self.self_control_addr,
+            control_addr: *self.self_control_addr.lock_safe(),
             name: self.self_name.clone(),
         }
     }
@@ -337,7 +401,12 @@ impl BroadcastDissemination {
     /// Set the control address advertised to peers — used after binding the control listener to
     /// an ephemeral port, so what we gossip is the address that actually accepts connections.
     pub fn set_self_control_addr(&mut self, addr: SocketAddr) {
-        self.self_control_addr = addr;
+        *self.self_control_addr.lock_safe() = addr;
+    }
+
+    /// The control address this node advertises — so the dialler can decline to dial itself.
+    pub fn self_control_addr(&self) -> SocketAddr {
+        *self.self_control_addr.lock_safe()
     }
 
     /// Send a `Heartbeat` (this node + its address) to every peer. The caller drives the
@@ -362,8 +431,10 @@ impl BroadcastDissemination {
             .live_addr_of(node, self.liveness_timeout)
     }
 
-    /// How long since `node` was last heard from; `None` if never. Used to judge whether an
-    /// owner is *gone* rather than momentarily silent.
+    /// How long since we last had **direct** evidence of `node` — a heartbeat, or its own notice
+    /// that it was leaving; `None` if we have never had contact, including for a node known only by
+    /// hearsay. Used to judge whether an owner is *gone* rather than momentarily silent, so `None`
+    /// has to mean "cannot say", never "gone for ages".
     pub fn silent_for(&self, node: NodeId) -> Option<std::time::Duration> {
         self.membership.lock_safe().silent_for(node)
     }
@@ -381,8 +452,20 @@ impl BroadcastDissemination {
 
     /// Broadcast to every peer except `from`; drops peers whose send fails (disconnected).
     fn send_except(&mut self, from: PeerId, frame: &[u8]) {
-        self.peers
-            .retain_mut(|p| p.id == from || p.conn.send_frame(frame).is_ok());
+        self.peers.retain_mut(|p| {
+            if p.id == from {
+                return true;
+            }
+            match p.conn.send_frame(frame) {
+                Ok(()) => true,
+                Err(_) => {
+                    // Shut it down rather than just dropping our handle, so the reader thread on
+                    // the other half unblocks and cleans up instead of lingering forever.
+                    let _ = p.conn.shutdown();
+                    false
+                }
+            }
+        });
     }
 }
 
@@ -396,6 +479,17 @@ impl Dissemination for BroadcastDissemination {
     fn relay(&mut self, from: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
         let frame = encode_control(&ControlMsg::RegistryDelta(delta.to_vec()));
         self.send_except(from, &frame);
+        Ok(())
+    }
+
+    fn reply(&mut self, to: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
+        let frame = encode_control(&ControlMsg::RegistryDelta(delta.to_vec()));
+        if let Some(p) = self.peers.iter_mut().find(|p| p.id == to)
+            && p.conn.send_frame(&frame).is_err()
+        {
+            let _ = p.conn.shutdown();
+            self.peers.retain(|p| p.id != to);
+        }
         Ok(())
     }
 
@@ -426,8 +520,11 @@ fn spawn_reader(
     link_peers: LinkPeers,
     addr: Option<SocketAddr>,
     self_node: NodeId,
-    dup_warned: Arc<AtomicBool>,
+    self_control: SelfControl,
+    conflicts: Conflicts,
+    dial_identity: DialIdentity,
 ) {
+    let dial_addr = addr;
     std::thread::spawn(move || {
         while let Ok(bytes) = reader.recv_frame() {
             let Ok(msg) = decode_control(&bytes) else {
@@ -446,21 +543,32 @@ fn spawn_reader(
                     control_addr,
                     name,
                 } => {
+                    if node == self_node {
+                        // Either we dialled ourselves, or another machine is using our id — and the
+                        // advertised control address separates the two exactly, because a heartbeat
+                        // always carries the sender's own advertised address rather than the address
+                        // it was reached on. Same address ⇒ this link is a loop back to us, which a
+                        // seed list naming every node (including this one) produces routinely.
+                        if control_addr != *self_control.lock_safe() {
+                            conflicts.lock_safe().insert(node);
+                        }
+                        // **Never `record` under our own id, in either case.** Doing so overwrote
+                        // our own membership entry with the twin's addresses, and since
+                        // `unconnected_peers` skips `self_node`, the twin was then permanently
+                        // excluded from the dial candidates — the two would never meet again, and
+                        // the duplicate could not be resolved even in principle. Leaving the link's
+                        // identity unclaimed also keeps a self-link out of the tie-break, where it
+                        // would compete with a real peer's link.
+                        continue;
+                    }
                     // A heartbeat is the only thing that says who is on the far end of this link,
                     // which is what makes duplicate links resolvable.
                     link_peers.lock_safe().insert(id, (node, control_addr));
-                    // Nothing assigns or enforces `NodeId`s, so a misconfiguration lands here.
-                    // Say so once: a shared id makes two nodes indistinguishable in the membership
-                    // map, in channel ownership, and in link deduplication — where it would drop
-                    // the link between two genuinely different peers.
-                    if node == self_node && !dup_warned.swap(true, Ordering::Relaxed) {
-                        eprintln!(
-                            "xchanneld: WARNING: peer at {control_addr} claims NodeId {} — the \
-                             same as ours. NodeIds must be unique across the mesh; channel \
-                             ownership, membership and peer links are all keyed on them. Set \
-                             XCHANNELD_NODE_ID (it defaults to 1).",
-                            node.0
-                        );
+                    // `dial_addr`, not the heartbeat's `addr` field: one is where we reached this
+                    // peer, the other is the stream address it advertises, and the shadowing here is
+                    // exactly the confusion this rename avoids.
+                    if let Some(dialled) = dial_addr {
+                        dial_identity.lock_safe().insert(dialled, node);
                     }
                     if membership
                         .lock_safe()
@@ -479,6 +587,14 @@ fn spawn_reader(
                     control_addr,
                     name,
                 } => {
+                    if node == self_node {
+                        // Hearsay about ourselves. Our own heartbeat is the authority on our
+                        // addresses, and `learn`ing them from a third party would overwrite that
+                        // entry with a twin's — the same trap as above, reached from the other side.
+                        // A twin's *existence* is still detected, but only by the heartbeat path,
+                        // which is the only one that can distinguish it from a self-link.
+                        continue;
+                    }
                     if membership
                         .lock_safe()
                         .learn(node, addr, control_addr, &name)
@@ -493,11 +609,26 @@ fn spawn_reader(
                 // node that somehow is not adjacent falls back to the liveness timeout, exactly as
                 // it would for a peer that crashed.
                 ControlMsg::Leaving { node } => {
-                    membership.lock_safe().retire(node);
+                    // Only the peer on *this* link may announce its own departure. Accepting a
+                    // third party's id would let one node mark another not-live, which under a
+                    // duplicate id meant a departing twin silenced its still-serving sibling.
+                    if link_peers.lock_safe().get(&id).map(|(n, _)| *n) == Some(node) {
+                        membership.lock_safe().retire(node);
+                    }
                 }
                 _ => {} // not expected on a peer link
             }
         }
+        // **Shut the socket down.** The reader owns only a `try_clone` dup of the fd, so dropping
+        // it leaves the connection ESTABLISHED and our *send* half writable. Nothing else prunes
+        // `peers` except a send failure, and `dedup_links` deliberately keeps a link whose identity
+        // it does not know — which this exit has just erased. The result was a zombie peer that
+        // (a) leaked an fd and a thread every tick as `connected` was cleared and the node re-dialled,
+        // (b) eventually wedged `emit_heartbeat` inside `write_all` while holding the dissemination
+        // lock, stalling the entire node silently, and (c) shared an initiator with its own
+        // replacement, so the far end's tie-break kept the zombie and killed every fresh link.
+        // Shutting down makes the far end's next write fail, so its `send_except` reaps the peer.
+        let _ = reader.shutdown();
         // Connection dropped: forget who was on it, and clear outbound tracking so the node
         // reconnects.
         link_peers.lock_safe().remove(&id);
@@ -524,6 +655,69 @@ mod tests {
             epoch: 0,
             deleted: false,
             member_of: None,
+        }
+    }
+
+    /// **The duplicate that matters is the one where the duplicated id is ours**, and it is invisible
+    /// to link deduplication: a twin claiming our `NodeId` shows up on a *single* link, so there are
+    /// never two links to compare. Before this, a cloned image — every copy carrying the same
+    /// `.node_id` — was never reported, and the step-aside that exists precisely for that case never
+    /// ran.
+    ///
+    /// The advertised control address is what separates it from a link we opened to *ourselves*,
+    /// which a seed list naming every node in the mesh produces routinely and which must not be
+    /// mistaken for a duplicate. A heartbeat always carries the sender's own advertised address, so
+    /// the comparison is exact rather than a heuristic.
+    #[test]
+    fn a_twin_claiming_our_id_is_reported_and_a_link_to_ourselves_is_not() {
+        let ours: SocketAddr = "127.0.0.1:9101".parse().unwrap();
+        let theirs: SocketAddr = "127.0.0.1:9102".parse().unwrap();
+
+        for (advertised, expect_conflict) in [(theirs, true), (ours, false)] {
+            let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let listen_addr = listener.local_addr().unwrap();
+            let accept = std::thread::spawn(move || listener.accept().unwrap());
+            let mut far = TcpTransport::connect(listen_addr).unwrap();
+            let near = accept.join().unwrap();
+
+            let mut us = BroadcastDissemination::new(NodeId(7), ours, Duration::from_secs(60));
+            us.set_self_control_addr(ours);
+            us.add_peer(near, &[]).unwrap();
+
+            // The far end claims *our* id. Only the address it advertises distinguishes a twin from
+            // this node reaching itself.
+            far.send_frame(&encode_control(&ControlMsg::Heartbeat {
+                node: NodeId(7),
+                addr: advertised,
+                control_addr: advertised,
+                name: "twin".into(),
+            }))
+            .unwrap();
+
+            let mut conflicts = Vec::new();
+            for _ in 0..2000 {
+                conflicts = us.dedup_links();
+                if !conflicts.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                conflicts.contains(&NodeId(7)),
+                expect_conflict,
+                "advertised {advertised}, ours {ours}"
+            );
+
+            // Either way, our own membership entry must not have been overwritten with the far
+            // end's addresses. It was: `record` was called under our own id, and since
+            // `unconnected_peers` skips `self_node`, the twin was then permanently excluded from the
+            // dial candidates — the two could never meet again, so the duplicate could not be
+            // resolved even in principle.
+            assert_eq!(
+                us.addr_of(NodeId(7)),
+                None,
+                "a node must never record itself in its own membership map"
+            );
         }
     }
 

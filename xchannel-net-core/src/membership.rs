@@ -31,6 +31,15 @@ struct Member {
     /// it. Liveness by hearsay would let a node on the far side of a partition look reachable
     /// because a third party said so — exactly the case `force_deregister` exists to refuse.
     last_seen: Option<Instant>,
+    /// The last instant at which we had *direct* evidence of this node's state — a heartbeat, or
+    /// the moment it told us it was leaving. Unlike `last_seen` this is never cleared, which is
+    /// what makes silence measurable: `last_seen` goes to `None` exactly when a node stops being
+    /// live, and that is precisely when someone starts asking how long it has been gone.
+    ///
+    /// `None` only for a node known purely by hearsay — we have never had contact, so we cannot
+    /// say anything about its silence, and callers must treat that as "no answer" rather than as
+    /// "gone a long time".
+    last_contact: Option<Instant>,
 }
 
 /// Known peers and where to reach them, refreshed by heartbeats.
@@ -57,6 +66,7 @@ impl Membership {
         control_addr: SocketAddr,
         name: &str,
     ) -> bool {
+        let now = Instant::now();
         let novel = self
             .members
             .get(&node)
@@ -67,7 +77,8 @@ impl Membership {
                 addr,
                 control_addr,
                 name: name.to_string(),
-                last_seen: Some(Instant::now()),
+                last_seen: Some(now),
+                last_contact: Some(now),
             },
         );
         novel
@@ -102,6 +113,7 @@ impl Membership {
                         control_addr,
                         name: name.to_string(),
                         last_seen: None,
+                        last_contact: None,
                     },
                 );
                 true
@@ -134,7 +146,16 @@ impl Membership {
     /// needs no special handling. Returns whether this actually changed anything.
     pub fn retire(&mut self, node: NodeId) -> bool {
         match self.members.get_mut(&node) {
-            Some(m) => m.last_seen.take().is_some(),
+            Some(m) => {
+                // Stamp the departure, so `last_seen` is the *only* thing this clears. In practice
+                // it coincides with the last heartbeat — a `Leaving` can only arrive over a direct
+                // link, and `record` already stamped it — but making that a coincidence rather than
+                // a dependency is what keeps this from being the one path that erases the evidence
+                // `silent_for` needs. Without contact history a departed node is indistinguishable
+                // from one never met, and its names could never be reclaimed from here.
+                m.last_contact = Some(Instant::now());
+                m.last_seen.take().is_some()
+            }
             None => false,
         }
     }
@@ -173,13 +194,19 @@ impl Membership {
             .map(|m| m.addr)
     }
 
-    /// How long since `node` was last heard from, or `None` if it has never been heard from
-    /// at all. Callers deciding whether an owner is *gone* (rather than momentarily silent)
-    /// need the duration, not just the live/not-live verdict.
+    /// How long since we last had **direct** evidence of `node` — a heartbeat, or its own
+    /// announcement that it was leaving. `None` if we have never had contact at all, including
+    /// for a node we only know of by hearsay.
+    ///
+    /// Callers deciding whether an owner is *gone* (rather than momentarily silent) need the
+    /// duration, not the live/not-live verdict — and they need `None` to mean "this node cannot
+    /// answer that question", never "gone for ages". Reading `last_seen` here would have made
+    /// silence unmeasurable the moment it mattered: `retire` clears it, and a stale entry keeps
+    /// reporting a growing duration only while it is still there to report it.
     pub fn silent_for(&self, node: NodeId) -> Option<Duration> {
         self.members
             .get(&node)
-            .and_then(|m| m.last_seen)
+            .and_then(|m| m.last_contact)
             .map(|t| t.elapsed())
     }
 
@@ -227,6 +254,31 @@ mod tests {
 
     fn addr(p: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], p))
+    }
+
+    /// Silence has to remain measurable *after* a node stops being live, because that is the only
+    /// time anyone asks. A departure stamps the clock; hearsay never does.
+    #[test]
+    fn silence_is_measurable_after_a_departure_but_never_from_hearsay() {
+        let mut m = Membership::new();
+        m.record(NodeId(1), addr(7001), addr(8001), "gone-soon");
+        m.retire(NodeId(1));
+        assert!(
+            m.live_members(Duration::from_secs(60)).is_empty(),
+            "it said it was leaving"
+        );
+        assert!(
+            m.silent_for(NodeId(1)).is_some(),
+            "we heard from it once, so we can say how long ago that was — otherwise its names \
+             could never be reclaimed from this node"
+        );
+
+        m.learn(NodeId(2), addr(7002), addr(8002), "hearsay");
+        assert_eq!(
+            m.silent_for(NodeId(2)),
+            None,
+            "a node we have never had contact with cannot be reported as silent for any duration"
+        );
     }
 
     #[test]

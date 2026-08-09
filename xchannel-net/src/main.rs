@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 use xchannel_net::NodeConfig;
 use xchannel_net::node::{MuxIdle, Node};
-use xchannel_net_core::NodeId;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -205,6 +204,21 @@ fn main() -> std::io::Result<()> {
                  SECURITY.md."
             );
         }
+        // A wildcard bind is a perfectly good way to *listen* and a useless thing to *advertise*,
+        // and this node advertises exactly what it bound. Peers gossip the address onwards, so one
+        // wildcard-bound node teaches the whole mesh an address nobody can dial. Everything then
+        // depends on this node dialling out first — and duplicate-id detection, which distinguishes
+        // a twin from a self-link by comparing advertised control addresses, degrades too, because
+        // two wildcard-bound machines advertise the *same* address.
+        if addr.ip().is_unspecified() {
+            eprintln!(
+                "xchanneld[{node_id}]: WARNING: {plane} plane bound to the wildcard address \
+                 {addr}, which is what it will advertise to peers — they cannot dial it back, so \
+                 links form only in the outbound direction and duplicate-NodeId detection is \
+                 weakened. Set XCHANNELD_{}_ADDR to an address peers can reach.",
+                plane.to_uppercase(),
+            );
+        }
     }
 
     // Restart = reconstruct (DESIGN.md §5.2, doc/RESTART.md): re-host topics and re-register
@@ -227,7 +241,12 @@ fn main() -> std::io::Result<()> {
         );
     }
 
-    node.connect_seeds();
+    // Serve *before* dialling. `connect_seeds` is serial with a 1 s timeout per address, so a
+    // cold start against a seed list containing unreachable members stalled here for seconds —
+    // measured at 25 s for 25 blackholed seeds — with the listeners already bound. A peer's TCP
+    // connect therefore succeeded, it recorded us as connected, and then waited: the node looked
+    // ready and served nothing. The maintenance loop dials anyway, so nothing is lost by letting
+    // it do the work.
     for (node, run) in [
         (node.clone(), Plane::Control(control_listener)),
         (node.clone(), Plane::Client(client_listener)),
