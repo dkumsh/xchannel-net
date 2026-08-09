@@ -286,9 +286,23 @@ node-wide stall — and a socket send timeout is *not* such a bound: `write_all`
 syscall moved a byte, so three unresponsive peers produced a 15 s heartbeat gap against a 10 s liveness
 timeout, and a peer merely draining at 128 KiB/s produced 19 s without the timeout ever firing.
 Registry frames are therefore capped at a few hundred identities (anti-entropy, which sends the whole
-registry, is chunked), and writes are given deadlines after which the peer is dropped — one deadline for
-the entire join-time exchange rather than one per frame, because hundreds of frames each passing their
-own check individually still add up to a stalled lock.
+registry, is chunked), and **each burst of frames shares one deadline** — a budget per frame is not a
+bound on a sequence of them, and every path that carries a whole registry is such a sequence: a peer
+draining just fast enough to clear each individual check held the control plane for 13.4 s, four times
+the liveness budget, without any bound firing.
+
+That deadline is **derived from the burst's size against a minimum drain rate**, not fixed. A fixed one
+cannot be both large enough for a healthy peer and small enough to bound the tick, because the payload
+is a whole registry: at the rate a real daemon drains, half a second buys under 7 MB, so a *healthy*
+peer holding a large registry would have been unable to form a link at all. Expressed as a rate, the
+policy reads "a peer slower than this is not keeping up", which holds whatever the registry size and
+whatever the link. Small periodic frames — heartbeats, hints, departures — get a small fixed budget
+instead, because they go to every peer in one pass and so cost P times whatever is chosen.
+
+What that leaves, stated plainly rather than asserted away: a burst of R bytes may hold the
+dissemination lock for up to `R / rate`. Bounding *that* requires not holding the lock across the write
+— a per-peer outbox, which the stream plane already has — and is post-0.3.0 work. The build-time
+assertion therefore covers the connect portion of a tick only, and says so.
 
 A related ordering is load-bearing and easy to get backwards: a node **spawns its reader before** sending
 its own join, so that it drains its peer while writing. Both ends of a pair dial, so both adopt at once;
@@ -297,9 +311,15 @@ and both drop the link — then retry identically for ever. Relays and
 replies are coalesced to one frame per *source link* per pump cycle rather than one per identity: that
 alone took a 200 000-identity delta from a 40 s heartbeat gap to 0.7 s.
 
-**Member attachment is capped per tick.** Each remote member not yet replicating costs a bounded
-resolve, and the count used to be unbounded: fifty of them made a tick 10.5 s. Attachment is idempotent
-and retried every tick, so a cap delays it rather than losing it.
+**Member attachment skips what it cannot resolve, and rotates the rest.** Each remote member not yet
+replicating costs a bounded resolve, and the count used to be unbounded: fifty of them made a tick
+10.5 s. But a cap alone was worse than the problem — a member whose owner is unreachable can *never* be
+resolved, so it consumed a slot on every tick for ever, and because the registry is a `BTreeMap` the
+same few names took every slot in the same order, so members behind them were never attempted at all. A
+topic silently stopped merging its live members. Two changes: a member whose owner is not a live member
+is skipped for free (the liveness is already known, and that is the entire population that used to clog
+the queue), and the walk rotates, because a cap over a deterministically-ordered list starves whatever
+sorts last — the same lesson as the dial cursors, learned twice.
 
 A build-time assertion ties the worst-case dial spend — count × (connect timeout + frame budget) — to
 `LIVENESS_TIMEOUT`, keeping a fixed reserve back for everything else in the tick. Read it as a bound on
@@ -326,7 +346,10 @@ is not ours is a twin, and the same heartbeat carrying *our own* advertised addr
 we opened to ourselves — which a seed list naming every node produces routinely and which must never
 be mistaken for a duplicate.
 
-**A wildcard bind defeats all of this, so a node can advertise something other than what it bound.**
+**A wildcard bind defeats all of this, so a node can advertise something other than what it bound**, and
+the advertised value must be *per instance* — two nodes advertising one address are as indistinguishable
+as two nodes advertising a wildcard, since it is advertised addresses that duplicate detection compares.
+Both mistakes warn at startup.
 Every mechanism above compares *advertised* control addresses, and a node bound to `0.0.0.0` advertises
 exactly that: peers cannot dial it back, and — because every wildcard-bound node advertises the same
 address — two of them sharing an id are indistinguishable, so their links are collapsed as duplicate

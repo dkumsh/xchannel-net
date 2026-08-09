@@ -74,33 +74,49 @@ fn link_key(local: SocketAddr, peer: SocketAddr) -> LinkKey {
     }
 }
 
-/// How long **one frame** to one peer may take before that peer is treated as dead.
-///
-/// The control plane writes while holding the dissemination lock, which the heartbeat also needs, so
-/// this is the bound on how long a single unresponsive peer can stop everything. It has to be a bound
-/// on the *frame*: `SO_SNDTIMEO` alone bounds a syscall, and `write_all` retries whenever a byte
-/// moved, which measured 4.1 s per wedged peer at a 2 s setting and 19 s for a peer draining slowly
-/// enough that the timeout never fired. Hence [`TcpTransport::send_frame_within`].
-///
-/// 250 ms is enormous for a healthy peer — frames are capped at [`MAX_IDENTITIES_PER_FRAME`]
-/// identities, some tens of kilobytes, which drains in microseconds even on a slow link — and keeping
-/// it small is what bounds a *broadcast*: writes are serial, so P unresponsive peers cost P × this,
-/// once each, before they are dropped. It is also charged against the tick's dial budget (see the
-/// build-time assertion in `node.rs`), because a successful dial writes the join-time sync.
-pub(crate) const PEER_FRAME_BUDGET: Duration = Duration::from_millis(250);
-
 /// Per-syscall slice, so no single `write` parks indefinitely. The frame budget above is what actually
 /// decides; this only keeps a blocked syscall from outliving it.
 const PEER_WRITE_SLICE: Duration = Duration::from_millis(100);
 
-/// Total budget for one peer's whole join-time exchange — the chunked registry sync, the heartbeat and
-/// the directory — sharing a single deadline.
+/// Rough encoded size of one `ChannelIdentity`, for sizing a burst's deadline. An estimate is
+/// sufficient: it scales the deadline, and being wrong by a factor of two moves a bound that is
+/// generous by a factor of three.
+const APPROX_IDENTITY_BYTES: usize = 128;
+
+/// The minimum rate a peer must sustain to keep its link during a registry burst.
 ///
-/// Per-frame budgets do not compose: the sync is hundreds of frames, so a peer draining just fast enough
-/// to pass each frame individually could hold the dissemination lock for the sum of them. This is the
-/// number the tick's dial budget is charged (see the build-time assertion in `node.rs`), because a
-/// successful dial performs a join before it returns.
-pub(crate) const PEER_JOIN_BUDGET: Duration = Duration::from_millis(500);
+/// **A burst's deadline is derived from its size, not fixed.** That distinction is the whole design:
+/// a fixed budget cannot be both large enough for a healthy peer and small enough to bound the tick,
+/// because the payload is a whole registry and registries have no bound. Sized as a time, 500 ms buys
+/// 6.8 MB at the ~13.6 MB/s a real daemon drains at — so a *healthy* peer with a 200 000-channel
+/// registry would have failed it. Sized as a rate, the same policy reads "a peer slower than this is
+/// not keeping up", which is true independently of how big the registry is or how fast the link is.
+///
+/// 4 MiB/s is roughly a third of what an idle daemon on a LAN sustains, so a peer three times degraded
+/// still keeps its link. Below it, the peer is dropped rather than allowed to hold the control plane.
+///
+/// The residual, stated plainly because it cannot be fixed by choosing a better number: a burst of R
+/// bytes may hold the dissemination lock for up to `R / MIN_DRAIN_RATE`. At 10 MB that is 2.5 s; at
+/// 40 MB it exceeds `LIVENESS_TIMEOUT`. Bounding *that* requires not holding the lock across the write
+/// — a per-peer outbox, as the stream plane already has (`FramedConn`). That is post-0.3.0 work.
+const MIN_DRAIN_RATE: u64 = 4 << 20;
+
+/// Floor under a burst's deadline, so a small delta is not given a microscopic budget.
+const PEER_BURST_MIN: Duration = Duration::from_millis(500);
+
+/// Budget for a single *small* frame — a heartbeat, a hint, a departure notice. Tens of bytes, so a
+/// peer that cannot take one in this long is wedged rather than slow.
+///
+/// Deliberately much smaller than a burst's, because these are the frames sent to **every** peer in one
+/// pass: the cost of a heartbeat broadcast is P times this, and at the ≤100-node target a 250 ms budget
+/// made that 25 s. Each failed write also drops its peer, so the cost is paid once.
+const PEER_SMALL_FRAME_BUDGET: Duration = Duration::from_millis(50);
+
+/// How long a burst of `bytes` may take in total before the peer is treated as not keeping up.
+fn burst_deadline(bytes: usize) -> Instant {
+    let allowed = Duration::from_micros((bytes as u64).saturating_mul(1_000_000) / MIN_DRAIN_RATE);
+    Instant::now() + allowed.max(PEER_BURST_MIN)
+}
 
 /// Identities per control frame.
 ///
@@ -242,9 +258,11 @@ impl BroadcastDissemination {
     ) -> io::Result<()> {
         // Every control-plane write happens while holding the dissemination lock, which is also what
         // the heartbeat needs, so an unbounded write is a node-wide stall. `PEER_WRITE_SLICE` keeps a
-        // single syscall from parking; `PEER_FRAME_BUDGET` is the bound that matters, applied per frame
-        // by `send_frame_within`.
-        let _ = transport.set_write_timeout(Some(PEER_WRITE_SLICE));
+        // single syscall from parking; the deadline each send is given is the bound that matters.
+        // **Not `let _ =`.** This is the sole precondition of every write bound below: `write_all_by`
+        // only consults its deadline *between* syscalls, so without a per-syscall timeout a single
+        // `write` parks indefinitely and every deadline in this file silently stops existing.
+        transport.set_write_timeout(Some(PEER_WRITE_SLICE))?;
         let (local, peer) = transport.endpoints()?;
         let key = link_key(local, peer);
         let reader = transport.try_clone()?;
@@ -266,9 +284,9 @@ impl BroadcastDissemination {
             Arc::clone(&self.dial_identity),
         );
 
-        // One deadline for the whole exchange, not one per frame — see `PEER_JOIN_BUDGET`. On any
-        // failure the socket is shut down, which is what stops the reader thread above from outliving
-        // this call.
+        // One deadline for the whole exchange, not one per frame — see `MIN_DRAIN_RATE`. On any failure
+        // the socket is shut down, which is what stops the reader thread above from outliving this
+        // call.
         match self.write_join(&mut transport, initial_sync) {
             Ok(()) => {
                 self.peers.push(Peer {
@@ -293,7 +311,13 @@ impl BroadcastDissemination {
         transport: &mut TcpTransport,
         initial_sync: &[ChannelIdentity],
     ) -> io::Result<()> {
-        let deadline = Instant::now() + PEER_JOIN_BUDGET;
+        // Derived from the payload, for the reason given on `MIN_DRAIN_RATE`: a fixed 500 ms could not
+        // fit a healthy peer's whole registry, so it turned "this peer is too slow" into "this registry
+        // is too big" and made large deployments unable to form links at all. The floor keeps a small
+        // join generous.
+        let deadline = burst_deadline(
+            initial_sync.len() * APPROX_IDENTITY_BYTES + self.membership.lock_safe().len() * 64,
+        );
         // Chunked, because anti-entropy carries the entire registry and one frame of it was measured at
         // 10.6 MB taking 6.1 s to write to a stalled peer. The receiver merges each frame independently
         // and the merge is idempotent and order-free, so splitting is invisible to it.
@@ -449,6 +473,9 @@ impl BroadcastDissemination {
     /// with cycles goes quiet once everyone knows everyone.
     pub fn relay_hints(&mut self) {
         let pending: Vec<_> = self.hints.lock_safe().drain(..).collect();
+        // One deadline across every hint and every peer. Each hint used to get its own, so a forming
+        // 20-node mesh meant 19 hints × 19 peers = 361 independent budgets in a single tick.
+        let deadline = burst_deadline(pending.len() * 128);
         for (from, node, addr, control_addr, name) in pending {
             if node == self.self_node {
                 continue; // never gossip about ourselves second-hand; our heartbeat says it
@@ -459,7 +486,7 @@ impl BroadcastDissemination {
                 control_addr,
                 name,
             });
-            self.send_except(from, &frame);
+            self.send_except(from, &frame, deadline);
         }
     }
 
@@ -470,7 +497,7 @@ impl BroadcastDissemination {
         let frame = encode_control(&ControlMsg::Leaving {
             node: self.self_node,
         });
-        self.broadcast(&frame);
+        self.broadcast(&frame, Instant::now() + PEER_SMALL_FRAME_BUDGET);
     }
 
     /// Addresses a third party has reported *our own* `NodeId` at, and which we hold no link to.
@@ -527,7 +554,10 @@ impl BroadcastDissemination {
     /// cadence; peers refresh our membership entry on receipt.
     pub fn emit_heartbeat(&mut self) -> io::Result<()> {
         let hb = encode_control(&self.heartbeat());
-        self.broadcast(&hb);
+        // A per-peer budget, and a small one: this frame goes to *every* peer in one pass, so its cost
+        // is P times whatever is chosen here. At the ≤100-node target a 250 ms budget made the
+        // heartbeat broadcast — the very thing the liveness timeout measures — worth 25 s.
+        self.broadcast(&hb, Instant::now() + PEER_SMALL_FRAME_BUDGET);
         Ok(())
     }
 
@@ -560,17 +590,17 @@ impl BroadcastDissemination {
     }
 
     /// Best-effort broadcast to all peers; drops peers whose send fails (disconnected).
-    fn broadcast(&mut self, frame: &[u8]) {
-        self.send_except(NO_PEER, frame);
+    fn broadcast(&mut self, frame: &[u8], deadline: Instant) {
+        self.send_except(NO_PEER, frame, deadline);
     }
 
     /// Broadcast to every peer except `from`; drops peers whose send fails (disconnected).
-    fn send_except(&mut self, from: PeerId, frame: &[u8]) {
+    fn send_except(&mut self, from: PeerId, frame: &[u8], deadline: Instant) {
         self.peers.retain_mut(|p| {
             if p.id == from {
                 return true;
             }
-            match p.conn.send_frame_within(frame, PEER_FRAME_BUDGET) {
+            match p.conn.send_frame_by(frame, deadline) {
                 Ok(()) => true,
                 Err(_) => {
                     // Shut it down rather than just dropping our handle, so the reader thread on
@@ -585,28 +615,36 @@ impl BroadcastDissemination {
 
 impl Dissemination for BroadcastDissemination {
     fn announce(&mut self, delta: &[ChannelIdentity]) -> io::Result<()> {
+        // One deadline for the whole burst, not one per chunk. A budget per chunk is not a bound on a
+        // sequence of chunks — this diff's own `write_join` says so — and a peer draining just fast
+        // enough to clear each 250 ms check individually held the lock for the sum of them: measured at
+        // 13.4 s for a 600 000-identity relay, four times over the liveness budget, with no bound
+        // firing at any point and the peer never dropped.
+        let deadline = burst_deadline(delta.len() * APPROX_IDENTITY_BYTES);
         for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
             let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
-            self.broadcast(&frame);
+            self.broadcast(&frame, deadline);
         }
         Ok(())
     }
 
     fn relay(&mut self, from: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
+        let deadline = burst_deadline(delta.len() * APPROX_IDENTITY_BYTES);
         for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
             let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
-            self.send_except(from, &frame);
+            self.send_except(from, &frame, deadline);
         }
         Ok(())
     }
 
     fn reply(&mut self, to: PeerId, delta: &[ChannelIdentity]) -> io::Result<()> {
+        let deadline = burst_deadline(delta.len() * APPROX_IDENTITY_BYTES);
         for batch in delta.chunks(MAX_IDENTITIES_PER_FRAME) {
             let frame = encode_control(&ControlMsg::RegistryDelta(batch.to_vec()));
             let Some(p) = self.peers.iter_mut().find(|p| p.id == to) else {
                 return Ok(()); // already reaped, by an earlier batch or another send
             };
-            if p.conn.send_frame_within(&frame, PEER_FRAME_BUDGET).is_err() {
+            if p.conn.send_frame_by(&frame, deadline).is_err() {
                 let _ = p.conn.shutdown();
                 self.peers.retain(|p| p.id != to);
                 return Ok(());
@@ -816,6 +854,33 @@ mod tests {
             deleted: false,
             member_of: None,
         }
+    }
+
+    /// **A burst's deadline must scale with the burst.** A fixed one turned "this peer is too slow"
+    /// into "this registry is too big": at the ~13.6 MB/s a real daemon drains at, 500 ms buys 6.8 MB,
+    /// so a *healthy* peer holding a 200 000-channel registry could not complete a join at all. The
+    /// deadline is therefore derived from the payload against a minimum rate.
+    #[test]
+    fn a_bursts_deadline_scales_with_its_payload() {
+        let small = burst_deadline(0);
+        let floor = Instant::now() + PEER_BURST_MIN;
+        assert!(
+            small >= floor - Duration::from_millis(50),
+            "a small burst still gets the floor, not a microscopic budget"
+        );
+
+        // 40 MiB against a 4 MiB/s floor is ten seconds of allowance; the point is that it grows, so a
+        // healthy peer is never dropped for the size of someone else's registry.
+        let big = burst_deadline(40 << 20);
+        let grown = big.duration_since(Instant::now());
+        assert!(
+            grown > Duration::from_secs(9) && grown < Duration::from_secs(11),
+            "a 40 MiB burst should be allowed about 10 s at 4 MiB/s, got {grown:?}"
+        );
+        assert!(
+            big > small,
+            "the deadline must scale with the payload, or it is a registry-size limit in disguise"
+        );
     }
 
     /// **Both ends adopt at the same time, and a large registry must not deadlock them.** Both ends of a

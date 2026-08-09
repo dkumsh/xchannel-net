@@ -41,7 +41,8 @@ unsafe extern "C" {
 ///
 /// It also **restores the default disposition for both signals**, so a *second* `SIGTERM` or `^C` —
 /// whichever arrives — kills the process outright. Disarming only the signal that arrived left an
-/// operator who pressed `^C` and then reached for `kill` with no escape hatch at all. Without that escape hatch, a daemon wedged anywhere in its
+/// operator who pressed `^C` and then reached for `kill` with no escape hatch at all. Without one, a
+/// daemon wedged anywhere in its
 /// shutdown path — a blocking `write_all` to a peer that stopped reading is the realistic one —
 /// would swallow every further signal and could only be ended with `SIGKILL`. Re-arming is
 /// `signal`'s own behaviour on Linux and is async-signal-safe.

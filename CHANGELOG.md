@@ -110,7 +110,10 @@ node before starting any new one; see *Upgrading from 0.2.x* in the README.
   container image, the exact case the step-aside exists for, was invisible to it and their links were
   collapsed as duplicate *links* instead. Binding the wildcard and advertising something routable now
   works, and is verified end to end: two wildcard-bound clones seeded only at a bootstrap detect each
-  other and both stand down. A node that binds a wildcard and advertises nothing warns at startup.
+  other and both stand down. The value must be **per instance** — two nodes advertising one address are
+  as indistinguishable as two advertising a wildcard, since advertised addresses are what duplicate
+  detection compares. Both mistakes warn at startup, including an advertised address that is itself a
+  wildcard, which would otherwise silence the warning while restoring the defect.
 
 - **A cosmetic node name and creation time**, gossiped with the heartbeat and stored in membership.
   `XCHANNELD_NODE_NAME`, defaulting to the hostname. Never a key, never a tie-break — a duplicate name
@@ -241,23 +244,33 @@ Everything from here down was found by a pre-release review of the four changes 
     penalty is forgiven once an address has *identified itself* over a link dialled there, which is a
     real peer whose link merely dropped.
   - **Seeds, learned peers and same-id candidates carry separate budgets**, so a tick's worst-case dial
-    spend is their sum, not the one budget the constant's own doc claimed. A build-time assertion ties
-    that spend — count × (connect timeout + join budget, since a successful dial performs a whole join
-    before returning) — to `LIVENESS_TIMEOUT` with a fixed reserve
+    spend is their sum, not the one budget the constant's own doc claimed. A build-time assertion ties the
+    **connect** portion of that spend to `LIVENESS_TIMEOUT` with a fixed reserve
     held back for the rest of the tick, because a heartbeat period that quietly grows past it looks
     healthy right until every peer declares this node dead. It is a bound on *dialling*, not on the
     tick; the first version of it was written in truncating whole seconds and omitted the frame budget,
     so it passed for any dial count whatever while the real worst case was ninety seconds.
-  - **The gap escalates while attempts continue and decays once they stop, with no exemption for an
-    address that once worked.** An exemption keyed on "has identified itself over a link we dialled
+  - **The gap escalates on a failed attempt, resets when a link actually forms, and decays once attempts
+    stop — with no exemption for an address that once worked.** "Success" means the whole join completed,
+    not merely that `connect` returned, so an address that accepts and then drops the link still backs
+    off. Keying the escalation on the interval between attempts alone could not tell a dial that failed
+    from one that succeeded and served, so a link repeatedly closed by the far end ratcheted to the
+    ceiling although nothing about it was flapping. An exemption keyed on "has identified itself over a link we dialled
     there" was a straight regression: that memo is never pruned, so it applied every tick forever and
     cleared the penalty before it could double, and a host powered off overnight was dialled every tick
     in perpetuity. Four such hosts took the heartbeat period from 0.5 s to a sustained **4.5 s**, where
     0.2.x decayed to one attempt a minute. No exemption is needed — a link that outlasted its own gap
     has already outlived the penalty from the dial that created it.
-  - **Member attachment is capped per tick.** Each remote member not yet replicating costs a bounded
-    resolve, and the count was unbounded: fifty of them made a tick **10.5 s**. Attachment is idempotent
-    and retried, so the cap delays it rather than losing it.
+  - **Member attachment skips what it cannot resolve, and rotates the rest.** Each remote member not yet
+    replicating costs a bounded resolve, and the count was unbounded: fifty made a tick **10.5 s**. A cap
+    alone turned that into something worse — a member whose owner is unreachable can never be resolved,
+    so it consumed a slot every tick for ever, and since the registry is a `BTreeMap` the same names took
+    every slot in the same order and members behind them were never attempted at all. A hosted topic
+    silently stopped merging its live members; three independent reproductions, one showing eight
+    dead-owner members stopping a topic from merging *any* live member for 120 s where the previous
+    release attached them slowly. Now a member whose owner is not a live member is skipped for free, and
+    the walk rotates — a cap over a deterministically-ordered list starves whatever sorts last, which is
+    why the dial paths already had cursors.
 
 - **A peer that stopped reading could stall the entire node.** Every control-plane write is a blocking
   write made while holding the dissemination lock, so one unresponsive peer stalled the heartbeat along
@@ -271,10 +284,26 @@ Everything from here down was found by a pre-release review of the four changes 
   - Registry frames are **chunked** to a few hundred identities. Anti-entropy sends the whole registry
     on every reconnect, and one frame of it was measured at 10.6 MB taking 6.1 s to write to a stalled
     peer — all of it under the lock.
-  - The join-time exchange carries **one deadline for the whole thing**, and every other frame its own;
-    past the deadline the peer is dropped. A per-frame budget does not compose over a burst: the chunked
-    sync is hundreds of frames, so a peer draining just fast enough to pass each check individually could
-    hold the lock for the sum of them. A socket send timeout is not a
+  - **Every burst of frames shares one deadline, derived from its size.** A budget per frame is not a
+    bound on a sequence of frames, and every path carrying a whole registry — the join sync, `announce`,
+    `relay`, `reply`, and the hint flood — is such a sequence. Measured: a peer draining at ~2 MB/s
+    cleared each individual 250 ms check and held the control plane for **13.4 s** on a 600 000-identity
+    relay, four times the liveness budget, with no bound firing and the peer never dropped. Below 1 MB/s
+    such a peer was dropped on the first chunk; above 8 MB/s it finished. It is the *middling* peer that
+    stalls a node.
+
+    The deadline scales with the payload against a minimum drain rate rather than being a constant,
+    because a constant cannot be both large enough for a healthy peer and small enough to bound a tick:
+    at the ~13.6 MB/s a real daemon sustains, half a second buys under 7 MB, so a **healthy** peer with a
+    200 000-channel registry would have failed to form a link at all. As a rate the policy reads "a peer
+    slower than this is not keeping up", which is true whatever the registry size and whatever the link.
+    Small periodic frames — heartbeat, hints, departure — get a small fixed budget instead, since they go
+    to every peer in one pass: at the ≤100-node target, a 250 ms budget made a heartbeat broadcast worth
+    25 s.
+
+    What remains, and is documented rather than asserted away: a burst of R bytes may hold the
+    dissemination lock for up to `R / rate`. Bounding that means not holding the lock across the write —
+    a per-peer outbox, as the stream plane already has — and is post-0.3.0. A socket send timeout is not a
     substitute and it was a mistake to ship one as if it were: `write_all` retries whenever a syscall
     moved a byte, so three unresponsive peers produced a **15.03 s** heartbeat gap against a 2 s
     setting, and a peer draining at 128 KiB/s produced **19.37 s** with the timeout never firing at all.

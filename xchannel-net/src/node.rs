@@ -109,28 +109,33 @@ struct DialPenalty {
 /// slow ordinary mesh formation. One per tick reaches a twin inside a second.
 const MAX_TWIN_DIALS_PER_TICK: usize = 1;
 
-/// The coupling that makes the cap worth having: a tick must fit inside the liveness budget with room
-/// to spare, since dialling is only part of what a tick does. Stated as a build-time check because the
-/// failure it guards against is invisible — a heartbeat period that quietly exceeds `LIVENESS_TIMEOUT`
-/// gets this node declared dead by every peer, and the topic member reaper then tombstones its live
-/// members' names.
+/// The one part of a tick this can bound at build time: **the connects**.
 ///
-/// **In milliseconds, and counting the join-time write.** Written in `as_secs()` it was theatre: the
-/// division truncates, so a `CONNECT_TIMEOUT` of 900 ms read as zero and the assertion passed for any
-/// dial count whatever, while a 1900 ms one read as 1 and hid a 9.5 s worst case. It also omitted the
-/// dominant term — a successful dial writes the join-time sync before returning — so the quantity it
-/// checked was not the one it named.
+/// A tick is serial and holds the dissemination lock across most of itself, and the tick *is* the
+/// heartbeat, so if it runs past `LIVENESS_TIMEOUT` every peer declares this node dead and the topic
+/// member reaper starts tombstoning its live members' names. That makes the tick's cost worth checking
+/// mechanically rather than by argument — an earlier version of this assertion was written in
+/// truncating whole seconds, so a 900 ms `CONNECT_TIMEOUT` counted as zero and it passed for any dial
+/// budget whatever while the real worst case was ninety seconds.
 ///
-/// It still does not model everything in a tick: `attach_pending_members` costs a `RESOLVE_TIMEOUT`
-/// per unattached remote member and is capped only by [`MAX_ATTACH_RESOLVES_PER_TICK`]. Read it as a
-/// bound on *dialling*, which is what it says, not as a bound on the tick.
+/// **What it does not cover, stated explicitly so nobody reads it as a bound on the tick:**
+///
+/// * A registry burst (join, announce, relay, reply) is bounded by *size*, not by a constant:
+///   `bytes / MIN_DRAIN_RATE`, floored at `PEER_BURST_MIN`. At 10 MB that is 2.5 s. There is no
+///   constant here to check, and no constant that could be right — see `MIN_DRAIN_RATE`.
+/// * A heartbeat costs `P × PEER_SMALL_FRAME_BUDGET` across P peers, once per wedged peer since each
+///   failed write drops it.
+/// * Member attachment costs at most `MAX_ATTACH_RESOLVES_PER_TICK` resolves, and only for members
+///   whose owner is reachable.
+///
+/// Bounding the burst term properly means not holding the lock across the write — a per-peer outbox,
+/// which the stream plane already has. Until then it is a documented limit, not a checked one.
 const _: () = assert!(
-    (2 * MAX_DIALS_PER_TICK + MAX_TWIN_DIALS_PER_TICK) as u128
-        * (CONNECT_TIMEOUT.as_millis() + crate::broadcast::PEER_JOIN_BUDGET.as_millis())
+    (2 * MAX_DIALS_PER_TICK + MAX_TWIN_DIALS_PER_TICK) as u128 * CONNECT_TIMEOUT.as_millis()
         + TICK_RESERVE.as_millis()
         <= LIVENESS_TIMEOUT.as_millis(),
-    "the worst-case dial spend leaves less than TICK_RESERVE of LIVENESS_TIMEOUT for the rest of the \
-     tick — reduce a dial budget, CONNECT_TIMEOUT, or PEER_FRAME_BUDGET"
+    "the worst-case connect spend leaves less than TICK_RESERVE of LIVENESS_TIMEOUT for the rest of \
+     the tick — reduce a dial budget or CONNECT_TIMEOUT"
 );
 
 /// How much of `LIVENESS_TIMEOUT` the assertion above keeps back for everything in a tick that is not
@@ -449,6 +454,8 @@ pub struct TopicStatus {
 /// | `if let P = <guard-expr> { }` | **yes**, in the then-block |
 /// | `match <guard-expr> { }` | **yes**, in every arm |
 /// | `f(<guard-expr>, g())` | **yes**, for the whole call |
+/// | `for p in <guard-expr> { }` | **yes**, for the whole loop |
+/// | `while let P = <guard-expr> { }` | **yes**, in the body |
 /// | `let g = <guard-expr>;` | **yes**, to the end of the block |
 ///
 /// The last row is the one that bites hardest, because it looks like the fix for the fourth:
@@ -498,6 +505,9 @@ pub struct Node {
     dial_cursor_learned: Arc<Mutex<usize>>,
     /// Walk position over addresses claiming this node's own id (the twin candidates).
     dial_cursor_twins: Arc<Mutex<usize>>,
+    /// Walk position over a topic's members, so a per-tick resolve cap cannot starve the tail of a
+    /// deterministically-ordered member list.
+    attach_cursor: Arc<Mutex<usize>>,
     /// Channels this node hosts (is the origin for): name → where + geometry to serve.
     hosted: Arc<Mutex<HashMap<String, ChannelSource>>>,
     /// Network-wide channel directory (CRDT), converged via dissemination.
@@ -568,6 +578,7 @@ impl Node {
             dial_cursor_seeds: Arc::new(Mutex::new(0)),
             dial_cursor_learned: Arc::new(Mutex::new(0)),
             dial_cursor_twins: Arc::new(Mutex::new(0)),
+            attach_cursor: Arc::new(Mutex::new(0)),
             config: Arc::new(config),
         }
     }
@@ -914,6 +925,16 @@ impl Node {
         // steady state, cost nothing here and are not counted against it.
         let mut resolves = 0usize;
         for (topic, mux) in self.mux_handles() {
+            // Rotate the starting point, for the same reason `dial_some` does: a cap over a walk in a
+            // deterministic order (the registry is a `BTreeMap`) starves whatever sorts last. The
+            // liveness skip above removes the population that used to fill the budget, so this is
+            // belt-and-braces — but a cap without rotation is a starvation machine, and that lesson
+            // has now been learned twice in this file.
+            let rotate = {
+                let mut c = self.attach_cursor.lock_safe();
+                *c = c.wrapping_add(1);
+                *c
+            };
             // Members the registry says belong to this topic right now (live, non-tombstoned).
             let live: Vec<ChannelIdentity> = {
                 let reg = self.registry.lock_safe();
@@ -923,12 +944,32 @@ impl Node {
                     .collect()
             };
 
-            for m in &live {
+            for i in 0..live.len() {
+                let m = &live[(rotate + i) % live.len()];
                 let remote = m.owner != self.config.node_id;
+                let owner_live = !remote
+                    || self
+                        .dissemination
+                        .lock_safe()
+                        .live_addr_of(m.owner)
+                        .is_some();
                 // Keep a **remote** member's replica fresh whether or not it's attached yet.
                 // This is essential after a restart: reconstruct may re-attach a member from a
                 // *stale* replica, so we must (re)start its subscription to resume its stream —
                 // idempotent, a no-op if already replicating.
+                // **Never spend a resolve on an owner we already know we cannot reach.** This is the
+                // whole starvation fix: such a member can never be resolved, so it consumed a budget
+                // slot on every tick for ever — and because the walk is over a `BTreeMap`, the same
+                // few names took every slot in the same order each time, and every member behind them
+                // was never attempted at all. Three separate reproductions: four dead-owner members
+                // sorting early by name stopped a hosted topic from ever merging *any* of its live
+                // members, silently, where the previous release attached them slowly.
+                //
+                // The owner's liveness is already known here for free, so the members that used to
+                // starve the queue now cost nothing and leave it.
+                if remote && !owner_live {
+                    continue;
+                }
                 if remote && resolves < MAX_ATTACH_RESOLVES_PER_TICK {
                     // Only a member that is *not* already replicating can block, and only that case is
                     // charged: `ensure_member_subscription` returns immediately for a live one.
@@ -1830,8 +1871,9 @@ impl Node {
     /// so the next tick found it unlinked, un-penalised, and due, and spent a dial on it again. Two
     /// such addresses starved every live peer behind them permanently.
     ///
-    /// The refund is in [`dial_due`](Self::dial_due), and it is granted for having *identified
-    /// itself* rather than for having accepted a connection.
+    /// A dial that completes its whole join resets the gap to the floor; one that fails — including an
+    /// address that accepts the connection and then drops the link — keeps its escalation. There is no
+    /// refund keyed on having *once* worked; [`dial_due`](Self::dial_due) explains why that was removed.
     fn dial_peer(&self, addr: SocketAddr) {
         {
             let now = Instant::now();
@@ -1856,10 +1898,29 @@ impl Node {
                 },
             );
         }
-        if let Ok(conn) = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT) {
+        let joined = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT).and_then(|conn| {
             let mut d = self.dissemination.lock_safe();
             let snapshot = self.registry_snapshot();
-            let _ = d.add_outbound_peer(conn, addr, &snapshot);
+            d.add_outbound_peer(conn, addr, &snapshot)
+        });
+        // **Reset on a link that actually formed.** The escalation above keys on the interval between
+        // *attempts*, which cannot tell a dial that failed from one that succeeded and served — so a
+        // link repeatedly established and repeatedly closed by the far end ratcheted to the ceiling
+        // although nothing about it was flapping, and `DESIGN.md` claimed the escalation keyed on
+        // outcome when it did not. Success here means the whole join completed, not merely that
+        // `connect` returned: an address that accepts and then drops the link fails the join, keeps its
+        // escalation, and so is still held off — which is the property the charge-every-attempt rule
+        // was introduced to get.
+        if joined.is_ok() {
+            let now = Instant::now();
+            self.dial_backoff.lock_safe().insert(
+                addr,
+                DialPenalty {
+                    attempted_at: now,
+                    next: now + DIAL_BACKOFF_MIN,
+                    gap: DIAL_BACKOFF_MIN,
+                },
+            );
         }
     }
 
@@ -2004,9 +2065,11 @@ impl Node {
                 // deliver any number of identities in a single frame: 200 000 of them produced a
                 // forty-second heartbeat gap, four times `LIVENESS_TIMEOUT`, so every peer declared
                 // this node dead and the topic member reaper began tombstoning its live members'
-                // names. Coalescing bounds the whole pump to one acquisition and one write per peer,
-                // whatever arrives. (The write itself is bounded separately, by the peer write
-                // timeout — a peer that has stopped reading must not be able to stall the lock.)
+                // names. Coalescing bounds the whole pump to **one dissemination-lock acquisition** and
+                // one *burst* per peer, whatever arrives — not one write: a burst is chunked, so it is
+                // as many frames as the delta needs. The frames of one burst share a single deadline
+                // derived from its size (`MIN_DRAIN_RATE`), which is what bounds it; a budget per frame
+                // is not a bound on a sequence of them.
                 let mut to_relay: HashMap<PeerId, Vec<ChannelIdentity>> = HashMap::new();
                 let mut to_reply: HashMap<PeerId, Vec<ChannelIdentity>> = HashMap::new();
                 for (from, id) in pumped {
@@ -3062,6 +3125,50 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("condition not met within timeout");
+    }
+
+    /// **A cap over a deterministically-ordered walk starves whatever sorts last.** Reproduced three
+    /// times independently: a topic whose first few members alphabetically have dead owners never
+    /// merged *any* of its live members, because those members consumed the whole per-tick resolve
+    /// budget on every tick for ever and the walk always reached them first. Registry order is
+    /// `BTreeMap` order, so it was the same names every time — and nothing logged it.
+    ///
+    /// Two properties, both asserted here: a member whose owner cannot be reached costs nothing, and a
+    /// live member behind it still gets attached.
+    #[test]
+    fn a_member_whose_owner_is_unreachable_cannot_starve_a_live_one() {
+        let (a, _a_stream, a_control) = start(150, "attach-starve-a");
+        let (b, _b_stream, _b_control) = start_seeded(151, "attach-starve-b", &[a_control]);
+        a.create_topic("t.orders", TopicOptions::default()).unwrap();
+
+        // Members owned by a node nobody can reach, named to sort *before* the live one. This is the
+        // ordinary shape: an owner was decommissioned, and `member_reap_after` defaults to never, so
+        // its member registrations stay in the CRDT for good.
+        for i in 0..8 {
+            a.registry.lock_safe().merge(ChannelIdentity {
+                name: format!("aaa.{i}"),
+                owner: NodeId(9999),
+                region_size: 1 << 20,
+                mtu: 0,
+                earliest_index: RecordIndex(0),
+                registered_at_nanos: 1,
+                epoch: 0,
+                deleted: false,
+                member_of: Some("t.orders".into()),
+            });
+        }
+
+        // A live member on B, sorting last.
+        b.publish_to_topic("t.orders", "zzz.live", ChannelOptions::default())
+            .unwrap();
+
+        // It must attach despite the eight unreachable members ahead of it in the walk.
+        poll_until(|| {
+            a.topic_status("t.orders")
+                .and_then(|s| s.ok())
+                .filter(|s| s.members.iter().any(|m| m.name == "zzz.live"))
+                .map(|_| ())
+        });
     }
 
     /// **A duplicate is a standing condition, so the verdict must be re-evaluated, not latched.**

@@ -23,7 +23,11 @@ locks:
     @echo "--- guards in an if-let / match scrutinee (alive for the whole body) ---"
     @grep -rn 'if let .*lock_safe()\|match .*lock_safe()\|while let .*lock_safe()' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client || true
     @echo "--- guards bound to a name (alive to end of block; check for borrows) ---"
-    @grep -rn 'let [a-z_]* = self\.[a-z_]*\.lock_safe();' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client || true
+    @grep -rn 'let \(mut \)\?[a-z_]* = [a-z_.]*lock_safe()' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client || true
+    @echo "--- guards in a for-head (alive for the whole loop) ---"
+    @grep -rn 'for .* in .*lock_safe()' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client || true
+    @echo "--- multi-line guard bindings (check the following lines by hand) ---"
+    @grep -rn -B1 '^\s*\.lock_safe()' --include='*.rs' xchannel-net xchannel-net-core xchannel-net-client | grep 'let ' || true
 
 # automatically fix clippy warnings
 fix:

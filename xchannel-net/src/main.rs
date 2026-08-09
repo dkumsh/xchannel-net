@@ -243,6 +243,19 @@ fn main() -> std::io::Result<()> {
             "stream" => advertise_stream_addr,
             _ => advertise_control_addr,
         };
+        // An advertised wildcard is worse than no advertised address: it silences this warning while
+        // restoring exactly the defect the setting exists to cure, so it is warned about on its own
+        // terms. The value has to be *per instance* — two nodes advertising one address are
+        // indistinguishable to duplicate detection, which compares advertised addresses.
+        if advertised.is_some_and(|a| a.ip().is_unspecified()) {
+            eprintln!(
+                "xchanneld[{node_id}]: WARNING: XCHANNELD_ADVERTISE_{}_ADDR is a wildcard address, \
+                 which no peer can dial and which every node using it advertises identically — so two \
+                 nodes sharing a NodeId cannot be told apart and a cloned image never stands down. Set \
+                 it to this instance's own routable address.",
+                plane.to_uppercase(),
+            );
+        }
         if addr.ip().is_unspecified() && advertised.is_none() {
             eprintln!(
                 "xchanneld[{node_id}]: WARNING: {plane} plane bound to the wildcard address {addr} \
