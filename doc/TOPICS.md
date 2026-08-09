@@ -72,12 +72,19 @@ every hole in the LWW map in production.
 > emitted at the head of every segment, so one is always inside the retained window (§6.3).
 >
 > **Known deviations / not-yet (honest):**
-> - **Execution model (§4.1):** the mux runs on its **own thread** (`Node::run_mux`), *not* as
->   poll-items in the daemon's shared single-threaded forwarding loop as §4.1 specifies. Same engine
->   and invariants; different scheduling. The §4.1 promotion path (shared-loop → thread → process)
->   is therefore not wired. The loop backs off only when a poll finds nothing (`MuxIdle`:
->   spin → yield → park doubling to a 5 ms ceiling), so a producing member never waits on a clock
->   — measured median merge latency ~1 µs, against ~5 ms when the loop slept a flat tick.
+> - **Execution model (§4.1): implemented.** `Node::run_duty_cycle` is the shared loop, with
+>   replication sources, replication sinks and mux slots as peer poll-items, each bounded to 256
+>   records per turn. **A caveat §4.1 did not anticipate:** the daemon had no "existing forwarding
+>   loop" to add muxes to — it was thread-per-connection with blocking IO — so the loop had to be
+>   built, which meant non-blocking resumable framing (`FramedConn`) and poll-item forms of the
+>   stream protocol (`ServerPollItem`/`ClientPollItem`). Establishment stays off the loop
+>   deliberately (below). Measured: a daemon serving 32 subscriptions runs the same 6 threads it
+>   runs idle, and merge latency stays ~2 µs.
+> - **Establishment is not a poll-item**, and §4.1 should not be read as asking for that. Resolving,
+>   dialling, exchanging the handshake and seeking to a resume index are blocking and unbounded; on
+>   the duty cycle one unreachable peer or one long seek would stall every other poll-item. A
+>   transient thread performs the handshake and hands the finished connection to the loop, then
+>   exits — the *connection* outliving the thread is what makes this not thread-per-connection.
 > - **Recovery cost (§5.2):** correct, but scans from genesis rather than the bounded
 >   last-slot-table scan (a correct bound needs reverse reads, an xchannel feature).
 > - **Reconstruct scope:** both topics and **non-topic origins** re-register on restart (the
@@ -174,7 +181,9 @@ not a scheduling boundary. One loop hosts any number of muxes (one per topic is 
 natural grouping, not a requirement); recovery (§5) is per-topic regardless of how
 they are scheduled.
 
-**Promotion path.** Because the merge engine is plain xchannel readers + one writer,
+**Promotion path** (rung 1 is what `xchanneld` runs; rung 2 is `Node::run_mux`, for a mux hosted
+outside the shared loop; rung 3 is unbuilt, and the *trigger* for choosing between them remains
+§9's open question). Because the merge engine is plain xchannel readers + one writer,
 a topic that outgrows the shared core is promoted without any protocol or semantic
 change: shared loop poll-item → dedicated thread → separate supervised process (or a
 standalone binary hosting the same engine with non-registry discovery). Chosen

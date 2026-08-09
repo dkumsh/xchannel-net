@@ -22,16 +22,18 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use xchannel::{Writer, WriterBuilder};
 use xchannel_net_core::codec::{self, decode_client_request, encode_client_reply};
 use xchannel_net_core::dissemination::Dissemination;
 use xchannel_net_core::identity::ChannelIdentity;
 use xchannel_net_core::mux::{self, Mux};
-use xchannel_net_core::stream::{self, ChannelSource, SubscribeError, accept_subscription};
+use xchannel_net_core::stream::{
+    self, ChannelSource, ClientPollItem, ServerPollItem, SubscribeError, accept_subscription,
+};
 use xchannel_net_core::transport::{
     Listener, TcpListener, TcpTransport, Transport, UnixListener, UnixTransport,
 };
@@ -47,6 +49,22 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on concurrent inbound stream + client connections (thread-exhaustion guard). Peer
 /// control links are not capped — they come from configured/trusted seeds.
 const MAX_CONNECTIONS: usize = 4096;
+
+/// Records a single duty-cycle poll-item may move per turn. Bounded **per poll-item**, not just
+/// per member (`doc/TOPICS.md` §4.1 budget coupling): everything in the loop shares its cycles, so
+/// one saturated subscription or topic must not head-of-line-block the rest for a full drain.
+const MAX_BATCH_PER_POLL_ITEM: usize = 256;
+
+/// How long establishment waits to resolve a channel before giving up and retrying next tick.
+const RESOLVE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Bounded dial, so an unreachable owner costs one establishment thread a moment, not minutes.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Bounded handshake read. A peer that connects and then says nothing must not pin the thread
+/// performing the handshake — which, now that handshakes are not one-thread-per-connection for
+/// their whole lifetime, would otherwise be a cheap way to exhaust them.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-member records merged per mux poll cycle — the fairness bound so one hot member can't
 /// monopolize the interleave or head-of-line-block other topics on the shared loop
@@ -323,6 +341,17 @@ pub struct Node {
     member_dead_since: Arc<Mutex<HashMap<(String, u64), Instant>>>,
     /// Count of live inbound stream/client connections (capped at [`MAX_CONNECTIONS`]).
     conns: Arc<AtomicUsize>,
+    /// Where establishment hands finished connections to the duty cycle.
+    duty: Arc<DutyInbox>,
+    /// Subscriptions the conductor re-establishes when their connection drops.
+    ///
+    /// Held **weakly and separately from `subscriptions`** on purpose. `subscriptions` is the
+    /// client-facing lookup map, and a caller of `Node::subscribe` need not file its handle there
+    /// — under the old thread-per-subscription model such a subscription still self-healed,
+    /// because the healing lived in its own thread. Keying the conductor off the map instead would
+    /// have quietly made self-healing conditional on registration. Weak so that dropping the
+    /// handle is enough to stop servicing it, with no deregistration step to forget.
+    conducted: Arc<Mutex<Vec<(String, Weak<SubShared>)>>>,
 }
 
 impl Node {
@@ -339,6 +368,8 @@ impl Node {
             topic_reap: Arc::new(Mutex::new(HashMap::new())),
             member_dead_since: Arc::new(Mutex::new(HashMap::new())),
             conns: Arc::new(AtomicUsize::new(0)),
+            duty: Arc::new(DutyInbox::default()),
+            conducted: Arc::new(Mutex::new(Vec::new())),
             discovery: Arc::new(Mutex::new(None)),
             discovery_generation: now_nanos(),
             started_at: Instant::now(),
@@ -848,9 +879,12 @@ impl Node {
             .collect()
     }
 
-    /// Drive the muxes forever: poll every hosted topic, backing off per `idle` only when there
-    /// was nothing to merge. (Runs on its own thread; §4.1's shared-loop integration and per-topic
-    /// promotion are later — see [`MuxIdle`] for why this is a poll loop at all.)
+    /// Drive the muxes and nothing else, on their own thread.
+    ///
+    /// `xchanneld` does **not** use this: it runs [`run_duty_cycle`](Self::run_duty_cycle), where
+    /// muxes are poll-items alongside replication (§4.1). This remains the second rung of §4.1's
+    /// promotion path — a mux engine hosted outside the shared loop, in a standalone process or a
+    /// thread of its own — and is what an embedder driving `Mux` directly would use.
     pub fn run_mux(&self, idle: MuxIdle) {
         let mut round = 0u32;
         loop {
@@ -1187,8 +1221,15 @@ impl Node {
         Ok(listener)
     }
 
-    /// Accept stream connections forever, dispatching each to its own thread serving one
-    /// subscription against this node's hosted channels.
+    /// Accept stream connections forever, handshaking each and handing the result to the duty
+    /// cycle as a poll-item.
+    ///
+    /// The handshake runs on a **transient** thread that exits as soon as it has one: it resolves
+    /// the channel, decides `Gap`/`Diverged`, and seeks forward to the subscriber's resume index,
+    /// which is unbounded work that must happen neither on the accept path (where it would delay
+    /// every other subscriber's connect) nor on the duty cycle (where it would stall every
+    /// poll-item). The *connection* then outlives the thread — that is the difference from
+    /// thread-per-connection, and the whole point of §4.1.
     pub fn serve_stream(&self, mut listener: TcpListener) -> io::Result<()> {
         loop {
             let conn = listener.accept()?;
@@ -1196,11 +1237,23 @@ impl Node {
                 continue; // at capacity — drop the connection
             };
             let hosted = Arc::clone(&self.hosted);
+            let duty = Arc::clone(&self.duty);
             std::thread::spawn(move || {
-                let _guard = guard; // released when this connection's thread ends
+                // A peer that connects and then says nothing must not pin this thread.
+                if conn.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
+                    return;
+                }
                 let resolve = |name: &str| hosted.lock_safe().get(name).cloned();
-                if let Ok(mut server) = accept_subscription(conn, resolve) {
-                    let _ = server.run();
+                let Ok(server) = accept_subscription(conn, resolve) else {
+                    return; // guard drops here, releasing the connection slot
+                };
+                if let Ok(item) = ServerPollItem::adopt(server) {
+                    // The slot stays taken for as long as the poll-item lives, not just for as
+                    // long as this thread does.
+                    duty.servers.lock_safe().push(HostedServer {
+                        item,
+                        _guard: guard,
+                    });
                 }
             });
         }
@@ -1290,6 +1343,8 @@ impl Node {
             // `member_of` registrations: attach live members, detach reaped/tombstoned ones.
             self.reap_dead_members();
             self.attach_pending_members();
+            // Reconnect any subscription the duty cycle dropped — the self-healing half.
+            self.service_subscriptions();
             std::thread::sleep(interval);
         }
     }
@@ -1661,130 +1716,215 @@ impl Node {
         if let Some(parent) = replica_path.parent() {
             ensure_private_dir(parent)?;
         }
-
-        let stopped = Arc::new(AtomicBool::new(false));
-        let synced = Arc::new(AtomicU64::new(0));
-        let head_at_connect = Arc::new(AtomicU64::new(0));
-        let last_record_at_ms = Arc::new(AtomicU64::new(0));
-        let rebuilds = Arc::new(RebuildStats::default());
-        let shutdown: Arc<Mutex<Option<TcpTransport>>> = Arc::new(Mutex::new(None));
-
-        let node = self.clone();
-        let progress = SubscriptionProgress {
-            synced: Arc::clone(&synced),
-            head_at_connect: Arc::clone(&head_at_connect),
-            last_record_at_ms: Arc::clone(&last_record_at_ms),
-            rebuilds: Arc::clone(&rebuilds),
-        };
-        let (name_t, path_t, stopped_t, shutdown_t) = (
-            name.to_string(),
-            replica_path.clone(),
-            Arc::clone(&stopped),
-            Arc::clone(&shutdown),
-        );
-        let handle = std::thread::spawn(move || {
-            node.run_subscription(name_t, path_t, stopped_t, progress, shutdown_t)
-        });
-
-        Ok(Subscription {
+        let shared = Arc::new(SubShared {
             replica_path,
-            synced,
-            head_at_connect,
-            last_record_at_ms,
-            rebuilds,
-            stopped,
-            shutdown,
-            handle: Some(handle),
-        })
+            synced: AtomicU64::new(0),
+            head_at_connect: AtomicU64::new(0),
+            last_record_at_ms: AtomicU64::new(0),
+            rebuilds: RebuildStats::default(),
+            stopped: AtomicBool::new(false),
+            connected: AtomicBool::new(false),
+            establishing: AtomicBool::new(false),
+        });
+        self.conducted
+            .lock_safe()
+            .push((name.to_string(), Arc::downgrade(&shared)));
+        // Establish inline so a caller that has just been handed a `Subscription` is already
+        // replicating, rather than waiting for the conductor's next tick. Reconnects are the
+        // conductor's job (`service_subscriptions`).
+        self.spawn_establish(name, &shared);
+        Ok(Subscription { shared })
     }
 
-    /// The self-healing subscription loop: resolve → resume from replica head → stream →
-    /// reconnect, until stopped. Failures back off and retry; `stop` interrupts a blocked
-    /// read by shutting down the live socket.
-    fn run_subscription(
-        &self,
-        name: String,
-        replica_path: PathBuf,
-        stopped: Arc<AtomicBool>,
-        progress: SubscriptionProgress,
-        shutdown: Arc<Mutex<Option<TcpTransport>>>,
-    ) {
-        let SubscriptionProgress {
-            synced,
-            head_at_connect,
-            last_record_at_ms,
-            rebuilds,
-        } = progress;
-        const BACKOFF: Duration = Duration::from_millis(100);
-        while !stopped.load(Ordering::Relaxed) {
-            // Re-resolve each attempt (owner address may have changed); short timeout so we
-            // keep re-checking `stopped`.
-            let Ok((id, addr)) = self.resolve(&name, Some(Duration::from_millis(200))) else {
-                std::thread::sleep(BACKOFF);
+    /// (Re)establish any subscription that is wanted but not currently connected. Called on the
+    /// conductor tick — this is the self-healing half of a subscription, the part that used to be
+    /// the reconnect half of what used to be one thread per subscription.
+    fn service_subscriptions(&self) {
+        let wanted: Vec<(String, Arc<SubShared>)> = {
+            let mut conducted = self.conducted.lock_safe();
+            // Forget subscriptions whose handle is gone or that have been stopped.
+            conducted.retain(|(_, weak)| {
+                weak.upgrade()
+                    .is_some_and(|s| !s.stopped.load(Ordering::Relaxed))
+            });
+            conducted
+                .iter()
+                .filter_map(|(name, weak)| weak.upgrade().map(|s| (name.clone(), s)))
+                .collect()
+        };
+        for (name, shared) in wanted {
+            if shared.stopped.load(Ordering::Relaxed) || shared.connected.load(Ordering::Acquire) {
                 continue;
-            };
-            // Resume from the replica's current head (0 if it doesn't exist yet), carrying
-            // the incarnation that replica holds so the source can refuse a resume across a
-            // reclaim instead of splicing two logs.
-            let (from, generation) = self
-                .replica_position(&replica_path, id.region_size)
-                .unwrap_or((RecordIndex(0), 0));
-            synced.store(from.0, Ordering::Relaxed);
+            }
+            self.spawn_establish(&name, &shared);
+        }
+    }
 
-            let Ok(conn) = TcpTransport::connect(addr) else {
-                std::thread::sleep(BACKOFF);
-                continue;
-            };
-            let shutdown_handle = conn.try_clone().ok();
-            let mut client = match stream::subscribe(conn, &name, from, generation, &replica_path) {
-                Ok(client) => client,
-                Err(SubscribeError::Rebuild { diverged, .. }) => {
-                    // The source cannot extend this replica — it is behind retention, or it
-                    // belongs to a previous incarnation of the name. Retrying the same
-                    // position would loop forever (the answer will not change), so discard it
-                    // and let the next attempt subscribe from scratch. Only ever taken for
-                    // this classified failure: doing it on a transient error would throw away
-                    // a whole channel's history over a dropped connection.
-                    if let Ok(dir) = self.replica_dir(&name) {
-                        let _ = std::fs::remove_dir_all(&dir);
-                        // Recreate it: the next attempt's sink opens a writer *inside* this
-                        // directory and will not create it.
-                        let _ = ensure_private_dir(&dir);
-                    }
-                    synced.store(0, Ordering::Relaxed);
-                    rebuilds.record(diverged);
-                    std::thread::sleep(BACKOFF);
-                    continue;
-                }
-                Err(_) => {
-                    std::thread::sleep(BACKOFF);
-                    continue;
-                }
-            };
-            head_at_connect.store(client.head().0, Ordering::Relaxed);
-            *shutdown.lock_safe() = shutdown_handle;
+    /// Run one establishment attempt on a **transient thread**.
+    ///
+    /// Establishment is blocking by nature — resolve, dial, one frame each way, and a `skip_to`
+    /// that reads forward to the resume index — and none of it may happen on the duty cycle, where
+    /// a single unreachable peer or a long seek would stall every other poll-item. Nor on the
+    /// conductor, for the same reason at a smaller scale. The thread exists only for the
+    /// handshake and hands the finished connection to the duty cycle; it is not a
+    /// thread-per-connection, which is what §4.1 set out to remove.
+    fn spawn_establish(&self, name: &str, shared: &Arc<SubShared>) {
+        // One attempt at a time per subscription.
+        if shared
+            .establishing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let (node, name, shared) = (self.clone(), name.to_string(), Arc::clone(shared));
+        std::thread::spawn(move || {
+            node.establish(&name, &shared);
+            shared.establishing.store(false, Ordering::Release);
+        });
+    }
 
-            // Apply records until the connection drops or we're stopped.
-            loop {
-                if stopped.load(Ordering::Relaxed) {
-                    return;
-                }
-                match client.recv_one() {
-                    Ok(()) => {
-                        synced.store(client.expected_index().0, Ordering::Relaxed);
-                        // One vDSO clock read per record, alongside a socket read and an mmap
-                        // write — negligible, and it is the only *live* staleness signal a
-                        // client has: `head_at_connect` goes stale the moment the source moves.
-                        last_record_at_ms.store(now_nanos() / 1_000_000, Ordering::Relaxed);
-                    }
-                    Err(_) => break, // disconnected → reconnect (resuming from the new head)
+    /// One attempt to connect and hand a subscription's sink to the duty cycle. Failures are
+    /// silent and simply retried on a later conductor tick, exactly as the old loop's backoff did.
+    fn establish(&self, name: &str, shared: &Arc<SubShared>) {
+        if shared.stopped.load(Ordering::Relaxed) || shared.connected.load(Ordering::Acquire) {
+            return;
+        }
+        // Re-resolve each attempt — the owner's address may have changed.
+        let Ok((id, addr)) = self.resolve(name, Some(RESOLVE_TIMEOUT)) else {
+            return;
+        };
+        // Resume from the replica's current head (0 if it doesn't exist yet), carrying the
+        // incarnation that replica holds so the source can refuse a resume across a reclaim
+        // instead of splicing two logs.
+        let (from, generation) = self
+            .replica_position(&shared.replica_path, id.region_size)
+            .unwrap_or((RecordIndex(0), 0));
+        shared.synced.store(from.0, Ordering::Relaxed);
+
+        let Ok(conn) = TcpTransport::connect_timeout(&addr, CONNECT_TIMEOUT) else {
+            return;
+        };
+        // Bound the handshake: a peer that accepts and then says nothing must not pin this thread.
+        if conn.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
+            return;
+        }
+        match stream::subscribe(conn, name, from, generation, &shared.replica_path) {
+            Ok(client) => {
+                shared
+                    .head_at_connect
+                    .store(client.head().0, Ordering::Relaxed);
+                if let Ok(item) = ClientPollItem::adopt(client) {
+                    // Publish *before* handing the item over, so the conductor cannot decide this
+                    // subscription is idle and start a second connection alongside it.
+                    shared.connected.store(true, Ordering::Release);
+                    self.duty.clients.lock_safe().push(PolledSub {
+                        shared: Arc::clone(shared),
+                        item,
+                    });
                 }
             }
-            *shutdown.lock_safe() = None;
-            if stopped.load(Ordering::Relaxed) {
-                return;
+            Err(SubscribeError::Rebuild { diverged, .. }) => {
+                // The source cannot extend this replica — it is behind retention, or it belongs to
+                // a previous incarnation of the name. Retrying the same position would loop
+                // forever (the answer will not change), so discard it and let the next attempt
+                // subscribe from scratch. Only ever taken for this classified failure: doing it on
+                // a transient error would throw away a whole channel's history over a dropped
+                // connection.
+                //
+                // Safe to delete the files here precisely because `connected` is false: the duty
+                // cycle holds no writer for this replica.
+                if let Ok(dir) = self.replica_dir(name) {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    // Recreate it: the next attempt's sink opens a writer *inside* this directory
+                    // and will not create it.
+                    let _ = ensure_private_dir(&dir);
+                }
+                shared.synced.store(0, Ordering::Relaxed);
+                shared.rebuilds.record(diverged);
             }
-            std::thread::sleep(BACKOFF);
+            Err(_) => {}
+        }
+    }
+
+    /// **The duty cycle** (`doc/TOPICS.md` §4.1): one thread polling every replication source,
+    /// replication sink and mux as peer poll-items, each bounded to
+    /// [`MAX_BATCH_PER_POLL_ITEM`] records per turn so none can head-of-line-block the others for
+    /// a full drain.
+    ///
+    /// This is the loop §4.1 describes, and it comes with the coupling §4.1's budget note warns
+    /// about, now real: a hot topic competes with replication forwarding for the same core, and a
+    /// stall in one topic's mmap path briefly stalls forwarding too. That is the trade the shared
+    /// loop makes in exchange for one thread instead of one per connection, and scheduling that is
+    /// deterministic rather than at the mercy of N blocked threads waking in whatever order.
+    ///
+    /// Establishment is deliberately *not* here — see [`spawn_establish`](Self::spawn_establish).
+    pub fn run_duty_cycle(&self, idle: MuxIdle) {
+        let mut servers: Vec<HostedServer> = Vec::new();
+        let mut clients: Vec<PolledSub> = Vec::new();
+        let mut round = 0u32;
+        loop {
+            // Adopt whatever establishment finished since the last cycle.
+            servers.append(&mut self.duty.servers.lock_safe());
+            clients.append(&mut self.duty.clients.lock_safe());
+
+            let mut work = 0usize;
+
+            // Replication sources: forward to subscribers. A dropped connection simply retires the
+            // poll-item; the subscriber reconnects and resumes from its replica head.
+            servers.retain_mut(|s| match s.item.poll(MAX_BATCH_PER_POLL_ITEM) {
+                Ok(n) => {
+                    work += n;
+                    true
+                }
+                Err(_) => false,
+            });
+
+            // Replication sinks: apply into replicas.
+            //
+            // Written as an explicit drain rather than `retain_mut` because the order matters:
+            // `retain_mut` drops a rejected element *after* its closure returns, which would
+            // publish `connected == false` while the replica `Writer` inside the item was still
+            // alive — and the conductor may start rebuilding that replica the instant it sees the
+            // flag. Here the item is dropped first, by hand, and the flag published after.
+            let mut live = Vec::with_capacity(clients.len());
+            for mut c in clients.drain(..) {
+                if c.shared.stopped.load(Ordering::Relaxed) {
+                    let _ = c.item.shutdown();
+                    drop(c.item);
+                    c.shared.connected.store(false, Ordering::Release);
+                    continue;
+                }
+                match c.item.poll(MAX_BATCH_PER_POLL_ITEM) {
+                    Ok(n) => {
+                        if n > 0 {
+                            work += n;
+                            c.shared
+                                .synced
+                                .store(c.item.expected_index().0, Ordering::Relaxed);
+                            c.shared
+                                .last_record_at_ms
+                                .store(now_nanos() / 1_000_000, Ordering::Relaxed);
+                        }
+                        live.push(c);
+                    }
+                    Err(_) => {
+                        drop(c.item);
+                        c.shared.connected.store(false, Ordering::Release);
+                    }
+                }
+            }
+            clients = live;
+
+            // Mux slots: merge members into their topics.
+            work += self.poll_muxes().unwrap_or(0);
+
+            if work > 0 {
+                round = 0;
+            } else {
+                idle.wait(round);
+                round = round.saturating_add(1);
+            }
         }
     }
 
@@ -1915,84 +2055,105 @@ impl RebuildStats {
     }
 }
 
-/// The progress counters a subscription's background loop writes and its handle reads.
-/// Bundled so the loop takes one parameter rather than a growing list of `Arc`s.
-struct SubscriptionProgress {
-    synced: Arc<AtomicU64>,
-    head_at_connect: Arc<AtomicU64>,
-    last_record_at_ms: Arc<AtomicU64>,
-    rebuilds: Arc<RebuildStats>,
+/// State a subscription shares between the **conductor** that establishes its connection and the
+/// **duty cycle** that forwards on it.
+///
+/// `connected` is the handoff. The conductor only (re)establishes — and only wipes a replica for a
+/// rebuild — while it is false, which is what keeps it from deleting files under the replica
+/// `Writer` the duty cycle is holding. The duty cycle drops the poll-item *before* clearing the
+/// flag (with `Release`, paired with the conductor's `Acquire`), so "not connected" really does
+/// mean "no writer is live".
+struct SubShared {
+    replica_path: PathBuf,
+    synced: AtomicU64,
+    /// The source's head as advertised in the last `SubscribeAck` — a snapshot at connect time,
+    /// not a live value; see [`SubscriptionStatus::head_at_connect`].
+    head_at_connect: AtomicU64,
+    /// Unix-millis when a record was last applied; 0 = none yet.
+    last_record_at_ms: AtomicU64,
+    rebuilds: RebuildStats,
+    stopped: AtomicBool,
+    /// A poll-item for this subscription exists in the duty cycle.
+    connected: AtomicBool,
+    /// An establishment attempt is in flight, so the conductor does not start a second one.
+    establishing: AtomicBool,
 }
 
-/// Handle to a self-healing subscription replicating a remote channel locally. Dropping it
-/// stops the background loop.
+/// A subscription's sink as a duty-cycle poll-item, with the state its progress is reported into.
+struct PolledSub {
+    shared: Arc<SubShared>,
+    item: ClientPollItem,
+}
+
+/// A served subscription as a duty-cycle poll-item. Carries the connection-count guard, which used
+/// to be released by the per-connection thread ending and now lives as long as the poll-item.
+struct HostedServer {
+    item: ServerPollItem,
+    _guard: ConnGuard,
+}
+
+/// Where establishment hands finished connections to the duty cycle.
+///
+/// Two queues rather than direct insertion because the duty cycle owns its poll-items outright —
+/// nothing else may touch them while it is polling, and it should not have to take a lock per
+/// item per cycle. It drains these once per cycle instead.
+#[derive(Default)]
+struct DutyInbox {
+    servers: Mutex<Vec<HostedServer>>,
+    clients: Mutex<Vec<PolledSub>>,
+}
+
+/// Handle to a self-healing subscription replicating a remote channel locally. Dropping it stops
+/// the replication.
 pub struct Subscription {
-    replica_path: PathBuf,
-    synced: Arc<AtomicU64>,
-    /// The source's head as advertised in the last `SubscribeAck` — a snapshot at connect
-    /// time, not a live value; see [`SubscriptionStatus::head_at_connect`].
-    head_at_connect: Arc<AtomicU64>,
-    /// Unix-millis when a record was last applied; 0 = none yet.
-    last_record_at_ms: Arc<AtomicU64>,
-    rebuilds: Arc<RebuildStats>,
-    stopped: Arc<AtomicBool>,
-    /// The currently-live connection (if any), so [`stop`](Self::stop) can interrupt a
-    /// blocked read by shutting it down.
-    shutdown: Arc<Mutex<Option<TcpTransport>>>,
-    handle: Option<JoinHandle<()>>,
+    shared: Arc<SubShared>,
 }
 
 impl Subscription {
     /// Local path of the replica; a reader client opens this (in its own process).
     pub fn replica_path(&self) -> &Path {
-        &self.replica_path
+        &self.shared.replica_path
     }
 
     /// Absolute index the replica has been synced to (the head). Grows as records arrive.
     pub fn synced_index(&self) -> u64 {
-        self.synced.load(Ordering::Relaxed)
+        self.shared.synced.load(Ordering::Relaxed)
     }
 
     /// Replica rebuilds this subscription has performed, by cause — see [`RebuildStats`].
     pub fn rebuilds(&self) -> &RebuildStats {
-        &self.rebuilds
+        &self.shared.rebuilds
     }
 
     /// The source's head as of the last successful (re)connect.
     pub fn head_at_connect(&self) -> u64 {
-        self.head_at_connect.load(Ordering::Relaxed)
+        self.shared.head_at_connect.load(Ordering::Relaxed)
     }
 
     /// Unix-millis when a record was last applied, or `None` if none has been.
     pub fn last_record_at_ms(&self) -> Option<u64> {
-        match self.last_record_at_ms.load(Ordering::Relaxed) {
+        match self.shared.last_record_at_ms.load(Ordering::Relaxed) {
             0 => None,
             ms => Some(ms),
         }
     }
 
-    /// Whether the background loop is still running (not stopped).
+    /// Whether this subscription is still wanted (not stopped). Independent of whether it happens
+    /// to be connected right now — a reconnecting subscription is still active.
     pub fn is_active(&self) -> bool {
-        !self.stopped.load(Ordering::Relaxed)
+        !self.shared.stopped.load(Ordering::Relaxed)
     }
 
-    /// Stop the background loop: set the flag and shut down the live socket so a blocked
-    /// read returns. Idempotent.
+    /// Stop replicating. Idempotent. The duty cycle notices on its next cycle and drops the
+    /// poll-item, which shuts the socket and releases the replica writer.
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::Relaxed);
-        if let Some(conn) = self.shutdown.lock_safe().as_ref() {
-            let _ = conn.shutdown();
-        }
+        self.shared.stopped.store(true, Ordering::Relaxed);
     }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
         self.stop();
-        // Best-effort join so the replica writer is released before we return.
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -2051,6 +2212,10 @@ mod tests {
         std::thread::spawn(move || {
             let _ = m.run_maintenance(Duration::from_millis(5));
         });
+        // The duty cycle: replication sources, sinks and muxes as peer poll-items (§4.1). Without
+        // it a test node accepts and handshakes but never forwards a record.
+        let d = node.clone();
+        std::thread::spawn(move || d.run_duty_cycle(MuxIdle::default()));
         (node, stream_addr, control_addr)
     }
 
@@ -2933,6 +3098,9 @@ mod tests {
         std::thread::spawn(move || {
             let _ = serving.serve_stream(listener);
         });
+        // Serving is now split: `serve_stream` handshakes, the duty cycle forwards (§4.1).
+        let forwarding = node.clone();
+        std::thread::spawn(move || forwarding.run_duty_cycle(MuxIdle::default()));
 
         {
             let mut w = node.host_channel("md.aapl", 1 << 20, 0, |b| b).unwrap();
@@ -3432,10 +3600,6 @@ mod tests {
 
         // A hosts the topic and drives its mux.
         let topic_path = a.create_topic("agg", TopicOptions::default()).unwrap();
-        {
-            let a = a.clone();
-            std::thread::spawn(move || a.run_mux(MuxIdle::default()));
-        }
 
         // B hosts a member of "agg" (B does not own the topic) and writes to it, dropping the
         // writer before it's served (single-process test: avoid concurrent writer+reader on

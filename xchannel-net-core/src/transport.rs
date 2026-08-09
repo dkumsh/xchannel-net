@@ -105,6 +105,21 @@ impl TcpTransport {
     pub fn shutdown(&self) -> io::Result<()> {
         self.stream.shutdown(std::net::Shutdown::Both)
     }
+
+    /// Bound how long a blocking read may wait. Used on the handshake, so a peer that connects
+    /// and then says nothing cannot pin the thread performing it. Cleared by
+    /// [`FramedConn::new`](crate::transport::FramedConn::new), which makes the socket
+    /// non-blocking instead.
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    /// Give up the wrapped stream, to hand a connection from a blocking handshake to a polled
+    /// [`FramedConn`]. Safe precisely because `recv_framed` reads exactly the frames it parses and
+    /// buffers nothing, so no bytes are stranded in the discarded wrapper.
+    pub fn into_stream(self) -> TcpStream {
+        self.stream
+    }
 }
 
 impl Transport for TcpTransport {
@@ -114,6 +129,168 @@ impl Transport for TcpTransport {
 
     fn recv_frame(&mut self) -> io::Result<Vec<u8>> {
         recv_framed(&mut self.stream)
+    }
+}
+
+/// Outbound bytes buffered on one connection before its poll-item stops producing. The duty
+/// cycle's replacement for the backpressure a blocking `write_all` used to give for free: a
+/// subscriber that stops reading must stop us reading its source, not grow a buffer without
+/// bound. A subscriber held off long enough falls behind the origin's retention and is told so
+/// with a `Gap` on its next resume — the documented outcome, reached honestly.
+pub const MAX_PENDING_OUT: usize = 8 << 20; // 8 MiB
+
+/// How much to try to read from a socket per attempt.
+const READ_CHUNK: usize = 64 << 10;
+
+/// Compact the inbound buffer once this many consumed bytes sit at its front.
+const COMPACT_AFTER: usize = 256 << 10;
+
+/// A **non-blocking, resumable** framed connection — the form a duty cycle needs.
+///
+/// [`Transport`] cannot be polled. `recv_framed` uses `read_exact`, so a socket that has delivered
+/// only half a frame either blocks the caller (fine for a thread, fatal for a shared loop) or, if
+/// the socket were merely made non-blocking, discards the bytes it already read. Framing state
+/// therefore has to outlive the call: an inbound buffer that accumulates until a frame is whole,
+/// and an outbound buffer that drains as the socket allows.
+///
+/// Deliberately not a `Transport` implementation: the trait promises "receive the next frame,
+/// blocking until one arrives", which is exactly the promise a poll-item must not make. The two
+/// coexist — handshakes stay blocking (they run off the data path), and only forwarding is polled.
+pub struct FramedConn {
+    stream: TcpStream,
+    inbox: Vec<u8>,
+    inbox_off: usize,
+    outbox: Vec<u8>,
+    outbox_off: usize,
+}
+
+impl FramedConn {
+    /// Take over an established stream for polled use. The handshake that preceded it must have
+    /// left no buffered bytes — true of [`Transport`], which reads exactly the frames it parses.
+    pub fn new(stream: TcpStream) -> io::Result<Self> {
+        stream.set_nodelay(true)?;
+        stream.set_nonblocking(true)?;
+        Ok(Self {
+            stream,
+            inbox: Vec::new(),
+            inbox_off: 0,
+            outbox: Vec::new(),
+            outbox_off: 0,
+        })
+    }
+
+    /// The next complete frame, or `None` if one has not arrived yet. Never blocks.
+    pub fn try_recv_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        loop {
+            if let Some(frame) = self.take_buffered_frame()? {
+                return Ok(Some(frame));
+            }
+            // Read straight into the tail of the inbox rather than via a scratch buffer, so a
+            // partial frame costs no copy while it waits for the rest of itself.
+            let filled = self.inbox.len();
+            self.inbox.resize(filled + READ_CHUNK, 0);
+            match self.stream.read(&mut self.inbox[filled..]) {
+                Ok(0) => {
+                    self.inbox.truncate(filled);
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "peer closed the connection",
+                    ));
+                }
+                Ok(n) => self.inbox.truncate(filled + n),
+                Err(e) => {
+                    self.inbox.truncate(filled);
+                    match e.kind() {
+                        io::ErrorKind::WouldBlock => return Ok(None),
+                        io::ErrorKind::Interrupted => continue,
+                        _ => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Split one whole frame off the front of the inbox, if one is there.
+    fn take_buffered_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let available = self.inbox.len() - self.inbox_off;
+        if available < 4 {
+            return Ok(None);
+        }
+        let prefix: [u8; 4] = self.inbox[self.inbox_off..self.inbox_off + 4]
+            .try_into()
+            .expect("4 bytes");
+        let len = u32::from_le_bytes(prefix) as usize;
+        if len > MAX_FRAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incoming frame length exceeds MAX_FRAME_LEN",
+            ));
+        }
+        if available < 4 + len {
+            return Ok(None);
+        }
+        let body = self.inbox_off + 4;
+        let frame = self.inbox[body..body + len].to_vec();
+        self.inbox_off = body + len;
+        // Drop consumed bytes: cheaply when the buffer is spent (the steady state), by one
+        // memmove when a long run of small frames has left a large consumed prefix.
+        if self.inbox_off == self.inbox.len() {
+            self.inbox.clear();
+            self.inbox_off = 0;
+        } else if self.inbox_off >= COMPACT_AFTER {
+            self.inbox.drain(..self.inbox_off);
+            self.inbox_off = 0;
+        }
+        Ok(Some(frame))
+    }
+
+    /// Queue a frame and push as much as the socket will take. Never blocks; whatever does not
+    /// fit stays buffered for [`flush`](Self::flush).
+    pub fn queue_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() > MAX_FRAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame exceeds MAX_FRAME_LEN",
+            ));
+        }
+        self.outbox
+            .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        self.outbox.extend_from_slice(bytes);
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Drain buffered outbound bytes. `Ok(true)` once nothing is left pending.
+    pub fn flush(&mut self) -> io::Result<bool> {
+        while self.outbox_off < self.outbox.len() {
+            match self.stream.write(&self.outbox[self.outbox_off..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "socket accepted no bytes",
+                    ));
+                }
+                Ok(n) => self.outbox_off += n,
+                Err(e) => match e.kind() {
+                    io::ErrorKind::WouldBlock => return Ok(false),
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return Err(e),
+                },
+            }
+        }
+        self.outbox.clear();
+        self.outbox_off = 0;
+        Ok(true)
+    }
+
+    /// Bytes still waiting to go out — the backpressure signal against [`MAX_PENDING_OUT`].
+    pub fn pending_out(&self) -> usize {
+        self.outbox.len() - self.outbox_off
+    }
+
+    /// Shut the connection down in both directions.
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
     }
 }
 
@@ -266,6 +443,83 @@ mod tests {
             assert_eq!(client.recv_frame().unwrap(), payload);
         }
         server.join().unwrap();
+    }
+
+    /// The property the duty cycle depends on and the blocking transport cannot give: a frame
+    /// that arrives in pieces is reassembled across polls, with `None` (not a block, not a loss)
+    /// in between. Sent byte-at-a-time with the receiver polling in between, so every frame is
+    /// split at every possible offset.
+    #[test]
+    fn framed_conn_reassembles_frames_split_across_polls() {
+        let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payloads: Vec<Vec<u8>> = vec![b"first".to_vec(), Vec::new(), vec![0x5A; 5000]];
+        let expected = payloads.clone();
+
+        let writer = std::thread::spawn(move || {
+            let mut stream = TcpTransport::connect(addr).unwrap().into_stream();
+            let mut wire = Vec::new();
+            for p in &payloads {
+                wire.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                wire.extend_from_slice(p);
+            }
+            // One byte per write, so the reader sees every partial-frame state there is.
+            for b in wire {
+                stream.write_all(&[b]).unwrap();
+            }
+            stream
+        });
+
+        let mut server = FramedConn::new(listener.accept().unwrap().into_stream()).unwrap();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while got.len() < expected.len() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {got:?}");
+            match server.try_recv_frame().unwrap() {
+                Some(frame) => got.push(frame),
+                None => std::hint::spin_loop(), // nothing whole yet — the point of the test
+            }
+        }
+        assert_eq!(got, expected);
+        drop(writer.join().unwrap());
+    }
+
+    /// Outbound bytes survive a socket that will not take them all at once, and `pending_out`
+    /// reports the backlog the poll-item throttles on.
+    #[test]
+    fn framed_conn_buffers_what_the_socket_will_not_take() {
+        let mut listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || listener.accept().unwrap());
+        let mut sender =
+            FramedConn::new(TcpTransport::connect(addr).unwrap().into_stream()).unwrap();
+        let mut peer = reader.join().unwrap();
+
+        // Write far more than any socket buffer will absorb without a reader draining it.
+        let big = vec![0xC3u8; 1 << 20];
+        for _ in 0..64 {
+            sender.queue_frame(&big).unwrap();
+        }
+        assert!(
+            sender.pending_out() > 0,
+            "a socket that cannot take 64 MiB must leave a backlog to flush"
+        );
+
+        // Draining the peer lets the backlog flush without losing or reordering anything.
+        let drained = std::thread::spawn(move || {
+            let mut seen = 0;
+            for _ in 0..64 {
+                assert_eq!(peer.recv_frame().unwrap().len(), big.len());
+                seen += 1;
+            }
+            seen
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !sender.flush().unwrap() {
+            assert!(std::time::Instant::now() < deadline, "flush never drained");
+        }
+        assert_eq!(sender.pending_out(), 0);
+        assert_eq!(drained.join().unwrap(), 64);
     }
 
     #[test]

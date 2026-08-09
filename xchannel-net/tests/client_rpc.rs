@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use xchannel::{ReaderBuilder, ReaderMode};
 use xchannel_net::NodeConfig;
-use xchannel_net::node::Node;
+use xchannel_net::node::{MuxIdle, Node};
 use xchannel_net_client::Client;
 use xchannel_net_core::NodeId;
 use xchannel_net_core::wire::{ChannelChange, ChannelOptions};
@@ -58,6 +58,11 @@ fn client_creates_and_subscribes_via_daemon() {
         std::thread::spawn(move || {
             let _ = n.serve_client(client_l);
         });
+    }
+    {
+        // The duty cycle forwards; `serve_stream` only handshakes (doc/TOPICS.md §4.1).
+        let n = node.clone();
+        std::thread::spawn(move || n.run_duty_cycle(MuxIdle::default()));
     }
 
     let n = 30u64;
@@ -128,6 +133,11 @@ fn client_lists_and_watches_channels() {
             let _ = n.serve_client(client_l);
         });
     }
+    {
+        // The duty cycle forwards; `serve_stream` only handshakes (doc/TOPICS.md §4.1).
+        let n = node.clone();
+        std::thread::spawn(move || n.run_duty_cycle(MuxIdle::default()));
+    }
 
     let mut client = Client::connect(&client_path).unwrap();
     let opts = ChannelOptions::default();
@@ -191,6 +201,11 @@ fn subscribe_to_unknown_channel_times_out() {
         std::thread::spawn(move || {
             let _ = n.serve_client(client_l);
         });
+    }
+    {
+        // The duty cycle forwards; `serve_stream` only handshakes (doc/TOPICS.md §4.1).
+        let n = node.clone();
+        std::thread::spawn(move || n.run_duty_cycle(MuxIdle::default()));
     }
 
     let mut client = Client::connect(&client_path).unwrap();

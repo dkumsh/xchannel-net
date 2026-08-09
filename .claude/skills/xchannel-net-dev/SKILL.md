@@ -171,7 +171,7 @@ fixes on `main` since — see `CHANGELOG.md` "Unreleased"._
   commit passes `just check` (cargo check + fmt --check + clippy --all-targets).
 - **v1 complete and hardened.** External client process → `Client` RPC → local `xchanneld`
   → gossip discovery + membership → cross-node replication. Hardening done:
-  - **Self-healing subscriptions**: `Node::run_subscription` resumes from the replica head,
+  - **Self-healing subscriptions**: the conductor resumes from the replica head,
     reconnects on drop (backoff), and is stoppable (`Subscription::stop`/`unsubscribe`,
     socket shutdown to interrupt blocked reads). Idempotent `subscribe` RPC.
   - **Control-plane reconnection**: maintenance re-dials dropped seeds (tracked outbound
@@ -279,6 +279,21 @@ table is emitted at the **head of every segment**, so one is always inside the r
 (§6.3's late-consumer-decode promise, the restart sniff, and cursor recovery for a quiet member).
 Proven by a cross-process daemon-restart test. Chose option (a) content-sniff over (b) an
 xchannel header flag — keeps xchannel topic-agnostic, no cross-repo release.
+
+**Duty cycle** (post-0.1.0, §4.1): `xchanneld` runs **one** `Node::run_duty_cycle` thread polling
+replication sources + sinks + muxes as peer poll-items (256 records each per turn). Not
+thread-per-connection: 32 subscriptions cost 0 extra threads (6 idle → 6). Required building what
+§4.1 assumed existed — there was no shared forwarding loop, the daemon was thread-per-connection
+with blocking IO. New in core: `transport::FramedConn` (non-blocking resumable framing —
+`read_exact` cannot survive a partial frame), `stream::{ServerPollItem, ClientPollItem}`,
+`MAX_PENDING_OUT` backpressure (replacing blocking `write_all`'s implicit kind).
+**Establishment is NOT on the loop** — resolve/dial/handshake/`skip_to` are blocking and unbounded,
+so a transient thread does the handshake and hands the connection over, then exits; handshakes are
+bounded by `HANDSHAKE_TIMEOUT`. Reconnects are the conductor's (`service_subscriptions`, on the
+maintenance tick), registered via `conducted` (weak refs) **not** the `subscriptions` map — keying
+off the map would silently make a `Node::subscribe` handle stop self-healing unless the caller also
+filed it there. `Node::run_mux` survives as §4.1 promotion rung 2 (mux outside the shared loop).
+Accepted per §4.1's budget note: topics and replication now share a core.
 
 **Per-mux locking** (post-0.1.0 fix): `muxes` is `HashMap<String, Arc<Mutex<Mux>>>`; the map lock
 is held only to clone a handle, **never across mux IO**. **Lock order: map → mux, never the

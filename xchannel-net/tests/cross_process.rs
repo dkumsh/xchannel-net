@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use xchannel_net_client::{Client, SubscribeMode};
+use xchannel_net_core::RecordIndex;
 use xchannel_net_core::mux::{Provenance, is_control};
+use xchannel_net_core::stream;
+use xchannel_net_core::transport::TcpTransport;
 use xchannel_net_core::wire::{ChannelOptions, TopicOptions};
 
 /// Kills the spawned daemon on drop (even if the test panics).
@@ -95,6 +98,56 @@ fn spawn_daemon_seeded(
         }
     });
     (Daemon(child), client_path, control)
+}
+
+/// Spawn a daemon and recover both banner addresses plus its pid, for tests that need to observe
+/// the process itself rather than just talk to it.
+fn spawn_daemon_observed(data_dir: &Path) -> (Daemon, PathBuf, SocketAddr, u32) {
+    let client_path = data_dir.join("client.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xchanneld"))
+        .env("XCHANNELD_NODE_ID", "1")
+        .env("XCHANNELD_STREAM_ADDR", "127.0.0.1:0")
+        .env("XCHANNELD_CONTROL_ADDR", "127.0.0.1:0")
+        .env("XCHANNELD_CLIENT_PATH", &client_path)
+        .env("XCHANNELD_DATA_DIR", data_dir)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn xchanneld");
+    let pid = child.id();
+    let mut reader = BufReader::new(child.stderr.take().unwrap());
+    let stream_addr = loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "daemon exited before printing its banner"
+        );
+        if let Some(addr) = line
+            .split("stream ")
+            .nth(1)
+            .and_then(|rest| rest.split(" |").next())
+            .and_then(|s| s.trim().parse::<SocketAddr>().ok())
+        {
+            break addr;
+        }
+    };
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
+            sink.clear();
+        }
+    });
+    (Daemon(child), client_path, stream_addr, pid)
+}
+
+/// Live thread count of a process, from `/proc/<pid>/status`.
+#[cfg(target_os = "linux")]
+fn threads_of(pid: u32) -> usize {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("daemon is running");
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Threads:"))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("Threads: line")
 }
 
 fn connect_with_retry(path: &Path) -> Client {
@@ -293,6 +346,65 @@ fn a_record_merges_into_its_topic_without_waiting_on_a_poll_tick() {
         samples[samples.len() * 9 / 10],
         worst
     );
+}
+
+/// The point of the duty cycle (`doc/TOPICS.md` §4.1): a connection is a **poll-item**, not a
+/// thread. The daemon used to spawn one thread per subscriber and keep it for the connection's
+/// life, so 32 subscribers cost 32 parked threads; now one loop forwards them all, and the only
+/// threads a connection touches are the transient handshake it exits from.
+///
+/// Asserts the steady state rather than an instant, because handshake threads are genuinely alive
+/// for a moment — the claim is that they do not *accumulate*. Under the old model the count would
+/// sit at baseline + 32 forever and no amount of settling would bring it down.
+#[cfg(target_os = "linux")]
+#[test]
+fn subscriptions_do_not_cost_the_daemon_a_thread_each() {
+    const SUBSCRIBERS: usize = 32;
+    let data_dir = temp_dir("duty-threads");
+    let (_daemon, client_path, stream_addr, pid) = spawn_daemon_observed(&data_dir);
+    let mut client = connect_with_retry(&client_path);
+    let mut w = client
+        .create_channel("md.aapl", &ChannelOptions::default())
+        .unwrap();
+    let baseline = threads_of(pid);
+
+    // Subscribe straight to the stream plane, so each subscriber is a real served connection.
+    let mut subs = Vec::new();
+    for i in 0..SUBSCRIBERS {
+        let replica = data_dir.join(format!("sub-{i}")).join("log");
+        std::fs::create_dir_all(replica.parent().unwrap()).unwrap();
+        let conn = TcpTransport::connect(stream_addr).unwrap();
+        subs.push(
+            stream::subscribe(conn, "md.aapl", RecordIndex(0), 0, &replica)
+                .unwrap_or_else(|e| panic!("subscriber {i} handshake: {e}")),
+        );
+    }
+
+    // One record, received by every subscriber — proof all 32 are live poll-items, not merely
+    // accepted sockets.
+    let buf = w.try_reserve(4).unwrap();
+    buf.copy_from_slice(b"tick");
+    w.commit(0, 4, 0).unwrap();
+    for (i, s) in subs.iter_mut().enumerate() {
+        s.recv_one()
+            .unwrap_or_else(|e| panic!("subscriber {i} never received the record: {e}"));
+    }
+
+    // Handshake threads have exited by now, or will imminently; the count must settle near
+    // baseline instead of growing with the subscriber count.
+    let allowance = baseline + SUBSCRIBERS / 4;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut threads = threads_of(pid);
+    while threads > allowance && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        threads = threads_of(pid);
+    }
+    assert!(
+        threads <= allowance,
+        "{SUBSCRIBERS} live subscriptions left the daemon at {threads} threads (baseline \
+         {baseline}) — connections are still costing a thread each"
+    );
+    eprintln!("daemon threads: {baseline} idle -> {threads} with {SUBSCRIBERS} live subscriptions");
 }
 
 #[test]

@@ -15,13 +15,13 @@ owner to read-only replicas on subscribing nodes.
 
 ---
 
-## 0. Implementation status (v1, as of 2026-06)
+## 0. Implementation status
 
 > **This is a design document — much of it describes the target design, not all of which
 > is built.** This section is the authoritative map of what the code on disk actually
 > does. Where a later section describes behavior that is designed but not yet implemented,
-> it is tagged **(not yet — see §0)**. This is experimental, pre-1.0 software
-> (`version = 0.0.0`); the wire protocol and on-disk layout may change without notice.
+> it is tagged **(not yet — see §0)**. This is experimental, pre-1.0 software; the wire
+> protocol and on-disk layout may change without notice.
 
 **Implemented and tested** (unit + cross-process integration tests, `cargo test` green):
 
@@ -35,7 +35,8 @@ owner to read-only replicas on subscribing nodes.
   (re)connect; membership heartbeats; owner-address resolution.
 - Client↔daemon RPC (`create` / `subscribe`) and `connect_or_spawn` single-daemon bring-up.
 - Self-healing subscriptions: resume from the replica head, reconnect on drop,
-  stop/unsubscribe (§5.1, `node.rs::run_subscription`).
+  stop/unsubscribe (§5.1). Establishment and reconnection are the conductor's
+  (`Node::service_subscriptions`); forwarding is a poll-item on the duty cycle.
 - Resume handshake (`Subscribe.from` / `SubscribeAck.start`), `Gap` on retention underrun and
   `Diverged` when the resume position is past the source's head — both decided before the
   source seeks, so an out-of-range resume fails loudly instead of blocking forever (§4).
@@ -86,7 +87,9 @@ owner to read-only replicas on subscribing nodes.
 **Not yet implemented** (designed below, absent from the code):
 
 - **Stream multiplexing (§6)** — `StreamId` is hardcoded to `0`; one connection carries one
-  subscription. The multiplexing described in §6 is not built.
+  subscription. The multiplexing described in §6 is not built. (Connections no longer cost a
+  thread each — the data plane is one duty cycle, `doc/TOPICS.md` §4.1 — so what multiplexing
+  would still buy is sockets and handshakes, not scheduler load.)
 - **Authentication / authorization / encryption (§8)** — none. All three planes are
   unauthenticated plaintext; any peer that can connect can register names, subscribe to and
   pull any channel's history, inject registry deltas, and heartbeat as any node. **Run only

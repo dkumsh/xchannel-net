@@ -6,6 +6,35 @@ experimental: the wire protocol and on-disk layout may change without notice (se
 
 ## Unreleased
 
+### Changed
+- **The data plane is now a duty cycle** (`doc/TOPICS.md` §4.1). `Node::run_duty_cycle` polls
+  replication sources, replication sinks and mux slots as peer poll-items in one loop, each bounded
+  to 256 records per turn. It replaces thread-per-connection: a daemon serving 32 subscriptions
+  runs the same **6 threads it runs idle** (it would previously have run 38), and scheduling is one
+  loop's rather than N blocked threads waking in whatever order the kernel chooses.
+
+  §4.1 described muxes as poll-items in "the daemon's *existing* forwarding loop", but no such loop
+  existed — the daemon was thread-per-connection with blocking IO — so it had to be built:
+  `FramedConn` (non-blocking, resumable framing, because `read_exact` cannot survive a partial
+  frame), `ServerPollItem`/`ClientPollItem` (poll-item forms of the stream protocol), and explicit
+  backpressure via `MAX_PENDING_OUT`, which a blocking `write_all` used to provide for free.
+
+  **Establishment deliberately stays off the loop.** Resolving, dialling, handshaking and seeking
+  to a resume index are blocking and unbounded; on the duty cycle one unreachable peer would stall
+  every poll-item. A transient thread does the handshake and hands the connection over, then exits
+  — the connection outliving the thread is the whole difference. Handshakes are now bounded by
+  `HANDSHAKE_TIMEOUT`, so a peer that connects and says nothing cannot pin one.
+
+  **The coupling §4.1 warns about is now real**: a hot topic competes with replication forwarding
+  for the same core, and a stall in one topic's mmap path briefly stalls forwarding. That is the
+  trade the shared loop makes, and it is why the per-topic promotion path (rung 2, `Node::run_mux`)
+  is kept.
+
+  Subscription self-healing moved to the conductor, and is registered independently of the
+  client-facing `subscriptions` map — keying it off that map would have quietly made a
+  `Node::subscribe` handle stop reconnecting unless the caller also filed it, which the old
+  per-subscription thread did regardless.
+
 ### Fixed
 - **Topics no longer share one lock across their merges.** `poll_muxes` held the map lock for the
   whole sweep, and a merge is the one thing the daemon does that is unbounded while holding a lock

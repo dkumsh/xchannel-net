@@ -13,7 +13,7 @@
 
 use crate::codec::{decode_stream, encode_stream};
 use crate::replication::{ReplicationSink, ReplicationSource};
-use crate::transport::Transport;
+use crate::transport::{FramedConn, MAX_PENDING_OUT, TcpTransport, Transport};
 use crate::wire::StreamMsg;
 use crate::{RecordIndex, StreamId};
 use std::io;
@@ -359,6 +359,127 @@ impl<T: Transport> StreamClient<T> {
         loop {
             self.recv_one()?;
         }
+    }
+}
+
+// ---------------- poll-item forms (the duty cycle, doc/TOPICS.md §4.1) ----------------
+//
+// `StreamServer::run` and `StreamClient::run` are blocking loops, which is why the daemon used to
+// need a thread per connection. §4.1 wants replication sources, replication sinks and mux slots to
+// be *peer poll-items in one loop*, so each needs a form that does a bounded amount of work and
+// returns. The protocol is unchanged — same frames, same invariants; only the scheduling differs.
+//
+// **Handshakes stay blocking and stay off the loop.** `accept_subscription` and `subscribe` are
+// establishment: they resolve, dial, exchange one frame each way, and decide `Gap`/`Diverged`
+// rebuilds. Doing that on the duty cycle would let one unreachable peer stall every other
+// subscription. A conductor performs the handshake and hands the finished connection over via
+// `adopt`, which is also what keeps `FramedConn`'s "no bytes stranded" precondition true.
+
+/// An accepted subscription being forwarded, one bounded batch per poll.
+pub struct ServerPollItem {
+    conn: FramedConn,
+    source: ReplicationSource,
+}
+
+impl ServerPollItem {
+    /// Adopt a handshaken [`StreamServer`], switching its socket to non-blocking framing.
+    pub fn adopt(server: StreamServer<TcpTransport>) -> io::Result<Self> {
+        let StreamServer { transport, source } = server;
+        Ok(Self {
+            conn: FramedConn::new(transport.into_stream())?,
+            source,
+        })
+    }
+
+    /// Forward up to `max_batch` records. Returns how many were queued for the peer.
+    ///
+    /// Pending output is drained first, and nothing new is read from the source while the peer is
+    /// behind — the blocking `write_all` used to apply that backpressure implicitly, and without
+    /// it a subscriber that stops reading would be answered by unbounded memory growth here
+    /// instead of by falling behind its origin's retention.
+    pub fn poll(&mut self, max_batch: usize) -> io::Result<usize> {
+        if !self.conn.flush()? || self.conn.pending_out() >= MAX_PENDING_OUT {
+            return Ok(0);
+        }
+        let mut sent = 0;
+        while sent < max_batch {
+            let Some(frame) = self.source.try_next_frame()? else {
+                break;
+            };
+            self.conn.queue_frame(&encode_stream(&StreamMsg::Record {
+                stream_id: STREAM_ID,
+                frame,
+            }))?;
+            sent += 1;
+            if self.conn.pending_out() >= MAX_PENDING_OUT {
+                break;
+            }
+        }
+        Ok(sent)
+    }
+}
+
+/// A subscription being applied into its replica, one bounded batch per poll.
+pub struct ClientPollItem {
+    conn: FramedConn,
+    sink: ReplicationSink,
+    head: RecordIndex,
+}
+
+impl ClientPollItem {
+    /// Adopt a handshaken [`StreamClient`], switching its socket to non-blocking framing.
+    pub fn adopt(client: StreamClient<TcpTransport>) -> io::Result<Self> {
+        let StreamClient {
+            transport,
+            sink,
+            head,
+        } = client;
+        Ok(Self {
+            conn: FramedConn::new(transport.into_stream())?,
+            sink,
+            head,
+        })
+    }
+
+    /// Apply up to `max_batch` received records. Returns how many were applied.
+    pub fn poll(&mut self, max_batch: usize) -> io::Result<usize> {
+        let mut applied = 0;
+        while applied < max_batch {
+            let Some(bytes) = self.conn.try_recv_frame()? else {
+                break;
+            };
+            match decode_stream(&bytes)? {
+                StreamMsg::Record { frame, .. } => {
+                    self.sink.apply(&frame)?;
+                    applied += 1;
+                }
+                StreamMsg::Gap { earliest, .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("mid-stream gap at {}", earliest.0),
+                    ));
+                }
+                _ => return Err(invalid("expected Record")),
+            }
+        }
+        Ok(applied)
+    }
+
+    /// The absolute index the next received record must carry (the replica head).
+    #[inline]
+    pub fn expected_index(&self) -> RecordIndex {
+        self.sink.expected_index()
+    }
+
+    /// The source's high-water index as of the `SubscribeAck`.
+    #[inline]
+    pub fn head(&self) -> RecordIndex {
+        self.head
+    }
+
+    /// Shut the socket down, so a stop takes effect without waiting for the peer.
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.conn.shutdown()
     }
 }
 
