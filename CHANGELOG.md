@@ -85,11 +85,22 @@ node before starting any new one; see *Upgrading from 0.2.x* in the README.
 
   A node that finds its own **generated** id duplicated and owns no channels discards it and stops
   with status `3`, so a supervisor's restart takes a fresh one — the whole point being that deleting
-  the file while carrying on would leave the duplicate live and change nothing but the file. That
-  rescues the likely copying accident, a golden image snapshotted after first start. Both clones may
-  stand down at once; that is harmless, because neither owned anything. Once a node owns a channel,
-  changing its id would orphan it, so past that point this can only warn — and it warns **once per
-  id**, not once per maintenance tick.
+  the file while carrying on would leave the duplicate live and change nothing but the file. Once a
+  node owns a channel, changing its id would orphan it, so past that point this can only warn. The
+  warning prints **once per id**, not once per tick; the *verdict* is re-evaluated on every detection,
+  so a node that owned a channel when it first noticed can still stand aside once it owns nothing.
+
+  Reaching the case this was written for — a golden image snapshotted after first start — needs one
+  more thing, because a clone cannot *dial* its sibling: dial candidates come from membership, and
+  membership excludes this node's own id by construction. Clones seeded at a common bootstrap therefore
+  linked only to the bootstrap, which saw the duplicate plainly and could do nothing about it. So a
+  `PeerHint` naming **our own** id at an address that is not ours is now kept as a dial candidate —
+  never as a member (hearsay confers no liveness) and never as grounds by itself (a node restarted on
+  an ephemeral port would find peers relaying its own stale address). The hint earns a dial; the
+  heartbeat that returns over that link decides, on direct evidence. Verified end to end: two clones of
+  one data directory, each seeded only at a bootstrap, now both detect the duplicate, discard their ids
+  and exit 3. Every clone stands aside rather than all but one — they detect each other simultaneously
+  and none has grounds to consider itself the original, which is harmless because none owned anything.
 
 - **A cosmetic node name and creation time**, gossiped with the heartbeat and stored in membership.
   `XCHANNELD_NODE_NAME`, defaulting to the hostname. Never a key, never a tie-break — a duplicate name
@@ -200,9 +211,67 @@ Everything from here down was found by a pre-release review of the four changes 
   unreachable address and no cap — so the number of addresses the mesh had ever mentioned set this
   node's heartbeat period. Twelve unreachable addresses were enough to flip a live, actively-writing
   owner to `owner_live = false` on its peers; because the topic member reaper keys on the same
-  predicate, it then began tombstoning that node's live members' names. The heartbeat now goes first,
-  at most two addresses are dialled per tick, each failure backs off exponentially, and the candidate
-  list is walked round-robin so a permanently dead address cannot starve a live peer behind it.
+  predicate, it then began tombstoning that node's live members' names. The heartbeat now goes first and
+  the dialling is capped.
+
+  Measured before and after, with 25 dead seeds and 100 unreachable learned peers: heartbeat period
+  max **4.50 s** against a 10 s liveness timeout, and a healthy owner reported dead in **0 of 60**
+  samples where it had previously been 15 of 25. A 100-node mesh (4950 links, all live) closes in
+  **13.3 s** and a registration crosses it in 0.28 s; a 50-node mesh holds steady with **6** TCP opens
+  across the whole mesh in 30 s.
+
+  Three details of the cap were each wrong first, and are the kind that look like tuning and are not:
+  - **Each candidate list has its own cursor**, advanced by what it consumed. A single cursor reduced
+    modulo each list in turn — seeds are usually one or two entries — pinned the learned walk to a
+    constant index forever, so the rotation existed only in the comments.
+  - **The penalty is charged for the attempt, not for the failure.** An address can accept a connection
+    and then drop the link — a hint or seed naming a stream port, or a peer whose control frames this
+    release cannot decode — which costs a full dial and recorded nothing, so two such addresses consumed
+    the whole budget every tick, permanently, and the node joined only in the inbound direction. The
+    penalty is forgiven once an address has *identified itself* over a link dialled there, which is a
+    real peer whose link merely dropped.
+  - **Seeds, learned peers and same-id candidates carry separate budgets**, so a tick's worst case is
+    their sum — five dials, five seconds — not the two the constant's own doc claimed. A build-time
+    assertion now ties that sum to `LIVENESS_TIMEOUT`, because a heartbeat period that quietly grows
+    past it looks healthy right until every peer declares this node dead.
+
+- **A peer that stopped reading could stall the entire node.** Every control-plane write is a blocking
+  `write_all` made while holding the dissemination lock, so one unresponsive peer stalled the heartbeat
+  along with everything else. Two halves: peer sockets now carry a **write timeout** (a failed write is
+  already how a dead peer is reaped), and registry relays and replies are **coalesced to one frame per
+  peer per pump cycle** instead of one per identity, which also collapses N lock acquisitions to one.
+  Measured on the unfixed code: a single frame carrying 200 000 losing identities produced a **40.09 s
+  heartbeat gap** — four times the liveness timeout — and a ≥20 s client-plane outage. A control run
+  where the same identities *relayed* instead of replying peaked at 1.79 s, isolating the cause.
+
+- **A `deregister_topic` deadlocked the whole control plane against a peer being dialled or accepted.**
+  Taking the registry snapshot under the dissemination lock (below) gave the node a lock *order*, and
+  this function violated it invisibly: `if let Some(t) = self.registry.lock_safe().deregister(..)` holds
+  the guard for the whole body, across both the `hosted` lock and the announce. Two independent
+  reproductions hung within a couple of hundred retirements with a single inbound control connection
+  arriving every 5 ms, and hung silently — the dissemination lock is the entire control plane, so the
+  node stops heartbeating and every peer declares it dead. `subscription_status` held `hosted` across
+  the registry lock the same way, closing a second cycle. Both now bind before the `if let`; the lock
+  order is written on the `Node` type, along with the temporary-scope hazard that caused it, and a test
+  asserts the invariant directly rather than racing for it.
+
+- **A node listing itself among its seeds kept a permanent link to itself** — a thread, two descriptors
+  and a heartbeat exchanged with nobody, held forever because a self-link never learns an identity and
+  link deduplication deliberately keeps a link whose peer it does not know. Dialling now declines this
+  node's own advertised control address. (A seed list naming every node in the mesh is how an operator
+  writes one.)
+
+- **`reply` compared whole identities where the merge orders on a key.** Two entries tying on
+  `(epoch, deleted, registered_at_nanos, owner)` but differing in a payload field would have had each
+  node replying its own version to the other every tick forever, converging on nothing. No path in the
+  tree produces such a tie today; the guard should not depend on that staying true.
+
+- **Signal handling:** the flag is set *before* the handler disarms itself, so a fast double `^C` cannot
+  kill the process before the graceful path has been asked for; the disarm covers both signals, since an
+  operator who presses `^C` and then reaches for `kill` should find the second signal fatal; and
+  handlers are installed as the daemon's first action rather than after the data directory, identity and
+  lock, which had made a signal in the first milliseconds a hard kill despite a comment claiming
+  otherwise.
 - **Startup served nothing for as long as its seed list took to dial.** `connect_seeds` ran before any
   plane thread was spawned — measured at 25 s against 25 blackholed seeds, with the listeners already
   bound, so a peer's TCP connect succeeded and then waited: the node looked ready and answered nothing.
@@ -212,8 +281,11 @@ Everything from here down was found by a pre-release review of the four changes 
   made the ordinary case, since a registry entry now routinely arrives second-hand for a node we hold no
   link to. Every daemon older than `reclaim_after` therefore satisfied the floor unconditionally, so an
   owner that was alive and writing but merely unreachable from here could have its channel tombstoned —
-  precisely what the guard exists to refuse. It now measures how long the owner has been unreachable
-  **from this node**: silence since the last direct contact, or, failing that, how long this node has
+  precisely what the guard exists to refuse. One consequence worth stating because it is a behaviour
+  change: a node that announced `Leaving` now has to serve out the full floor before its names can be
+  reclaimed, where the uptime fallback allowed it immediately. That is the safer reading — a restart
+  announces `Leaving` too, and a rolling restart must not make channels reclaimable. It now measures how
+  long the owner has been unreachable **from this node**: silence since the last direct contact, or, failing that, how long this node has
   known of the owner and failed to reach it, a clock reset the instant contact is made. Membership keeps
   a departure instant so that a peer which said goodbye stays distinguishable from one never met —
   otherwise the fix would have made a graceful departure unreclaimable.

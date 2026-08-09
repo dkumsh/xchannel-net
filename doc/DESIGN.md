@@ -251,8 +251,33 @@ candidate set grows with every address the mesh has ever mentioned, and an unrea
 a full connect timeout, unbounded dialling let the *number of addresses this node knows of* set its
 heartbeat period — and a node whose heartbeat exceeds the liveness timeout is declared dead by
 everyone, which the topic member reaper then converts into tombstones for its live members' names.
-Each address that fails backs off exponentially, and the candidate list is walked round-robin so a
-permanently dead address cannot starve a live peer behind it.
+Measured: 25 blackholed seeds delayed a cold start's first served request by 25 s; twelve unreachable
+addresses were enough to have a live, actively-writing owner reported dead.
+
+Three candidate lists — seeds, learned peers, and addresses claiming this node's own id — carry
+**separate** budgets, so the worst-case tick is their sum, not one budget's worth. Sharing one would
+let a long list of learned ghosts crowd out the seeds, and the seeds are the only addresses an operator
+actually chose. The cap is what bounds the tick; the backoff reduces wasted work but cannot be relied
+on to bound it, because past roughly seventy unreachable addresses the demand for retries exceeds what
+a tick can spend and the loop simply saturates. A build-time assertion ties the sum to the liveness
+timeout, because the failure it guards against is invisible: a heartbeat period that quietly grows past
+`LIVENESS_TIMEOUT` looks like a healthy node right up to the moment every peer declares it dead.
+
+Two things about the walk are load-bearing and were each wrong once. **Each list has its own cursor,
+advanced by the candidates it actually consumed** — a single shared cursor reduced modulo each list in
+turn pinned the learned walk to a constant index forever. And **the penalty is charged for the attempt,
+not for the failure**: an address can accept a connection and then drop the link (a hint naming a
+stream port, or a peer whose control frames this release cannot decode), which costs a full dial while
+recording nothing, so two such addresses consumed the entire budget every tick in perpetuity. The
+penalty is forgiven once an address has *identified itself* over a link dialled there — a real peer
+whose link merely dropped, which is what prompt reconnection is for.
+
+Dialling is not the only blocking work in the tick. Registry replies and relays are coalesced to one
+frame per peer per cycle and every peer socket carries a write timeout, because a peer that stops
+reading would otherwise stall the dissemination lock — and therefore the heartbeat — indefinitely; a
+single frame of 200 000 losing identities produced a forty-second heartbeat gap before that was closed.
+Member attachment still costs a bounded resolve per unattached remote member and is *not* capped in
+member count; that is the next thing to bound if a tick ever runs long.
 
 **`NodeId`s must be unique; nothing negotiates them, and a duplicate is detected rather than
 prevented.** A node generates 64 random bits from `/dev/urandom` on first start and keeps them in
@@ -273,11 +298,23 @@ is not ours is a twin, and the same heartbeat carrying *our own* advertised addr
 we opened to ourselves — which a seed list naming every node produces routinely and which must never
 be mistaken for a duplicate.
 
-A node that finds its own *generated* id duplicated and owns no channels discards it and stops with a
-non-zero status, so a supervisor's restart takes a fresh one. Both clones may do that at once; that is
-harmless, because neither owned anything. Past the point where a node owns a channel, changing its id
-would leave those channels registered to an owner that never returns, so from there this can only
-warn.
+For the second form to be reachable at all, a clone has to be able to *dial* its sibling — and the
+ordinary dial candidates cannot contain it, because they come from membership and membership excludes
+this node's own id by construction. So a fleet of clones seeded at a common bootstrap linked only to
+the bootstrap, which saw the duplicate plainly and could do nothing about it, and the whole mechanism
+was unreachable in precisely the deployment it was written for. The repair: a `PeerHint` naming *our
+own* id at an address that is not ours is kept as a **dial candidate** — never as a member, since
+hearsay confers no liveness, and never as grounds by itself, since a node restarted on an ephemeral
+port would find peers relaying its own stale address. The hint earns a dial; the heartbeat that comes
+back over that link is what decides, on direct evidence, as always.
+
+A node that finds its own *generated* id duplicated and owns no channels discards it and stops with
+status 3, so a supervisor's restart takes a fresh one. Every clone stands aside, not all but one: they
+detect each other simultaneously and none has grounds to consider itself the original. That is
+harmless, because none of them owned anything. Past the point where a node owns a channel, changing its
+id would leave those channels registered to an owner that never returns, so from there this can only
+warn — and the *verdict* is re-evaluated on every detection even though the *warning* is printed once,
+so a node that owned a channel when it first noticed can still stand aside after it owns nothing.
 
 A duplicate makes two nodes indistinguishable in the membership map (their addresses overwrite each
 other), in channel ownership (`ChannelIdentity.owner`, and the `registered_at_nanos`/`NodeId`
