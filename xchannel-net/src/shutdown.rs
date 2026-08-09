@@ -25,13 +25,28 @@ static REQUESTED: AtomicBool = AtomicBool::new(false);
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
 
+/// `signal(2)`, declared with its real signature.
+///
+/// The handler is an `Option<Handler>` rather than a `usize`: `None` is C's `SIG_DFL`, so restoring
+/// the default needs no magic constant, and the compiler checks the function pointer instead of
+/// taking whatever an `as usize` cast produced. `SIG_ERR` is `-1` as a pointer, which is not a valid
+/// `Option<fn>`, so the return is read as a raw pointer and only compared.
+type Handler = extern "C" fn(i32);
 unsafe extern "C" {
-    fn signal(signum: i32, handler: usize) -> usize;
+    fn signal(signum: i32, handler: Option<Handler>) -> *const ();
 }
 
 /// The handler. A relaxed store to a `static` is one of the few things that is safe to do in a
 /// signal handler — no allocation, no locks, no reentrancy.
-extern "C" fn on_signal(_sig: i32) {
+///
+/// It also **restores the default disposition** for the signal it handled, so a *second* `SIGTERM`
+/// or `^C` kills the process outright. Without that escape hatch, a daemon wedged anywhere in its
+/// shutdown path — a blocking `write_all` to a peer that stopped reading is the realistic one —
+/// would swallow every further signal and could only be ended with `SIGKILL`. Re-arming is
+/// `signal`'s own behaviour on Linux and is async-signal-safe.
+extern "C" fn on_signal(sig: i32) {
+    // SAFETY: `signal` with `SIG_DFL` is async-signal-safe, and takes no locks and no allocation.
+    unsafe { signal(sig, None) };
     REQUESTED.store(true, Ordering::Relaxed);
 }
 
@@ -41,8 +56,8 @@ extern "C" fn on_signal(_sig: i32) {
 pub fn install() {
     for sig in [SIGINT, SIGTERM] {
         // SAFETY: `on_signal` is `extern "C"`, takes the right argument, and does nothing but a
-        // relaxed atomic store.
-        unsafe { signal(sig, on_signal as usize) };
+        // relaxed atomic store and a `signal` call.
+        unsafe { signal(sig, Some(on_signal)) };
     }
 }
 
@@ -88,7 +103,12 @@ mod tests {
     #[test]
     fn the_handler_sets_the_flag() {
         assert!(!requested(), "nothing has asked us to stop");
+        install();
         on_signal(SIGTERM);
+        // The handler disarmed itself, so the *next* SIGTERM is fatal — the escape hatch for a
+        // shutdown that hangs. Re-arm before leaving, or this test would change how the harness
+        // behaves for everything after it.
+        install();
         assert!(requested());
         assert!(!restart_wanted(), "a signal is not a restart request");
         // Leave it clear for any other test in this binary.
