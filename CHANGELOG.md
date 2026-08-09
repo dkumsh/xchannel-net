@@ -4,7 +4,44 @@ All notable changes to xchannel-net are documented here. Versioning is pre-1.0 a
 experimental: the wire protocol and on-disk layout may change without notice (see
 `SECURITY.md`).
 
-## Unreleased
+## 0.2.0 (2026-08-09)
+
+**The data plane became a duty cycle** (`doc/TOPICS.md` §4.1): one loop polls replication sources,
+replication sinks and mux slots as peer poll-items, replacing a thread per connection — a daemon
+serving 32 subscriptions now runs the same **6 threads it runs idle**. Merge latency fell from
+~5 ms to ~1 µs, and a topic hot enough to want its own core can be promoted onto one.
+
+The rest is correctness work found by reviewing everything since 0.0.1: topics that never applied
+the retention they were configured with, a merge cursor that could claim progress the topic's log
+did not have, tombstones that reached every daemon *except* the one that produced them, and a
+restarted daemon that answered questions before it had finished rebuilding from disk. Channel names
+are now stamped into the log itself, closing the last fact about a channel that was read from the
+filesystem rather than from its content.
+
+**Breaking — on-disk.** No migrator; a data directory written by 0.1.0 is not carried forward.
+A topic log's slot tables are refused (new wire version), and any channel written before name
+stamping is refused rather than re-hosted. Both are deliberate: a guarantee that held only for
+files written by a new enough daemon would not be one you could rely on.
+
+**Breaking — API.** `ReplicationSink::open` and `Mux::open` take the channel name;
+`Node::run_mux` is superseded by `Node::run_duty_cycle` for daemon use; `NodeConfig` gains
+`promoted_topics` and `mux_idle`; channel names are capped at 48 bytes
+(`xchannel::CHANNEL_NAME_MAX`), down from 200.
+
+### Added
+- **Per-topic promotion** (`doc/TOPICS.md` §4.1 rung 2, resolving §9's open *trigger* question).
+  `XCHANNELD_PROMOTED_TOPICS` — comma-separated topic names — gives a topic its own mux thread, and
+  the shared duty cycle **skips** it, so a promoted topic leaves the shared budget rather than
+  merely gaining a second poller. `TopicStatus::promoted` reports the effective state. The thread
+  exits when the map no longer holds *that* mux (identity, not name), so retire-and-recreate cannot
+  leave a stale thread polling alongside the new one.
+
+  §9 proposed this as a `TopicOptions` field; it is node config instead. `TopicOptions` is
+  client-supplied, and a client that could set it could make the daemon spawn threads; its policy
+  fields do not survive a restart, so a promotion would silently lapse; and promotion describes how
+  a *node* schedules rather than what a topic is. Automatic, lag-driven promotion remains unbuilt
+  on purpose — it needs evidence, and a daemon that spawned threads in reaction to load would be
+  the kind of emergent behavior the design refuses elsewhere.
 
 ### Changed
 - **A channel's name is now stamped into its log, and reconstruction believes the log over the
@@ -52,23 +89,6 @@ experimental: the wire protocol and on-disk layout may change without notice (se
   record` — one record, not one batch, because a record is always queued whole and the cap only
   gates starting another. It also asserts the throttle actually engaged, so the bound is not
   vacuously satisfied by the socket absorbing everything.
-
-### Added
-- **Per-topic promotion** (`doc/TOPICS.md` §4.1 rung 2, resolving §9's open *trigger* question).
-  `XCHANNELD_PROMOTED_TOPICS` — comma-separated topic names — gives a topic its own mux thread, and
-  the shared duty cycle **skips** it, so a promoted topic leaves the shared budget rather than
-  merely gaining a second poller. `TopicStatus::promoted` reports the effective state. The thread
-  exits when the map no longer holds *that* mux (identity, not name), so retire-and-recreate cannot
-  leave a stale thread polling alongside the new one.
-
-  §9 proposed this as a `TopicOptions` field; it is node config instead. `TopicOptions` is
-  client-supplied, and a client that could set it could make the daemon spawn threads; its policy
-  fields do not survive a restart, so a promotion would silently lapse; and promotion describes how
-  a *node* schedules rather than what a topic is. Automatic, lag-driven promotion remains unbuilt
-  on purpose — it needs evidence, and a daemon that spawned threads in reaction to load would be
-  the kind of emergent behavior the design refuses elsewhere.
-
-### Changed
 - **The data plane is now a duty cycle** (`doc/TOPICS.md` §4.1). `Node::run_duty_cycle` polls
   replication sources, replication sinks and mux slots as peer poll-items in one loop, each bounded
   to 256 records per turn. It replaces thread-per-connection: a daemon serving 32 subscriptions
@@ -96,6 +116,12 @@ experimental: the wire protocol and on-disk layout may change without notice (se
   client-facing `subscriptions` map — keying it off that map would have quietly made a
   `Node::subscribe` handle stop reconnecting unless the caller also filed it, which the old
   per-subscription thread did regardless.
+- **Slot-table wire format** gains a leading version byte, the topic's `file_roll_size`/`keep_files`,
+  and a per-entry `cursor`. A table of another version is **refused** rather than decoded at the
+  wrong offsets, since misreading one misattributes `member_ref → (name, epoch)` — the failure class
+  of the recovery-conflation bug. **On-disk format change**: a 0.1.0 topic log is not re-hosted on
+  upgrade (its tables no longer decode, so it reconstructs as a plain channel); pre-existing topic
+  data directories are not migrated.
 
 ### Fixed
 - **Topics no longer share one lock across their merges.** `poll_muxes` held the map lock for the
@@ -191,14 +217,6 @@ experimental: the wire protocol and on-disk layout may change without notice (se
   Separately, `RESTART.md` and `Node::host_channel` still described a reconstructed origin's
   replicas as "no rolling" — since roll mirroring they do roll (following the origin's
   boundaries) and simply never prune.
-
-### Changed
-- **Slot-table wire format** gains a leading version byte, the topic's `file_roll_size`/`keep_files`,
-  and a per-entry `cursor`. A table of another version is **refused** rather than decoded at the
-  wrong offsets, since misreading one misattributes `member_ref → (name, epoch)` — the failure class
-  of the recovery-conflation bug. **On-disk format change**: a 0.1.0 topic log is not re-hosted on
-  upgrade (its tables no longer decode, so it reconstructs as a plain channel); pre-existing topic
-  data directories are not migrated.
 
 ## 0.1.0 (2026-08-07)
 
