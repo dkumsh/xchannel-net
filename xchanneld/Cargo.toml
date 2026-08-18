@@ -13,7 +13,7 @@ name = "xchanneld"
 path = "src/main.rs"
 
 [dependencies]
-xchannel-net = { path = "../xchannel-net", version = "0.3.0" }
+xchannel-net = { path = "../xchannel-net", version = "0.3.1" }
 xchannel-net-core.workspace = true
 # The **only** dependency in this workspace beyond `xchannel` itself, and it lives here rather than in
 # a library on purpose: this crate exists so that a program's argument parser cannot reach anyone who

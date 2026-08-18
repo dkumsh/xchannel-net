@@ -93,6 +93,59 @@ struct SubscriptionSnapshot {
     last_rebuild_at_ms: Option<u64>,
 }
 
+/// Why an establishment attempt is being made — which decides whether the attach throttle applies.
+///
+/// The throttle exists to stop a *retry loop* from spinning: `service_subscriptions` re-establishes every
+/// wanted-but-disconnected subscription on every tick, and without a penalty an unattachable one costs a
+/// thread and a connect every 500 ms for ever. A **caller** asking for a subscription is not that loop.
+/// Throttling it made `Node::subscribe` return a `Subscription` that never replicated, and the client's
+/// own five-second wait for the replica then failed the call outright — while `subscribe`'s doc promised
+/// the opposite ("already replicating, rather than waiting for the conductor's next tick").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Establish {
+    /// Someone asked for this subscription now. Never throttled, and clears any standing penalty.
+    Caller,
+    /// The conductor is retrying one that is wanted but not connected. Throttled.
+    Retry,
+}
+
+/// A deterministic per-name spread over `[0, gap/2)`, so that many subscriptions failing for one
+/// reason do not all retry on the same tick.
+///
+/// Without it, three thousand members of a dead owner escalate in lockstep and arrive as a single
+/// three-thousand-thread herd every ceiling-length interval — measured. Derived from the name rather
+/// than from a random source so it needs no dependency and is reproducible in a test.
+fn jitter_for(name: &str, gap: Duration) -> Duration {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    let half = gap.as_micros().max(1) as u64 / 2;
+    Duration::from_micros(h % half.max(1))
+}
+
+/// First retry gap for a subscription that cannot be established, doubling to
+/// [`ATTACH_BACKOFF_MAX`].
+///
+/// Deliberately **not** the dialler's constants, which is the mistake this replaces. A peer link is
+/// re-formed by *either* end dialling, so a minute of patience there costs nothing: the other side is
+/// trying too. A subscription is one-directional — only the subscriber re-establishes it — so the same
+/// minute is a minute of stale replica with nobody else working to end it. Measured: reusing the
+/// dialler's 60 s ceiling left a subscriber 29.5 s behind after a 34 s owner outage, where a ceiling of
+/// its own resumes in 0.50 s (`measure_resume_after_the_owners_daemon_restarts`).
+const ATTACH_BACKOFF_MIN: Duration = Duration::from_millis(250);
+
+/// Ceiling on that gap. Chosen below `xchannel-net-client`'s own five-second wait for a replica to
+/// appear, so a throttled retry cannot outlast the caller that is waiting on it.
+const ATTACH_BACKOFF_MAX: Duration = Duration::from_secs(4);
+
+const _: () = assert!(
+    ATTACH_BACKOFF_MAX.as_millis() < DIAL_BACKOFF_MAX.as_millis(),
+    "an attach must recover faster than a dial: only the subscriber re-establishes a subscription, \
+     whereas either end of a peer link re-dials it"
+);
+
 /// One address's dial penalty: when it was last tried, when it may be tried again, and the gap that
 /// produced that. The attempt instant is what lets the gap decay rather than only ever grow.
 #[derive(Clone, Copy)]
@@ -491,6 +544,9 @@ pub struct Node {
     /// Incarnation of this daemon's discovery log — fresh per process, so a client's cursor
     /// from a previous run is recognisably stale.
     discovery_generation: u64,
+    /// Which owners were live on the previous attach pass, so a transition back to live can be
+    /// detected and used to forget the penalties that transition makes pointless.
+    last_live_owners: Arc<Mutex<HashSet<NodeId>>>,
     /// Per-member attach penalty, for members whose subscription cannot be established.
     ///
     /// Deleting the per-tick resolve cap removed a starvation bug and left one behaviour behind it: a member
@@ -591,6 +647,7 @@ impl Node {
             discovery: Arc::new(Mutex::new(None)),
             discovery_generation: now_nanos(),
             attach_backoff: Arc::new(Mutex::new(HashMap::new())),
+            last_live_owners: Arc::new(Mutex::new(HashSet::new())),
             dup_reported: Arc::new(Mutex::new(HashSet::new())),
             owner_unreachable_since: Arc::new(Mutex::new(HashMap::new())),
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
@@ -938,12 +995,16 @@ impl Node {
         // The live set once, not once per member: this used to take the dissemination lock for every
         // member of every topic on every tick — ten thousand acquisitions for a ten-thousand-member
         // topic, to answer a question that does not change during the pass.
-        let live_nodes: HashSet<NodeId> = self
-            .dissemination
-            .lock_safe()
-            .live_members()
-            .into_iter()
-            .collect();
+        // Asking for the live set is also how an owner's return is noticed: a member whose owner has
+        // just come back must not be made to wait out a penalty its own failures earned while the owner
+        // was away. Keeping it is what left a subscriber 29.5 s behind a restarted owner.
+        let live_nodes = self.live_owners_noting_revivals(
+            self.dissemination
+                .lock_safe()
+                .live_members()
+                .into_iter()
+                .collect(),
+        );
         for (topic, mux) in self.mux_handles() {
             // Members the registry says belong to this topic right now (live, non-tombstoned).
             let live: Vec<ChannelIdentity> = {
@@ -1103,20 +1164,61 @@ impl Node {
         }
         let now = Instant::now();
         let gap = match backoff.get(name) {
-            Some(p) if p.attempted_at.elapsed() < DIAL_BACKOFF_MAX * 2 => {
-                (p.gap * 2).min(DIAL_BACKOFF_MAX)
+            Some(p) if p.attempted_at.elapsed() < ATTACH_BACKOFF_MAX * 2 => {
+                (p.gap * 2).min(ATTACH_BACKOFF_MAX)
             }
-            _ => DIAL_BACKOFF_MIN,
+            _ => ATTACH_BACKOFF_MIN,
         };
         backoff.insert(
             name.to_string(),
             DialPenalty {
                 attempted_at: now,
-                next: now + gap,
+                next: now + gap + jitter_for(name, gap),
                 gap,
             },
         );
         true
+    }
+
+    /// Forget a name's attach penalty, so the next attempt is immediate.
+    fn attach_now(&self, name: &str) {
+        self.attach_backoff.lock_safe().remove(name);
+    }
+
+    /// `live_now`, having first dropped the attach penalties of members whose owner has just become
+    /// reachable again.
+    ///
+    /// The throttle exists for an owner that is *live but not answering* — its stream plane refusing,
+    /// or at its own connection cap — where retrying every tick achieves nothing. An owner that was
+    /// **unreachable** and is now live is the opposite case: the reason for the previous failures is
+    /// gone, and the only thing a penalty can do is delay the resume. That is the difference between a
+    /// 0.50 s and a 29.5 s recovery from an ordinary owner restart.
+    ///
+    /// It returns the set it was given so that the attach pass has to go through it to learn who is
+    /// live: a plain `clear_…(&live)` statement next to the one that computes `live` is a line anybody
+    /// could delete without a test noticing, and the deletion is exactly the bug this fixes.
+    fn live_owners_noting_revivals(&self, live_now: HashSet<NodeId>) -> HashSet<NodeId> {
+        let revived: HashSet<NodeId> = {
+            let mut was_live = self.last_live_owners.lock_safe();
+            let revived = live_now.difference(&was_live).copied().collect();
+            *was_live = live_now.clone();
+            revived
+        };
+        if revived.is_empty() {
+            return live_now;
+        }
+        let names: Vec<String> = self
+            .registry
+            .lock_safe()
+            .iter()
+            .filter(|id| revived.contains(&id.owner))
+            .map(|id| id.name.clone())
+            .collect();
+        let mut backoff = self.attach_backoff.lock_safe();
+        for name in names {
+            backoff.remove(&name);
+        }
+        live_now
     }
 
     fn ensure_member_subscription(&self, name: &str) {
@@ -1131,7 +1233,7 @@ impl Node {
         // Zero, not a short wait: this is only reached for a member whose owner is already a live
         // member, so `resolve` succeeds on its first pass. A timeout here could only ever be *spent*,
         // never useful — and spending it on the heartbeat's thread is what made a cap seem necessary.
-        if let Ok(sub) = self.subscribe(name, Some(Duration::ZERO)) {
+        if let Ok(sub) = self.subscribe_as(name, Some(Duration::ZERO), Establish::Retry) {
             self.subscriptions.lock_safe().insert(name.to_string(), sub);
         }
     }
@@ -2299,6 +2401,9 @@ impl Node {
         if let Some(sub) = self.subscriptions.lock_safe().remove(name) {
             sub.stop();
         }
+        // Forget any attach penalty with it. The map is keyed on the bare name, so a name reclaimed at
+        // `epoch + 1` would otherwise inherit its predecessor's backoff — and nothing else prunes it.
+        self.attach_now(name);
     }
 
     // ---------------- client plane (local client RPC) ----------------
@@ -2551,6 +2656,17 @@ impl Node {
         name: &str,
         resolve_timeout: Option<Duration>,
     ) -> io::Result<Subscription> {
+        self.subscribe_as(name, resolve_timeout, Establish::Caller)
+    }
+
+    /// [`subscribe`](Self::subscribe), stating whether this is a caller's request or the machinery
+    /// re-attaching something on its own initiative. Only the latter is throttled.
+    fn subscribe_as(
+        &self,
+        name: &str,
+        resolve_timeout: Option<Duration>,
+        why: Establish,
+    ) -> io::Result<Subscription> {
         // Fail fast if the channel can't be resolved within the timeout.
         self.resolve(name, resolve_timeout)?;
         let replica_path = self.replica_path(name)?;
@@ -2573,7 +2689,7 @@ impl Node {
         // Establish inline so a caller that has just been handed a `Subscription` is already
         // replicating, rather than waiting for the conductor's next tick. Reconnects are the
         // conductor's job (`service_subscriptions`).
-        self.spawn_establish(name, &shared);
+        self.spawn_establish(name, &shared, why);
         Ok(Subscription { shared })
     }
 
@@ -2597,7 +2713,7 @@ impl Node {
             if shared.stopped.load(Ordering::Relaxed) || shared.connected.load(Ordering::Acquire) {
                 continue;
             }
-            self.spawn_establish(&name, &shared);
+            self.spawn_establish(&name, &shared, Establish::Retry);
         }
     }
 
@@ -2609,7 +2725,12 @@ impl Node {
     /// conductor, for the same reason at a smaller scale. The thread exists only for the
     /// handshake and hands the finished connection to the duty cycle; it is not a
     /// thread-per-connection, which is what §4.1 set out to remove.
-    fn spawn_establish(&self, name: &str, shared: &Arc<SubShared>) {
+    fn spawn_establish(&self, name: &str, shared: &Arc<SubShared>, why: Establish) {
+        // A caller's request is not a retry loop: it is never throttled, and it forgives whatever the
+        // loop had accumulated, because the request is fresh evidence that somebody wants this now.
+        if why == Establish::Caller {
+            self.attach_now(name);
+        }
         // One attempt at a time per subscription.
         if shared
             .establishing
@@ -2625,7 +2746,7 @@ impl Node {
         // and eight hundred connects a second, with nothing logged, unchanged by that fix. Each attempt holds
         // a thread for up to the resolve, connect and handshake timeouts, so the retry rate *is* the thread
         // count.
-        if !self.attach_due(name) {
+        if why == Establish::Retry && !self.attach_due(name) {
             shared.establishing.store(false, Ordering::Release);
             return;
         }
@@ -3198,7 +3319,7 @@ mod tests {
 
         // The gap escalates while attempts keep coming...
         let gap = node.attach_backoff.lock_safe().get("mem.a").unwrap().gap;
-        assert_eq!(gap, DIAL_BACKOFF_MIN);
+        assert_eq!(gap, ATTACH_BACKOFF_MIN);
         node.attach_backoff
             .lock_safe()
             .get_mut("mem.a")
@@ -3207,13 +3328,199 @@ mod tests {
         assert!(node.attach_due("mem.a"));
         assert_eq!(
             node.attach_backoff.lock_safe().get("mem.a").unwrap().gap,
-            DIAL_BACKOFF_MIN * 2,
+            ATTACH_BACKOFF_MIN * 2,
             "a repeated failure must widen the gap"
         );
 
         // ...and a member that attaches clears it, so a peer coming back is picked up promptly.
-        node.attach_backoff.lock_safe().remove("mem.a");
+        node.attach_now("mem.a");
         assert!(node.attach_due("mem.a"), "a cleared penalty means due now");
+    }
+
+    /// **The attach ceiling must stay inside what a waiting caller will tolerate.** This is the whole
+    /// reason the attach backoff has constants of its own: it originally reused the dialler's, and a
+    /// dial's patience is affordable only because *both* ends re-dial. Escalate an attach to the same
+    /// minute and a client that asked for a subscription gets a handle that will not replicate for the
+    /// next 60 s — while its own wait for the replica is 5 s, so the call simply fails.
+    #[test]
+    fn the_attach_gap_is_capped_well_inside_a_callers_patience() {
+        let node = Node::new(config(160, temp_dir("attach-ceiling")));
+
+        // Escalate as hard as the machinery allows: every attempt due immediately, so the gap only ever
+        // doubles. Whatever it converges to is the worst case a caller can be made to wait.
+        for _ in 0..64 {
+            assert!(node.attach_due("mem.a"));
+            node.attach_backoff
+                .lock_safe()
+                .get_mut("mem.a")
+                .unwrap()
+                .next = Instant::now();
+        }
+        let p = *node.attach_backoff.lock_safe().get("mem.a").unwrap();
+        assert_eq!(p.gap, ATTACH_BACKOFF_MAX, "the gap must saturate, not grow");
+        assert!(
+            ATTACH_BACKOFF_MAX < Duration::from_secs(5),
+            "the ceiling must be under xchannel-net-client's five-second wait for a replica, or a \
+             throttled retry outlasts the caller waiting on it: {ATTACH_BACKOFF_MAX:?}"
+        );
+    }
+
+    /// **A caller's request is never throttled.** The throttle is there to stop the conductor's retry
+    /// loop from spinning; a client calling `subscribe` is fresh evidence that somebody wants this now,
+    /// and `subscribe`'s own doc promises a handle that is *already* replicating. Throttling it returned
+    /// a handle that would not attach for seconds, and the client's wait for the replica then failed.
+    #[test]
+    fn a_callers_subscribe_is_not_throttled_by_the_retry_backoff() {
+        let node = Node::new(config(160, temp_dir("attach-caller")));
+
+        // Burn the name's budget the way a failing retry loop would, then escalate it to the ceiling.
+        for _ in 0..8 {
+            node.attach_due("mem.a");
+            node.attach_backoff
+                .lock_safe()
+                .get_mut("mem.a")
+                .unwrap()
+                .next = Instant::now();
+        }
+        // One more attempt, this time leaving its gap standing: the loop is now throttled.
+        assert!(node.attach_due("mem.a"));
+        assert!(
+            !node.attach_due("mem.a"),
+            "premise: the retry loop is now throttled for this name"
+        );
+
+        // A caller's establishment forgives it; the machinery's does not.
+        let shared = Arc::new(SubShared {
+            replica_path: PathBuf::from("/nonexistent"),
+            synced: AtomicU64::new(0),
+            head_at_connect: AtomicU64::new(0),
+            last_record_at_ms: AtomicU64::new(0),
+            rebuilds: RebuildStats::default(),
+            stopped: AtomicBool::new(false),
+            connected: AtomicBool::new(false),
+            establishing: AtomicBool::new(false),
+        });
+        node.spawn_establish("mem.a", &shared, Establish::Caller);
+        assert!(
+            !node.attach_backoff.lock_safe().contains_key("mem.a"),
+            "a caller's request must clear the penalty, not queue behind it"
+        );
+    }
+
+    /// **An owner coming back must not be waited out.** The failures that built the penalty were the
+    /// owner being unreachable; once it is live again the penalty is pure delay. Measured on an ordinary
+    /// source-daemon restart: 0.009 s to resume with this clearing, 22 s without it.
+    #[test]
+    fn an_owner_returning_to_life_clears_its_members_attach_penalties() {
+        let node = Node::new(config(160, temp_dir("attach-revive")));
+        let owner = NodeId(4242);
+        node.registry.lock_safe().merge(ChannelIdentity {
+            name: "mem.a".to_string(),
+            owner,
+            region_size: 1 << 20,
+            mtu: 0,
+            earliest_index: RecordIndex(0),
+            registered_at_nanos: 1,
+            epoch: 0,
+            deleted: false,
+            member_of: Some("t.orders".into()),
+        });
+
+        // The owner is down and the retries have earned a penalty.
+        node.live_owners_noting_revivals(HashSet::new());
+        assert!(node.attach_due("mem.a"));
+        assert!(
+            !node.attach_due("mem.a"),
+            "premise: the name is throttled while its owner is away"
+        );
+
+        // It comes back.
+        assert_eq!(
+            node.live_owners_noting_revivals(HashSet::from([owner])),
+            HashSet::from([owner]),
+            "the live set must come back unchanged; the clearing is a side effect, not a filter"
+        );
+        assert!(
+            node.attach_due("mem.a"),
+            "the penalty must go with the reason for it, or the resume waits out a stale gap"
+        );
+
+        // Still live on the next pass is not a transition, so an ongoing failure keeps backing off.
+        assert!(!node.attach_due("mem.a"));
+        node.live_owners_noting_revivals(HashSet::from([owner]));
+        assert!(
+            !node.attach_due("mem.a"),
+            "a live owner that stays live must not clear the penalty every tick, or the throttle is gone"
+        );
+    }
+
+    /// **Members must not escalate in lockstep.** Every member of a topic whose owner is away fails on
+    /// the same tick, so a shared gap makes them all come due on the same tick too — 3000 members
+    /// meaning 3000 simultaneous establishment threads, every ceiling-width window. The jitter is
+    /// derived from the name so it needs no clock and no randomness, and it only ever *delays*.
+    #[test]
+    fn attach_retries_are_spread_so_members_do_not_come_due_together() {
+        let node = Node::new(config(160, temp_dir("attach-jitter")));
+        let names: Vec<String> = (0..1000).map(|i| format!("topic.member.{i}")).collect();
+
+        // Every member fails on the same pass, which is the realistic case: their owner is away.
+        let base = Instant::now();
+        for n in &names {
+            assert!(node.attach_due(n));
+        }
+
+        // When each becomes due again, bucketed at 100 ms. Without a spread every member carries the
+        // same gap from the same pass and they all land in one bucket — a thousand establishment
+        // threads on one tick, then nothing, for ever.
+        let buckets: HashSet<u64> = {
+            let backoff = node.attach_backoff.lock_safe();
+            names
+                .iter()
+                .map(|n| (backoff[n].next.duration_since(base).as_micros() as u64) / 100_000)
+                .collect()
+        };
+        assert!(
+            buckets.len() > 1,
+            "a thousand members must not all come due in the same 100 ms: {} bucket(s)",
+            buckets.len()
+        );
+
+        // And the spread only ever delays, by at most half the gap, so it cannot push a member past
+        // the ceiling the previous test pins.
+        let latest = {
+            let backoff = node.attach_backoff.lock_safe();
+            names
+                .iter()
+                .map(|n| backoff[n].next.duration_since(base))
+                .max()
+                .unwrap()
+        };
+        assert!(
+            latest < ATTACH_BACKOFF_MIN + ATTACH_BACKOFF_MIN / 2 + Duration::from_secs(1),
+            "the spread must be a fraction of the gap, not a multiple of it: {latest:?}"
+        );
+
+        // Stable per name, or a member's own gap would jump around between attempts.
+        assert_eq!(
+            jitter_for("topic.member.7", Duration::from_secs(4)),
+            jitter_for("topic.member.7", Duration::from_secs(4))
+        );
+    }
+
+    /// **A retired subscription takes its penalty with it.** The map is keyed on the bare name, and
+    /// nothing else prunes it, so a name reclaimed at `epoch + 1` — a respawned member, or an operator
+    /// re-registering after a `force_deregister` — would inherit the dead incarnation's backoff and be
+    /// throttled for its predecessor's failures.
+    #[test]
+    fn retiring_a_subscription_drops_its_attach_penalty() {
+        let node = Node::new(config(160, temp_dir("attach-retire")));
+        assert!(node.attach_due("mem.a"));
+        assert!(!node.attach_due("mem.a"), "premise: throttled");
+        node.retire_subscription("mem.a");
+        assert!(
+            node.attach_due("mem.a"),
+            "a reclaimed name must start with a clean slate"
+        );
     }
 
     /// **A cap over a deterministically-ordered walk starves whatever sorts last.** Reproduced three

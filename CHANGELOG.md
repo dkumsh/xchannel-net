@@ -4,6 +4,34 @@ All notable changes to xchannel-net are documented here. Versioning is pre-1.0 a
 experimental: the wire protocol and on-disk layout may change without notice (see
 `SECURITY.md`).
 
+## 0.3.1 (2026-08-18)
+
+**A subscriber no longer waits out a stale retry gap after its channel's owner comes back.** 0.3.0 gave
+subscription re-establishment a backoff, and reused the dialler's constants for it — one second doubling
+to sixty. That is the wrong shape for a subscription: a peer link is re-formed by *either* end dialling,
+so a minute of patience there costs nothing, while only the subscriber ever re-establishes a subscription.
+Measured on `measure_resume_after_the_owners_daemon_restarts` with a 34-second owner outage: **29.5 s to
+resume before, 0.50 s after.** How bad it looked was luck — the delay is wherever the owner's return falls
+inside the current gap, so the same code resumed in 1.5 s at a 30-second outage.
+
+### Fixed
+- **The attach backoff has a ceiling of its own** (250 ms doubling to 4 s), chosen below
+  `xchannel-net-client`'s own five-second wait for a replica to appear, so a throttled retry can no longer
+  outlast the caller waiting on it. A build-time assertion keeps it under the dialler's ceiling.
+- **An owner returning to life clears its channels' attach penalties.** The throttle is for an owner that
+  is live but not answering; an owner that was *unreachable* and is now live has had the reason for those
+  failures removed, and a standing penalty can then only delay the resume. Obtaining the live set is now
+  what notices the transition, so the two cannot be separated by a later edit.
+- **A caller's `subscribe` is never throttled.** `subscribe`'s contract is a handle that is already
+  replicating; the throttle exists to stop the conductor's retry loop from spinning, and applying it to a
+  request returned a handle that would not attach for seconds — after which the client's own wait for the
+  replica failed the call. The conductor's retries, and the topic member attach, are still throttled.
+- **Retries are spread.** The gap is offset by a deterministic per-name jitter of up to half its width, so
+  members that all failed on the same pass no longer all come due on the same pass — three thousand of
+  them meant three thousand establishment threads at once, then silence, repeating.
+- **A retired subscription drops its attach penalty.** The map is keyed on the bare name, so a name
+  reclaimed at `epoch + 1` inherited the dead incarnation's backoff and nothing else pruned it.
+
 ## 0.3.0 (2026-08-09)
 
 **A node now joins a mesh without being told how.** It generates its own identity on first start,

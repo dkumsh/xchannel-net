@@ -844,3 +844,80 @@ fn topic_merges_local_members_end_to_end() {
     assert_eq!(groups[1][0].1, 100);
     assert_eq!(groups[0][0].1, 200);
 }
+
+/// **How long a subscriber takes to resume after the channel's owner restarts.** The number this
+/// prints is the one that made 0.3.1 a hotfix: the attach retry originally borrowed the dialler's
+/// backoff constants (1 s doubling to 60 s), so a subscriber that had been retrying throughout the
+/// outage waited out a stale gap after the owner was back. A dial can afford a minute of patience because
+/// *both* ends re-dial; a subscription cannot, because only the subscriber re-establishes it.
+///
+/// Measured on this harness, same 34 s outage: **29.524 s** before, **0.502 s** after. How bad the old
+/// behaviour looked depended on luck — the delay is wherever the owner's return happens to fall inside
+/// the current gap, so the same code resumed in 1.5 s at a 30 s outage and 29.5 s at 34 s. That is the
+/// argument for a ceiling rather than a faster escalation: the tail is the whole problem.
+///
+/// Kept as a measurement rather than an assertion because it needs a real multi-second outage to let
+/// the backoff escalate, and that cost does not belong in every `just check`. The always-on guards are
+/// the unit tests around `attach_due` — chiefly `the_attach_gap_is_capped_well_inside_a_callers_patience`.
+#[test]
+#[ignore = "measurement harness; run with --ignored --nocapture"]
+fn measure_resume_after_the_owners_daemon_restarts() {
+    // How long the owner stays away, which is what decides how far the retry has escalated by the
+    // time it returns. Overridable because the divergence between a capped and an uncapped backoff only
+    // shows up once the escalation has had room to run, and because where the return lands inside the
+    // current gap decides the old code's delay: 34 s is a value that lands mid-gap.
+    let outage = Duration::from_secs(
+        std::env::var("XCHNET_OUTAGE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(34),
+    );
+    let dir_a = temp_dir("resume-a");
+    let dir_b = temp_dir("resume-b");
+    let opts = ChannelOptions::default();
+
+    // A owns the channel; B subscribes to it.
+    let (daemon_a, a_client, a_control) = spawn_daemon_seeded(1, &dir_a, &[]);
+    let (_daemon_b, b_client, b_control) = spawn_daemon_seeded(2, &dir_b, &[a_control]);
+    let mut client_a = connect_with_retry(&a_client);
+    let mut w = client_a.create_channel("md.x", &opts).unwrap();
+    let write = |w: &mut xchannel::Writer, i: u64| {
+        let p = format!("r{i}").into_bytes();
+        let buf = w.try_reserve(p.len()).unwrap();
+        buf.copy_from_slice(&p);
+        w.commit(1, p.len() as u32, i).unwrap();
+    };
+    write(&mut w, 0);
+
+    let mut client_b = connect_with_retry(&b_client);
+    let mut reader = client_b
+        .subscribe(
+            "md.x",
+            SubscribeMode::LateJoin,
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+    assert!(
+        reader
+            .read_blocking(Some(Duration::from_secs(10)))
+            .unwrap()
+            .is_some(),
+        "premise: B replicates before the outage"
+    );
+
+    // A goes away for long enough that B's attach retry escalates, then comes back. A rebinds a fresh
+    // ephemeral port, so the restarted A is seeded to B and re-dials it; B relearns A's address.
+    drop(daemon_a);
+    drop(w);
+    std::thread::sleep(outage);
+    let _daemon_a2 = spawn_daemon_seeded(1, &dir_a, &[b_control]).0;
+    let mut client_a = connect_with_retry(&a_client);
+    let mut w = client_a.create_channel("md.x", &opts).unwrap();
+    write(&mut w, 1);
+
+    let back = Instant::now();
+    let record = reader.read_blocking(Some(Duration::from_secs(90))).unwrap();
+    let elapsed = back.elapsed();
+    assert!(record.is_some(), "B never resumed within 90 s");
+    println!("outage {outage:?}: subscriber resumed {elapsed:.3?} after the owner was back");
+}
